@@ -734,7 +734,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             "PanVK-specific behavior (exact BC decode, driver-crash guard) "
             "does not apply to this run",
             custom_driver_so, properties_1_2_KHR_driver_properties.driverName,
-            vk::to_string(vk::type(properties_1_2_KHR_driver_properties.driverID)));
+            vk::to_string(vk::DriverId(properties_1_2_KHR_driver_properties.driverID)));
       }
     }
   }
