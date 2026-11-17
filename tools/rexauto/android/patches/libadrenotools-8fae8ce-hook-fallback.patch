@@ -1,0 +1,35 @@
+--- a/src/hook/hook_impl.cpp
++++ b/src/hook/hook_impl.cpp
+@@ -67,13 +67,28 @@
+     // Preload ourself, a new instance will be created since we have different linker ancestory
+     // If we don't preload we get a weird issue where despite being in NEEDED of the hook lib the hook's symbols will overwrite ours and cause an infinite loop
+     auto hookImpl{linkernsbypass_namespace_dlopen("libhook_impl.so", RTLD_NOW, driverNs)};
+-    if (!hookImpl)
+-        return nullptr;
++    if (!hookImpl) {
++        // (Ronda 8, auditor E — R8-E3.) Upstream devolvia nullptr aqui:
++        // un nullptr de android_dlopen_ext le dice al loader que el ICD
++        // no cargo, vkCreateInstance falla y el juego sale en silencio
++        // (ver R6-E2), en vez de caer al driver del sistema como hace
++        // cualquier otro fallo de esta funcion. La primera carga de
++        // libhook_impl.so ya tuvo exito en driver.cpp, asi que esto
++        // solo dispara si la recarga en este namespace difiere — pero
++        // si dispara, el fallback es el comportamiento correcto.
++        LOGI("hook_android_dlopen_ext: hook failed: failed to reload libhook_impl.so, falling back to the system driver!");
++        return fallback();
++    }
+ 
+     // Pass parameters to ourself
+     auto initHookParam{reinterpret_cast<void (*)(const void *)>(dlsym(hookImpl, "init_hook_param"))};
+-    if (!initHookParam)
+-        return nullptr;
++    if (!initHookParam) {
++        // (Ronda 8, auditor E — R8-E3.) Igual que arriba: un
++        // libhook_impl.so sin init_hook_param no es motivo para matar
++        // el arranque; el sistema sigue siendo un driver valido.
++        LOGI("hook_android_dlopen_ext: hook failed: libhook_impl.so has no init_hook_param, falling back to the system driver!");
++        return fallback();
++    }
+ 
+     initHookParam(hook_params);
+ 

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- app_name is overridden per build from Gradle (resValue) -->
+    <string name="edition">Edición Android · Title ID %1$s</string>
+    <string name="first_run_help">Añade tu copia de %1$s: toca «Elegir juego» y elige la imagen del disco (.iso), el paquete XBLA o su default.xex, o elige una carpeta ya extraída. Cualquier otro juego será rechazado.</string>
+    <string name="status_reading">Leyendo %1$s…</string>
+    <string name="status_copying">Copiando carpeta…</string>
+    <string name="status_copied">Copiados %1$d archivo(s)… %2$s</string>
+    <string name="pick_iso">Elegir juego (ISO / XBLA / default.xex)</string>
+    <string name="pick_folder">Elegir carpeta</string>
+    <string name="graphics">Gráficos y rendimiento</string>
+    <string name="logs">Registros</string>
+    <string name="crash_title">El juego se cerró la última vez</string>
+    <string name="share">Compartir</string>
+    <string name="copy">Copiar</string>
+    <string name="copied">Copiado al portapapeles</string>
+    <string name="reset">Quitar archivos</string>
+    <string name="reset_confirm">¿Borrar los archivos del juego y los datos guardados (partidas, DLC instalados, caché)?</string>
+    <string name="err_no_xex_in_iso">La imagen del disco no tiene default.xex: no es un disco de juego de Xbox 360.</string>
+    <string name="err_no_xex_in_folder">No se encontró default.xex en esa carpeta.</string>
+    <string name="err_not_iso">%1$s no es ni una ISO de Xbox 360 ni un default.xex.</string>
+    <string name="err_wrong_game">Eso es <b>%1$s</b>. Esta app está hecha para <b>%2$s</b> (Title ID %3$s): elige la imagen del disco de ese juego.</string>
+    <string name="err_xex_unreadable">No se pudo leer el encabezado de default.xex (archivo dañado o incompleto).</string>
+    <string name="err_generic">La importación falló.</string>
+    <string name="err_no_xex_in_stfs">%1$s es un paquete de Xbox 360 pero no contiene default.xex (¿una partida guardada, un DLC o una actualización?).</string>
+    <string name="err_god_needs_folder">%1$s es una imagen Games on Demand de varias partes. Usa <b>Elegir carpeta</b> y elige la carpeta que contiene este archivo y su carpeta «%1$s.data».</string>
+    <string name="log_empty">(aún no hay registro)</string>
+
+    <string name="gfx_scale">Resolución interna</string>
+    <string name="gfx_effect">Filtro de salida</string>
+    <string name="gfx_video_mode">Modo de vídeo del juego</string>
+    <string name="gfx_vsync">V-Sync (más suave, limita los FPS)</string>
+    <string name="gfx_letterbox">Mantener proporción (bandas negras)</string>
+    <string name="gfx_tolerant">Modo tolerante (omitir funciones que faltan en vez de fallar)</string>
+    <string name="gfx_extra">Avanzado: opciones extra del runtime (clave=valor por línea)</string>
+
+    <!-- Virtual gamepad -->
+    <string name="pad_settings_title">Controles en pantalla</string>
+    <string name="pad_size">Tamaño: %1$d%%</string>
+    <string name="pad_opacity">Opacidad: %1$d%%</string>
+    <string name="pad_haptics">Vibrar al tocar</string>
+    <string name="pad_reset">Por defecto</string>
+    <string name="pad_hide">Ocultar</string>
+    <string name="gpu_driver">Controlador GPU</string>
+    <string name="gpu_driver_system">Controlador del sistema (por defecto)</string>
+    <string name="gpu_driver_import">Importar zip…</string>
+    <string name="gpu_driver_installed">Controlador %1$s instalado y seleccionado</string>
+    <string name="gpu_driver_remove">¿Quitar el controlador %1$s?</string>
+    <string name="gpu_driver_not_supported">Este dispositivo no tiene una GPU con controlador alternativo conocido (ni Adreno ni Mali): la elección siguiente probablemente se ignore y se usará el controlador del sistema.</string>
+    <string name="gpu_driver_mali_note">Este dispositivo tiene GPU Mali: solo valen paquetes PanVK (Mesa), con libraryName libvulkan_panfrost.so o libvulkan_panvk.so (p. ej. el zip adrenotools de panvk-kbase v26.3.1). Un zip Turnip/Adreno no sirve aquí. PanVK es experimental y no está probado en este teléfono: si el juego no arranca, el próximo inicio ofrecerá volver al controlador del sistema.</string>
+    <string name="gpu_driver_experimental">Controlador GPU experimental (PanVK / Turnip)</string>
+    <string name="gpu_driver_experimental_off">El controlador GPU alternativo es experimental y está apagado. Actívalo solo si quieres probar PanVK (Mali) o Turnip (Adreno) con un controlador importado por ti: si el juego no arranca con él, el próximo inicio ofrecerá volver al controlador del sistema.</string>
+    <string name="gpu_driver_experimental_enable">Activar y elegir controlador</string>
+    <string name="gpu_driver_crash_title">El controlador %1$s falló en el último arranque</string>
+    <string name="gpu_driver_crash_msg">El juego se cerró la última vez con el controlador alternativo «%1$s» seleccionado. Puede que ese controlador no funcione en este teléfono. ¿Volver al controlador del sistema (recomendado) o reintentarlo?</string>
+    <string name="gpu_driver_crash_reset">Volver al controlador del sistema</string>
+    <string name="gpu_driver_crash_retry">Reintentar con el controlador</string>
+    <string name="err_driver_zip">%1$s no es un paquete de controlador: se esperaba un zip con meta.json y un libvulkan_*.so (los zips de controladores Turnip / Adreno de Yuzu, Skyline, Dolphin o Winlator sirven tal cual).</string>
+    <string name="gfx_orientation">Orientación de pantalla al jugar</string>
+    <string name="orient_portrait">Vertical</string>
+    <string name="orient_landscape">Horizontal (por defecto)</string>
+    <string name="orient_auto">Seguir la rotación del dispositivo</string>
+    <string name="gfx_preset">Preajuste de rendimiento</string>
+    <string name="preset_performance">Rendimiento (por defecto en teléfonos)</string>
+    <string name="preset_balanced">Equilibrado</string>
+    <string name="preset_accuracy">Precisión (valores de escritorio)</string>
+    <string name="gfx_fps_cap">Límite de fotogramas</string>
+    <string name="fps_off">Sin límite (frecuencia de pantalla)</string>
+    <string name="fps_30">30 FPS (más fresco y estable)</string>
+    <string name="fps_60">60 FPS</string>
+
+    <string-array name="gfx_scale_options">
+        <item>1x (720p, la más rápida)</item>
+        <item>2x (1440p)</item>
+        <item>3x (2160p)</item>
+    </string-array>
+    <string-array name="gfx_effect_options">
+        <item>Bilineal (la más barata)</item>
+        <item>AMD CAS (nitidez)</item>
+        <item>AMD FSR (reescalado)</item>
+    </string-array>
+    <string-array name="gfx_mode_options">
+        <item>1280x720 (por defecto)</item>
+        <item>1920x1080 (pesado)</item>
+        <item>1024x576 (más ligero)</item>
+        <item>960x540 (el más ligero)</item>
+    </string-array>
+</resources>

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- The Xenos GPU backend needs a full Vulkan 1.1 implementation. -->
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x00401000"
+        android:required="true" />
+
+    <!-- Android 12+: declare game mode support so performance mode is offered. -->
+    <application
+        android:allowBackup="false"
+        android:name=".PortApp"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:appCategory="game"
+        android:isGame="true"
+        android:requestLegacyExternalStorage="false"
+        android:theme="@style/AppTheme">
+
+        <!-- (Ronda 6, auditor F — R6-F8.) La lista era mas corta que la de
+             MainActivity: un cambio de densidad (escala de fuente), de
+             smallestScreenSize (pantalla dividida) o de uiMode (modo oscuro)
+             recreaba SetupActivity a mitad de un import y el hilo de import
+             se quedaba con la actividad destruida. Misma lista que
+             MainActivity, que ya la lleva completa. -->
+        <activity
+            android:name=".SetupActivity"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape" />
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

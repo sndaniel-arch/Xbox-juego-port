@@ -1,0 +1,77 @@
+# Game files — NEVER committed. The user supplies their own copy.
+private/
+*.xex
+*.xexp
+*.ipk
+*.rdpk
+
+# Generated C++ from XenonRecomp / ReXGlue codegen — never committed.
+ppc/
+out/
+rex/generated/
+generated/
+
+# Build outputs
+build/
+out-*/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# Analysis outputs (produced by the CI workflow, kept as artifacts)
+analysis/
+
+# Cloned tools (re-cloned by CI; later this may become a git submodule)
+tools/XenonRecomp/
+tools/XenosRecomp/
+tools/rexglue/
+
+# Android / Gradle (Phase 1+)
+local.properties
+*.apk
+*.aab
+.gradle/
+app/build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+
+# Private keys / keystores - NEVER committed (R8-F1). tools/mitm-proxy/
+# keeps a local CA (ca.key) and truststore (mitm-truststore.jks) that only
+# exist on the developer machine; without these rules a `git add` would
+# silently commit them.
+*.key
+*.jks
+# (Ronda 9, auditor F - R9-F2.) R8-F1 cubrio *.key/*.jks, pero un keystore
+# PKCS12 (.p12, formato por defecto de keytool desde JDK 9), un .keystore
+# o un .pem futuro no tenian regla; google-services.json tampoco (hoy no
+# hay Firebase, pero el archivo lleva claves de API). settings.gradle.kts
+# es config SOLO local (el workflow usa el stock de rexauto, que dice que
+# settings.gradle.kts "is not tracked -- the stock one stays") con una ruta
+# absoluta a esta VM; sin regla, un `git add` lo commitearia y el overlay
+# de CI lo impondria sobre el stock.
+*.p12
+*.pem
+*.keystore
+google-services.json
+settings.gradle.kts
+
+# Añadido en la limpieza para la cuenta nueva
+tools/downloads/
+tools/local-maven/
+tools/pkg2zip/
+tools/psvpfstools/
+tools/wivi514-casezero/
+tools/audio/
+tools/jtls/
+tools/mitm-proxy/
+tools/xex_image_dump/
+__pycache__/
+.env
+*.b64
+node_modules/

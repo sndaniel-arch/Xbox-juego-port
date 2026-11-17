@@ -1,0 +1,779 @@
+# Recompile Child of Light for Android, via rexauto
+#
+# Adaptación del "Recompile for Android" de rexauto
+# (Player124413/rexauto, rama arena/01a07629-rexauto, commit verificado
+#  dac49b331f2632f0b050f469e35747721300b8b2) para el port nativo de
+# Child of Light (Xbox 360 -> Android) en este repo.
+#
+# Uso: Actions -> "Recompile Child of Light for Android (rexauto)" -> Run workflow
+#   iso_url:    URL de la ISO del juego (directa, Google Drive o Dropbox).
+#               La ISO es la copia propia del usuario; nunca se commitea: solo
+#               vive en el runner y se borra al terminar cada job.
+#   iso_sha256: SHA-256 de la ISO (opcional, recomendado).
+#
+# Diferencias frente al android.yml original de rexauto (todas deliberadas,
+# documentadas en docs/REXAUTo.md):
+#   1. Nombre de proyecto fijo: `childoflight` (rexauto exige [a-z0-9_]{1,40};
+#      `child-of-light` con guiones es inválido). No hay input `name`.
+#   2. Doble checkout: este repo + rexauto en `rexauto/` (commit fijado arriba).
+#      Este repo es un DELTA sobre rexauto@dac49b33: solo los archivos que
+#      cambiamos o anadimos viven aqui (tools/rexauto/android/ + nuestro
+#      tools/rexauto/tools/android_sdk.sh). El paso "Overlay our port tree"
+#      los copia sobre el checkout rexauto ANTES del SDK y del Gradle; sin
+#      el, el job construiria el launcher STOCK (sin parche Mali, sin fix
+#      super.onCreate, sin espanol, sin pulso de entrada) -- P0-1, caza
+#      ronda 2 (2026-11-13). El paso "Re-overlay tracked SDK files" vuelve
+#      a copiar los archivos SDK trackeados DESPUES del SDK: android_sdk.sh
+#      hace rm -rf y reconstruye solo desde parches, y los archivos SDK
+#      trackeados (STFS de Fase 5 + ediciones a mano) no los produce ningun
+#      parche -- sin el, un build con cache-miss perderia el soporte STFS
+#      (prueba de assemble-android-tree.sh, 2026-11-13). Codegen (job recompile):
+#      rexauto NO usa XenonRecomp: el codegen lo hace el binario del SDK
+#      (rexglue.exe, v0.10.1 repack -- el fork xdzleo v0.10.0-rexauto.2
+#      desaparecio 2026-11-14; ver release sdk-v0.10.1-repack). Los parches
+#      0015-0022 de patches/XenonRecomp/ son contra hedge-dev/XenonRecomp y
+#      NO aplican al arbol del SDK (no existen XenonRecomp/ ni XenonUtils/
+#      ahi; verificado 2026-11-13). Tampoco se lee recomp/col.toml en CI: es
+#      un manifest de XenonRecomp standalone; rexauto autora su propio
+#      <name>_manifest.toml (stage init) y el SDK lee las opciones
+#      *_as_local de la tabla [entrypoint] de ese manifest (config.cpp
+#      ApplyToml; caza ronda 4 P0-1: top-level se ignora). El SDK YA
+#      soporta as_local nativamente y NO emite un ppc_context.h podado (el
+#      contexto es el del runtime, completo); db16cyc ya es no-op en el SDK
+#      (build_db16cyc).
+#      Lo que SI falta para que as_local sea CORRECTO es el pase
+#      tools/localize_fix_col.py sobre el arbol generado (flush/copy-back
+#      entre llamadas; sin el, el callee lee registros stale). El script YA
+#      esta adaptado a la sintaxis del SDK (DEFINE_REX_FUNC /
+#      REX_CALL_INDIRECT_FUNC / REX_FUNC_PROLOGUE, ronda 2 A P1-1, verificado
+#      en fixture: 13 funciones / 39 marcadores LOCALIZE_FIX) y el glob ya
+#      es childoflight_recomp.*.cpp. El cableado (inyeccion en el manifest +
+#      paso localize + verificacion con tripwire) esta en el job recompile.
+#   3. `runheal` por defecto `false` (igual que en rexauto Android): el heal
+#      lanza el game.exe en el runner y no hay modo headless, asi que un
+#      dispatch por defecto con `true` se quedaria colgado (hunt 4 P1-1).
+#      Quien lo quiera lo activa a mano en el dispatch.
+#      `heal_iters` por defecto `"6"` (en rexauto Android es `"4"`).
+#   4. Keystore CI estable vía secretos (ver §6 de docs/REXAUTo.md): el YAML de
+#      rexauto genera un keystore nuevo en cada run aunque su README diga que la
+#      clave es estable — verificado leyendo el YAML. Aquí se restaura el
+#      keystore del secreto CI_KEYSTORE_BASE64 si existe; si no existe, el job
+#      falla con ::error:: (ronda 3, B-R3-1: la rama antigua generaba un
+#      keystore fresco con contrasena aleatoria y la APK salia firmada en
+#      verde, pero con otra llave: no instalaba encima de ninguna build
+#      anterior y el unico aviso era un ::warning::).
+#      P1-7 (ronda 2, auditor B): las contraseñas del keystore NUNCA van en el
+#      repo (antes estaban hardcodeadas en build.gradle.kts, en los scripts
+#      full y en este mismo workflow). Ahora se leen de los secretos
+#      CI_KEYSTORE_STORE_PASSWORD / CI_KEYSTORE_KEY_PASSWORD (alias opcional
+#      en CI_KEYSTORE_KEY_ALIAS) y llegan a Gradle como variables de entorno
+#      (ver el paso "CI signing key"). El paso "Verify APK" comprueba ademas
+#      la huella del certificado (B-R3-1): la APK debe estar firmada con la
+#      llave corazon, no solo "firmada". El secreto antiguo
+#      CI_KEYSTORE_PASSWORD existe pero NUNCA se leyó en ningún paso: es
+#      legado; borrarlo tras crear los nuevos secretos (ver docs/REXAUTo.md
+#      §6; el plan de rotación es ROTATION-PLAN-keystore.md en la raíz
+#      del repo).
+#   5. Modelo público (decisión del usuario 2026-11-13): el repo es PÚBLICO
+#      para tener minutos ilimitados + runners grandes. La APK NUNCA sale como
+#      Release público: solo como artefacto de Actions con retención corta
+#      (7 días), y el repo no contiene código ni datos del juego (ver
+#      docs/DMCA.md). El guard de repo privado de la versión anterior se quitó
+#      con esta decisión.
+#   6. Liberar disco + swap de 16 GB en el job `apk` (patrón UnleashedRecomp_Android):
+#      los runners tienen ~14 GB de SSD y la build es grande.
+#
+# TODO (ver docs/REXAUTo.md §9):
+#   - URL + SHA-256 de la ISO (input del usuario).
+#   - Secretos CI_KEYSTORE_BASE64 + CI_KEYSTORE_STORE_PASSWORD +
+#     CI_KEYSTORE_KEY_PASSWORD (+ CI_KEYSTORE_KEY_ALIAS, opcional) antes
+#     del primer run de producción. (CI_KEYSTORE_PASSWORD es legado,
+#     no se usa: ver §4.)
+#   - Title ID a confirmar con el dump (citado 5841140D, no verificado).
+#   - Jump tables: el CI salta jumptables siempre (--no-jumptables, no hay IDA).
+#   - Verificar tools/localize_fix_col.py sobre codigo generado REAL del SDK:
+#     el script YA esta adaptado a la sintaxis del SDK (DEFINE_REX_FUNC /
+#     REX_CALL_INDIRECT_FUNC / REX_FUNC_PROLOGUE, ronda 2 A P1-1, verificado
+#     en fixture: 13 funciones / 39 marcadores LOCALIZE_FIX) y el glob ya es
+#     childoflight_recomp.*.cpp. Lo que falta es la confirmacion con salida
+#     real del codegen (la del fixture es sintetica). El paso "Verify
+#     register-as-local codegen + localize" FALLA el job si hay 0 marcadores
+#     LOCALIZE_FIX en el arbol generado (tripwire): no se envia codigo
+#     as_local=true sin el pase localize, porque el callee leeria registros
+#     stale. NO borrar el tripwire. Informe:
+#     ~/workspace/research/ci-codegen-2026-11-13.md (en el workspace, no en el repo).
+#     El APK de CI (job apk) SI lleva nuestros archivos de app y parches SDK
+#     gracias al overlay.
+
+name: Recompile Child of Light for Android (rexauto)
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "Link to the Child of Light Xbox 360 ISO (direct, Google Drive or Dropbox)"
+        required: true
+        type: string
+      iso_sha256:
+        description: "Expected SHA-256 of the ISO (optional, recommended)"
+        required: false
+        type: string
+      runheal:
+        description: "Also run the Windows run-heal loop first (slower, more functions cured)"
+        required: false
+        default: false
+        type: boolean
+      heal_iters:
+        description: "Max run-heal iterations (if enabled)"
+        required: false
+        default: "6"
+        type: string
+      baseline_arm:
+        description: "Build for plain ARMv8.0 (older 2016-2017 SoCs) instead of ARMv8.2 (default, faster)"
+        required: false
+        default: false
+        type: boolean
+
+run-name: "Android: childoflight (rexauto)"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-childoflight
+  cancel-in-progress: false
+
+env:
+  # Fixed project name (rexauto requires [a-z0-9_]{1,40}).
+  REX_PROJECT: childoflight
+  # Pinned rexauto commit (verified 2026-11-13; branch arena/01a07629-rexauto).
+  REXAUTO_REF: dac49b331f2632f0b050f469e35747721300b8b2
+
+jobs:
+  # ------------------------------------------------------------------ codegen
+  recompile:
+    name: "codegen + static heal (windows)"
+    runs-on: windows-latest
+    timeout-minutes: 350
+    outputs:
+      title: ${{ steps.meta.outputs.title }}
+      title_id: ${{ steps.meta.outputs.title_id }}
+    env:
+      REXAUTO_WORK: ${{ github.workspace }}\autoports
+      REXAUTO_PORTABLE: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      # ReXGlue SDK: el fork xdzleo (v0.10.0-rexauto.2) desaparecio de
+      # GitHub el 2026-11-14 (404) y era de donde bajaba el SDK el run #1.
+      # Usamos el repack oficial v0.10.1 publicado en este repo (release
+      # sdk-v0.10.1-repack; solo se quito el envoltorio win-amd64/).
+      # REXAUTO_SDK_PIN=0 porque el pin exige el binario xdzleo y este
+      # repack no es ese binario (setup.py pin_enforced).
+      REXGLUE_BUNDLE_URL: https://github.com/sndaniel-arch/Xbox-juego-port/releases/download/sdk-v0.10.1-repack/rexglue-sdk-0.10.1-win-amd64-raw.zip
+      REXAUTO_SDK_PIN: "0"
+    steps:
+      - name: Validate inputs
+        shell: pwsh
+        run: |
+          if ("${{ inputs.iso_url }}".Trim() -notmatch '^https?://') { Write-Host "::error::iso_url must start with http(s)://"; exit 1 }
+
+      - uses: actions/checkout@v4
+
+      - name: Checkout rexauto (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: Player124413/rexauto
+          ref: ${{ env.REXAUTO_REF }}
+          path: rexauto
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python deps
+        shell: pwsh
+        run: |
+          # gdown: rexauto tools/ci_fetch.py calls gdown.download(..., fuzzy=True)
+          # and installs gdown itself with plain `pip install gdown` (no
+          # --upgrade), so the version here decides. PIN to 5.2.0: the
+          # runner's pre-installed gdown predates fuzzy (run #2 died on
+          # TypeError), and an unpinned --upgrade installs 6.x, which
+          # REMOVED fuzzy (run #3 died on the same TypeError). Verified
+          # against the real wheels: 6.5.1 has no fuzzy, 5.2.0 has it.
+          python -m pip install -q --upgrade pip pillow "gdown==5.2.0"
+          python -c "import gdown; print('gdown version:', gdown.__version__)"
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Host "::error::vcvars64.bat not found"; exit 1 }
+          "VCVARS=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Resolve pinned SDK URL
+        id: sdk
+        shell: pwsh
+        working-directory: rexauto
+        run: |
+          $url = (python tools/ci_sdk.py url)
+          "url=$url" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: rexauto/rexglue
+          key: rexglue-sdk-${{ hashFiles('rexauto/rexauto.py') }}-${{ steps.sdk.outputs.url }}
+
+      - name: Install ReXGlue SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        working-directory: rexauto
+        env:
+          REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
+        run: python tools/ci_sdk.py install
+
+      - name: Verify SDK pin
+        shell: pwsh
+        working-directory: rexauto
+        run: python tools/ci_sdk.py verify
+
+      - name: Download game input
+        id: fetch
+        shell: pwsh
+        working-directory: rexauto
+        run: python tools/ci_fetch.py "${{ inputs.iso_url }}" "${{ runner.temp }}\input"
+
+      - name: Verify ISO SHA-256 (if provided)
+        if: inputs.iso_sha256 != ''
+        shell: pwsh
+        run: |
+          $expected = "${{ inputs.iso_sha256 }}".Trim().ToUpper()
+          # (Ronda 4, G-F1.) pick_container returns a DIRECTORY for .xex /
+          # .zip inputs (it renames to default.xex and returns the folder),
+          # and Get-FileHash cannot hash a directory: PowerShell 7 errors
+          # with "Access to the path ... is denied" and 5.1 returns nothing,
+          # so .Hash is $null either way and the comparison below would fail
+          # with a false "SHA-256 mismatch" on a correct download. The
+          # downloaded FILE itself is not exported by ci_fetch.py (upstream),
+          # so there is nothing better to hash here: skip the check with a
+          # warning instead of failing the job. .iso / STFS inputs still
+          # return a file and are verified as before.
+          $container = "${{ steps.fetch.outputs.container }}"
+          if (Test-Path $container -PathType Container) {
+            Write-Host "::warning::iso_sha256 skipped: the game input is a directory ($container), not a single file -- Get-FileHash cannot hash it"
+            exit 0
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $container).Hash
+          Write-Host "expected: $expected"
+          Write-Host "actual:   $actual"
+          if ($actual -ne $expected) { Write-Host "::error::SHA-256 mismatch: the downloaded ISO is not the expected one"; exit 1 }
+
+      - name: Recompile (extract + init)
+        shell: pwsh
+        working-directory: rexauto
+        run: |
+          # Phase 1 of the two-phase recompile: run rexauto only up to the
+          # init stage, so the next step can inject the register-as-local
+          # keys into the manifest rexauto authors. State is saved in
+          # $REXAUTO_WORK\.rexauto_state, so completed stages are skipped
+          # on the next invocation (rexauto.py --from/--until).
+          # NOTE: --until init here must be the ONLY --until flag: argparse
+          # keeps the last one, and the runheal-based "--until build" of
+          # phase 2 would silently extend this phase past init.
+          $args = @("${{ steps.fetch.outputs.container }}", "--name", "${{ env.REX_PROJECT }}",
+                    "--no-jumptables", "--heal-iters", "${{ inputs.heal_iters }}", "--publish-gabarito",
+                    "--until", "init")
+          New-Item -ItemType Directory -Force "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}" | Out-Null
+          python rexauto.py @args 2>&1 | Tee-Object -FilePath "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\_pipeline-init.log"
+          exit $LASTEXITCODE
+
+      - name: Inject register-as-local into the manifest
+        shell: pwsh
+        run: |
+          # Hunt 4 P0-1: the SDK reads the *_as_local / skip_* options from
+          # the [entrypoint] table of the project manifest, NOT top-level
+          # (ManifestConfig::Load -> LoadBinaryConfig(*entrypoint) ->
+          # ApplyToml reads toml["ctr_as_local"] etc. from the table passed
+          # in; the only top-level reader, RecompilerConfig::Load, has no
+          # callers). Top-level copies are silently ignored (defaults false),
+          # so insert them INSIDE [entrypoint], right after its header.
+          # Idempotent: any previous copy of these keys is dropped first
+          # (re-runs). skip_lr stays false. skip_msr = true and
+          # non_volatile_as_local REMOVED (Alice T1/T2, 2026-11-15:
+          # alice-nx proved non_volatile_as_local glitches textures
+          # on ARM64 by bisection on real console; skip_msr is safe
+          # and the biggest CPU gain measured in the ReXGlue family).
+          $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
+          $manifest = Join-Path $port "${{ env.REX_PROJECT }}_manifest.toml"
+          if (-not (Test-Path $manifest)) { Write-Host "::error::manifest not found at $manifest -- the init stage did not produce it"; exit 1 }
+          $keys = @(
+            "ctr_as_local = true",
+            "xer_as_local = true",
+            "reserved_as_local = true",
+            "cr_as_local = true",
+            "non_argument_as_local = true",
+            "skip_lr = false",
+            "skip_msr = true"
+          )
+          $names = @("ctr_as_local","xer_as_local","reserved_as_local","cr_as_local","non_argument_as_local","non_volatile_as_local","skip_lr","skip_msr")
+          $lines = [System.IO.File]::ReadAllLines($manifest)
+          $kept = @()
+          foreach ($l in $lines) {
+            $m = [regex]::Match($l, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+            if ($m.Success -and ($names -contains $m.Groups[1].Value)) { continue }
+            $kept += $l
+          }
+          $idx = -1
+          for ($i = 0; $i -lt $kept.Count; $i++) { if ($kept[$i] -match '^\s*\[entrypoint\]\s*$') { $idx = $i; break } }
+          if ($idx -lt 0) { Write-Host "::error::[entrypoint] section not found in $manifest -- the init stage did not author it"; exit 1 }
+          $block = @("# register-as-local (injected by the workflow, CI codegen wiring 2026-11-13; hunt 4 P0-1: the SDK reads these from [entrypoint], NOT top-level):") + $keys
+          $new = @()
+          $new += $kept[0..$idx]
+          $new += $block
+          if (($idx + 1) -lt $kept.Count) { $new += $kept[($idx+1)..($kept.Count-1)] }
+          [System.IO.File]::WriteAllLines($manifest, $new)
+          foreach ($k in $keys) {
+            $name = ($k -split '\s*=\s*', 2)[0]
+            $value = ($k -split '\s*=\s*', 2)[1]
+            $hits = @(Select-String -Path $manifest -Pattern ("^\s*" + [regex]::Escape($name) + "\s*=\s*" + [regex]::Escape($value) + "\s*$"))
+            if ($hits.Count -ne 1) { Write-Host "::error::manifest key '$k' found $($hits.Count) times (want exactly 1)"; exit 1 }
+          }
+          Write-Host "manifest updated: $($keys.Count) codegen keys injected into $manifest"
+
+      - name: Recompile (codegen + static heal + build check)
+        shell: pwsh
+        working-directory: rexauto
+        run: |
+          # Phase 2: resume from setjmp with the injected manifest.
+          # The init stage is skipped (state file), so the manifest is NOT
+          # re-authored and the injected keys survive. runheal=false (the
+          # default) still caps the run at build, as before.
+          $args = @("${{ steps.fetch.outputs.container }}", "--name", "${{ env.REX_PROJECT }}",
+                    "--no-jumptables", "--heal-iters", "${{ inputs.heal_iters }}", "--publish-gabarito",
+                    "--from", "setjmp")
+          if ("${{ inputs.runheal }}" -ne "true") { $args += @("--until", "build") }
+          python rexauto.py @args 2>&1 | Tee-Object -FilePath "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\_pipeline.log"
+          exit $LASTEXITCODE
+
+      - name: Localize generated code (register-as-local flush)
+        shell: pwsh
+        run: |
+          # tools/localize_fix_col.py runs on the GENERATED tree (after
+          # codegen converged, before the pack step). It adds the cross-call
+          # flush/copy-back that register-as-local needs: without it a
+          # callee reads stale ctx.<reg> where its caller set a local.
+          # The script is adapted to the SDK syntax (DEFINE_REX_FUNC /
+          # REX_CALL_INDIRECT_FUNC / REX_FUNC_PROLOGUE, ronda 2 A P1-1)
+          # and the glob below is childoflight_recomp.*.cpp (the SDK emits
+          # {project}_recomp.{N}.cpp). The next step ("Verify
+          # register-as-local codegen + localize") FAILS the job when 0
+          # LOCALIZE_FIX markers are found, instead of shipping
+          # un-localized code silently. Do NOT delete that tripwire: if it
+          # fires, the localize pass ran but transformed nothing -- check
+          # the manifest injection, the codegen output and the glob first.
+          $gen = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port\generated\default"
+          python "$env:GITHUB_WORKSPACE\tools\localize_fix_col.py" "$gen\childoflight_recomp.*.cpp"
+          exit $LASTEXITCODE
+
+      - name: Verify register-as-local codegen + localize
+        shell: pwsh
+        run: |
+          # Replaces the old "Guard: patched codegen required" step. That
+          # guard checked recomp/col.toml, a file CI never consumes; this
+          # one checks the three things that prove the wiring ran:
+          #  (1) the manifest still carries the 5 injected keys = true
+          #      (non_volatile_as_local removed by Alice T1: it is NOT
+          #      injected anymore, so the SDK default applies);
+          #  (2) the SDK codegen honored them (the generated *_init.cpp
+          #      carries the flags as struct fields, init_cpp.inja);
+          #  (3) the localize pass actually transformed the generated code
+          #      (LOCALIZE_FIX markers) -- the tripwire for the TODO above.
+          $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
+          $manifest = Join-Path $port "${{ env.REX_PROJECT }}_manifest.toml"
+          $gen = Join-Path $port "generated\default"
+          $flagNames = @("ctr_as_local","xer_as_local","reserved_as_local","cr_as_local","non_argument_as_local")
+          foreach ($k in $flagNames) {
+            if ((Select-String -Path $manifest -Pattern "^\s*$k\s*=\s*true\s*$").Count -ne 1) { Write-Host "::error::manifest lost $k = true -- the injection did not survive"; exit 1 }
+          }
+          $initCpp = Join-Path $gen "${{ env.REX_PROJECT }}_init.cpp"
+          if (-not (Test-Path $initCpp)) { Write-Host "::error::generated init file missing: $initCpp (expected <project>_init.cpp in generated/default)"; exit 1 }
+          foreach ($k in $flagNames) {
+            if ((Select-String -Path $initCpp -Pattern "\.$k\s*=\s*true").Count -lt 1) { Write-Host "::error::generated init file does not show .$k = true -- the SDK codegen ignored the manifest"; exit 1 }
+          }
+          $marks = (Get-ChildItem $gen -Filter "childoflight_recomp.*.cpp" | Select-String -Pattern "LOCALIZE_FIX").Count
+          if (-not $marks) {
+            Write-Host "::error::0 LOCALIZE_FIX markers in the generated tree: tools/localize_fix_col.py ran but transformed nothing (it is already adapted to the SDK syntax, DEFINE_REX_FUNC / REX_CALL_INDIRECT_FUNC -- check the manifest injection, the codegen output and the childoflight_recomp.*.cpp glob first). Do not ship as_local=true code without the localize pass (callees would read stale registers)."
+            exit 1
+          }
+          Write-Host "register-as-local verified: manifest keys + generated init flags + $marks LOCALIZE_FIX markers"
+
+      - name: Title metadata (name, Title ID, cover)
+        id: meta
+        if: always()
+        shell: pwsh
+        working-directory: rexauto
+        run: |
+          $game = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\game"
+          $xex = Get-ChildItem $game -Recurse -Filter default.xex -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($xex) { python tools/title_meta.py "$($xex.FullName)" "${{ runner.temp }}\meta" }
+          else { python tools/title_meta.py "${{ steps.fetch.outputs.container }}" "${{ runner.temp }}\meta" }
+
+      - name: Pack generated port for the APK job
+        if: always()
+        shell: pwsh
+        run: |
+          $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
+          if (-not (Test-Path "$port\generated\default\sources.cmake")) { Write-Host "::error::no generated code -- codegen failed, see logs"; exit 1 }
+          $out = "${{ runner.temp }}\port-src"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          # generated/ + src/ + *.toml -- NOT the build tree
+          Copy-Item -Recurse "$port\generated" "$out\generated"
+          Copy-Item -Recurse "$port\src" "$out\src"
+          Get-ChildItem $port -File -Filter *.toml | Copy-Item -Destination $out
+          Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+          # sources.cmake is ${CMAKE_CURRENT_LIST_DIR}-relative -> relocatable as-is
+          Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
+          Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: port-src-${{ env.REX_PROJECT }}
+          path: |
+            ${{ runner.temp }}/port-src.zip
+            ${{ runner.temp }}/cover.png
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-${{ env.REX_PROJECT }}
+          path: |
+            ${{ env.REXAUTO_WORK }}/${{ env.REX_PROJECT }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------- apk
+  apk:
+    name: "APK (arm64-v8a)"
+    needs: recompile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout rexauto (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: Player124413/rexauto
+          ref: ${{ env.REXAUTO_REF }}
+          path: rexauto
+
+      - name: Overlay our port tree onto rexauto
+        run: |
+          set -euo pipefail
+          # This repo is a DELTA on rexauto@dac49b33: only the files we
+          # changed or added live here. Without this step the Gradle below
+          # would build the STOCK rexauto launcher + stock SDK (no Mali
+          # patch, no super.onCreate fix, no Spanish, no input pulse) --
+          # P0-1, hunt round 2 (2026-11-13). The copy is safe: in CI this
+          # checkout holds exactly the tracked files (sdk/, build/,
+          # .gradle/, ci-release.jks, local.properties are gitignored, and
+          # settings.gradle.kts is not tracked -- the stock one stays).
+          cp -r tools/rexauto/android/. rexauto/android/
+          cp tools/rexauto/tools/android_sdk.sh rexauto/tools/android_sdk.sh
+          # Sanity: the files that must differ from stock are present.
+          test -f rexauto/android/app/src/main/java/com/rexauto/port/gamepad/VirtualPadView.java
+          # (Ronda 4, G-F2.) The M1 app files CMake compiles into libmain.so:
+          # without them Gradle fails minutes later instead of here.
+          test -f rexauto/android/app/src/main/cpp/col_main.cpp
+          test -f rexauto/android/app/src/main/cpp/col_dlc_installer.cpp
+          test -f rexauto/android/app/src/main/cpp/stfs_asset_jni.cpp
+          grep -q "mali-vertex-stores" rexauto/tools/android_sdk.sh
+          grep -q 'vulkan_async_skip_incomplete_frames", "false"' rexauto/android/app/src/main/java/com/rexauto/port/GraphicsSettings.java
+
+      - name: Free disk space + swap (runners have ~14 GB SSD)
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          docker image prune -af 2>/dev/null || true
+          sudo apt-get clean
+          df -h
+          free -h
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: port-src-${{ env.REX_PROJECT }}
+          path: ${{ runner.temp }}/in
+
+      - name: Unpack port
+        run: |
+          set -euo pipefail
+          mkdir -p autoports/${{ env.REX_PROJECT }}/port
+          unzip -q "${{ runner.temp }}/in/port-src.zip" -d autoports/${{ env.REX_PROJECT }}/port
+          ls autoports/${{ env.REX_PROJECT }}/port
+          # (no `ls | head` here: with pipefail a SIGPIPE'd ls fails the step)
+          find autoports/${{ env.REX_PROJECT }}/port/generated/default -maxdepth 1 | sed -n '1,12p'
+          test -f autoports/${{ env.REX_PROJECT }}/port/src/main.cpp
+          sed -n '1,8p' autoports/${{ env.REX_PROJECT }}/port/generated/default/sources.cmake
+
+      - name: Host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache patched ReXGlue SDK
+        uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: rexauto/android/sdk
+          key: android-sdk-v0.10.0-${{ hashFiles('rexauto/android/patches/*.patch', 'rexauto/tools/android_sdk.sh', 'tools/rexauto/android/patches/*.patch', 'tools/rexauto/tools/android_sdk.sh', 'tools/rexauto/android/sdk/**') }}
+
+      - name: ReXGlue SDK (v0.10.0 + Android patches)
+        working-directory: rexauto
+        run: tools/android_sdk.sh
+
+      - name: Re-overlay tracked SDK files (after SDK setup)
+        run: |
+          set -euo pipefail
+          # android_sdk.sh rm -rf's the SDK dir and rebuilds it from patches
+          # only. The tracked SDK files (STFS support, the xbmovie probe
+          # device, WaitMultiple, mprotect...) and the hand edits they carry
+          # are NOT produced by any patch — a cache-miss build would lose
+          # them without this step (assemble test, 2026-11-13). Tracked
+          # files win over patches by design. (No file count here: it went
+          # stale every round -- ronda 3 G-N6.)
+          cp -r tools/rexauto/android/sdk/. rexauto/android/sdk/
+          test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/stfs_data_file.cpp
+          test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/stfs_asset_source.cpp
+          # (Ronda 4, G-F2.) The xbmovie probe device (ronda 2, C-1/C-2):
+          # same early failure as the STFS files above if it goes missing.
+          test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_device.cpp
+          test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_entry.cpp
+          test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_file.cpp
+
+      - name: Android CMake 3.31.1
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018" >/dev/null
+
+      - name: Stage assets (title DB, cover, launcher icon)
+        run: |
+          set -euo pipefail
+          mkdir -p rexauto/android/app/src/main/assets
+          cp rexauto/tools/xbox360_titles.json rexauto/android/app/src/main/assets/
+          if [ -f "${{ runner.temp }}/in/cover.png" ]; then
+            cp "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/assets/cover.png
+            python3 -m pip install -q pillow
+            python3 rexauto/tools/android_icon.py "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/res
+          else
+            # (Ronda 4, G-F4.) A missing cover used to fall through silently
+            # to the generic rexauto icon. Warn so the log says why.
+            echo "::warning::cover.png missing in port-src artifact -- the APK will use the generic rexauto icon"
+            python3 -m pip install -q pillow
+            python3 rexauto/tools/android_icon.py rexauto/gui/rexauto_icon.png rexauto/android/app/src/main/res
+          fi
+
+      - name: CI signing key (stable, from secret if present)
+        env:
+          CI_KEYSTORE_BASE64: ${{ secrets.CI_KEYSTORE_BASE64 }}
+          CI_KEYSTORE_STORE_PASSWORD: ${{ secrets.CI_KEYSTORE_STORE_PASSWORD }}
+          CI_KEYSTORE_KEY_PASSWORD: ${{ secrets.CI_KEYSTORE_KEY_PASSWORD }}
+          CI_KEYSTORE_KEY_ALIAS: ${{ secrets.CI_KEYSTORE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          cd rexauto/android
+          if [ -n "${CI_KEYSTORE_BASE64:-}" ]; then
+            echo "$CI_KEYSTORE_BASE64" | base64 -d > ci-release.jks
+            echo "Using stable CI keystore from secret CI_KEYSTORE_BASE64."
+            # P1-7 (ronda 2, auditor B): the keystore passwords come from the
+            # new secrets CI_KEYSTORE_STORE_PASSWORD / CI_KEYSTORE_KEY_PASSWORD
+            # (alias from CI_KEYSTORE_KEY_ALIAS, defaulting to the heart alias
+            # when the secret is empty). build.gradle.kts reads them from the
+            # environment at Gradle time -- no hardcoded password, no sed of
+            # the alias anymore. The values are passed to the Gradle step via
+            # GITHUB_ENV (a step-level env: here would overwrite them with
+            # empty secrets when the fallback branch ran).
+            if [ -z "${CI_KEYSTORE_STORE_PASSWORD:-}" ] || [ -z "${CI_KEYSTORE_KEY_PASSWORD:-}" ]; then
+              echo "::error::CI_KEYSTORE_BASE64 is set but CI_KEYSTORE_STORE_PASSWORD / CI_KEYSTORE_KEY_PASSWORD are missing. Create the secrets (see docs/REXAUTo.md section 6) before running."
+              exit 1
+            fi
+            {
+              echo "CI_KEYSTORE_STORE_PASSWORD=$CI_KEYSTORE_STORE_PASSWORD"
+              echo "CI_KEYSTORE_KEY_PASSWORD=$CI_KEYSTORE_KEY_PASSWORD"
+              echo "CI_KEYSTORE_KEY_ALIAS=${CI_KEYSTORE_KEY_ALIAS:-childoflight<3}"
+            } >> "$GITHUB_ENV"
+          else
+            # (Ronda 3, auditor B, B-R3-1.) Sin CI_KEYSTORE_BASE64 NO se genera
+            # un keystore fresco: la rama antigua lo generaba con contrasena
+            # aleatoria y la APK salia firmada en verde (Verify solo comprueba
+            # que la firma sea valida), pero con una llave distinta a la del
+            # corazon: no instalaba encima de ninguna build anterior
+            # (INSTALL_FAILED_UPDATE_INCOMPATIBLE) y el unico aviso era un
+            # ::warning:: facil de pasar por alto. Este repo YA tiene builds
+            # con la llave corazon en la calle (v1.1-v1.4.1), asi que un
+            # keystore fresco nunca produce un artefacto utilizable: fallar
+            # aqui, antes de gastar el build de Gradle. Un fork sin el
+            # keystore corazon puede restaurar el bloque antiguo (keytool
+            # -genkeypair + GITHUB_ENV) y quitar la comprobacion de huella
+            # del paso "Verify APK".
+            echo "::error::CI_KEYSTORE_BASE64 is not set: no stable keystore, refusing to sign with a fresh key. Create the secret (see docs/REXAUTo.md section 6) before running."
+            exit 1
+          fi
+
+      - name: Gradle assembleRelease
+        env:
+          REX_TITLE: ${{ needs.recompile.outputs.title }}
+          REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
+        run: |
+          # P1-7: signing credentials (CI_KEYSTORE_STORE_PASSWORD /
+          # CI_KEYSTORE_KEY_PASSWORD / CI_KEYSTORE_KEY_ALIAS) reach Gradle via
+          # GITHUB_ENV, written by the "CI signing key" step above (from the
+          # secrets). Do NOT add a step-level env: mapping here -- the values
+          # come from GITHUB_ENV, and a mapping would only duplicate them.
+          set -euo pipefail
+          # Hunt 2, P2-6: un Title ID 00000000 (fallback) enmascararia que
+          # title_meta.py no produjo nada; la APK rechazaría el juego.
+          if [ -z "${REX_TITLE_ID:-}" ] || [ "$REX_TITLE_ID" = "00000000" ]; then echo "::error::REX_TITLE_ID is empty or 00000000 -- title_meta.py produced nothing"; exit 1; fi
+          if [ "${{ inputs.baseline_arm }}" = "true" ]; then export REX_ANDROID_BASELINE_ARM=1; fi
+          cd rexauto/android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PrexName="${{ env.REX_PROJECT }}" \
+            -PrexTitle="${REX_TITLE:-${{ env.REX_PROJECT }}}" \
+            -PrexTitleId="${REX_TITLE_ID:-00000000}" \
+            -PrexPortDir="$GITHUB_WORKSPACE/autoports/${{ env.REX_PROJECT }}/port" \
+            -PrexSdkDir="$GITHUB_WORKSPACE/rexauto/android/sdk/rexglue-sdk" \
+            -PrexVersionCode="${{ github.run_number }}" \
+            -PrexVersionName="1.${{ github.run_number }}"
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK=rexauto/android/app/build/outputs/apk/release/app-release.apk
+          unzip -l "$APK" > /tmp/apk.txt
+          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk.txt || { echo "::error::libmain.so missing"; exit 1; }
+          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk.txt || { echo "::error::GPU plugin missing"; exit 1; }
+          grep -q "assets/xbox360_titles.json" /tmp/apk.txt || { echo "::error::title DB missing"; exit 1; }
+          # (Ronda 4, auditor E — R4-E2.) Hard fail, not a warning: without
+          # libadrenotools the loader compiles to a no-op (the app
+          # CMakeLists only warns when the checkout is missing) and the
+          # whole driver UI stays live but dead — import/select would
+          # silently do nothing. Both .so files are in the current APK
+          # (verified in the local Nov 13 build: libadrenotools.so +
+          # libmain_hook.so), so this gate passes on a healthy build and
+          # only fires when the driver sources never reached the build
+          # (the android_sdk.sh clone) or CMake skipped them.
+          # (Ronda 5, auditor A — R5-A1.) The old message pointed at
+          # "tools/rexauto/android/sdk/libadrenotools checkout": that path
+          # is the repo tree, not where CI looks — in the apk job the
+          # sources live at rexauto/android/sdk/libadrenotools, put there
+          # by the 'ReXGlue SDK' step (tools/android_sdk.sh clones
+          # bylaws/libadrenotools at the pinned rev); the repo checkout
+          # does not carry them (nested .git, no .gitmodules at the root).
+          grep -q "lib/arm64-v8a/libadrenotools.so" /tmp/apk.txt && grep -q "lib/arm64-v8a/libmain_hook.so" /tmp/apk.txt || { echo "::error::libadrenotools not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
+          # Hunt 2, P2-5: el verify es el ultimo control antes de subir el
+          # artefacto y debe validar la firma (que la APK se pueda instalar).
+          # Con pipefail (arriba) un verify fallido mata el paso.
+          # P1-7: this step gates unsigned APKs: apksigner verify fails on an
+          # unsigned APK, so a build that lost its signing credentials
+          # (missing secrets/env) dies here instead of shipping an
+          # uninstallable artifact.
+          # (Ronda 3, auditor B, B-R3-1.) verify solo comprueba que la firma
+          # sea VALIDA, no que sea la del keystore corazon: una APK firmada
+          # con otro keystore pasaba en verde y no instalaba encima de las
+          # builds anteriores. La huella de abajo es la del certificado
+          # corazon (apksigner --print-certs sobre las APK v1.1-v1.4.1; ver
+          # docs/REXAUTo.md §6). OJO: 8ea1eb60... es el SHA-256 del ARCHIVO
+          # .jks, no del certificado: nunca usarlo aqui.
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/verify.txt
+          EXPECTED_CERT_SHA256="3768a83d38837f424138c1570f77e111bd1777ff6df049d476e562a46bb189ab"
+          ACTUAL_CERT_SHA256="$(grep -a "certificate SHA-256 digest" /tmp/verify.txt | head -1 | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
+          if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::APK signed with an unexpected certificate (SHA-256 $ACTUAL_CERT_SHA256, expected heart key $EXPECTED_CERT_SHA256). It would NOT install over previous builds -- check CI_KEYSTORE_BASE64."
+            exit 1
+          fi
+          echo "APK certificate SHA-256: $ACTUAL_CERT_SHA256 (heart key OK)"
+          cp "$APK" "${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk"
+          SIZE=$(stat -c%s "$APK")
+          {
+            echo "### ✅ ${{ needs.recompile.outputs.title }} — Android Edition"
+            echo ""
+            echo "- Title ID: \`${{ needs.recompile.outputs.title_id }}\`"
+            echo "- APK: \`${{ env.REX_PROJECT }}-android.apk\` ($((SIZE / 1048576)) MB, arm64-v8a, Vulkan)"
+            echo "- Signing certificate SHA-256: \`$ACTUAL_CERT_SHA256\` (heart key)"
+            echo ""
+            echo "Install the APK and open it — the game starts directly (no home screen, no Play button since v1.3). Graphics, GPU driver and logs live in the in-game menu (gear on the virtual gamepad)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REX_PROJECT }}-android-apk
+          path: ${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # complete Android project: launcher app + recompiled port sources, ready
+      # to open in Android Studio (SDK + build outputs excluded)
+      - name: Collect project sources
+        if: always()
+        run: |
+          # (Ronda 4, G-F3.) set -e: a failed rsync used to leave a partial
+          # source-... artifact with exit 0. The guarded commands below
+          # already tolerate failure ([ -d ... ] && ... and ... || true),
+          # so -e only kills the step on a real copy failure.
+          set -euo pipefail
+          OUT="${{ runner.temp }}/source-${{ env.REX_PROJECT }}"
+          mkdir -p "$OUT"
+          rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' rexauto/android/ "$OUT/android/"
+          [ -d "autoports/${{ env.REX_PROJECT }}/port" ] && rsync -a --exclude build "autoports/${{ env.REX_PROJECT }}/port/" "$OUT/port/"
+          cp rexauto/tools/android_sdk.sh "$OUT/" && cp -r rexauto/android/patches "$OUT/android/" 2>/dev/null || true
+          cat > "$OUT/README.txt" <<EOF2
+          ${{ env.REX_PROJECT }} -- Android project sources
+
+          android/   launcher app (Gradle project)
+          port/      recompiled game (generated C++ + src + *.toml)
+          Build: run ./android_sdk.sh (needs android/sdk), then
+            cd android && ./gradlew assembleRelease -PrexName=${{ env.REX_PROJECT }} \
+              -PrexPortDir=\$PWD/../port -PrexSdkDir=\$PWD/sdk/rexglue-sdk
+          EOF2
+          du -sh "$OUT"
+
+      - name: Upload project sources
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ env.REX_PROJECT }}
+          path: ${{ runner.temp }}/source-${{ env.REX_PROJECT }}
+          compression-level: 9
+          retention-days: 7
+
+      - name: Upload native build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-android-${{ env.REX_PROJECT }}
+          path: |
+            rexauto/android/app/.cxx/**/*.log
+            rexauto/android/app/.cxx/**/CMakeOutput.log
+            rexauto/android/app/.cxx/**/CMakeError.log
+          if-no-files-found: ignore
+          retention-days: 14

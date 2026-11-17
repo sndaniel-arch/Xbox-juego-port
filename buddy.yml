@@ -1,0 +1,986 @@
+# =============================================================================
+# buddy.yml — Port nativo de Child of Light (Xbox 360 → Android) en Buddy
+# =============================================================================
+# Espejo del workflow de GitHub Actions:
+#   .github/workflows/recompile-android-rexauto.yml
+#   (repo sndaniel-arch/Xbox-juego-port, HEAD c639c5e)
+#
+# CÓMO USARLO:
+#   1. En Buddy, crea el proyecto conectado al repo (integración GitHub con el
+#      PAT que el usuario pegó: 'buddy-port-clone', Contents Read-only).
+#   2. Importa este archivo como buddy.yml (raíz del repo o editor YAML del
+#      pipeline). NO contiene ningún secreto: los secretos se crean en Buddy
+#      (Variables, Keys & Assets) como variables Secure, nunca aquí.
+#   3. Ejecuta primero la sonda (childoflight-probe) y lee su salida; si pasa,
+#      ejecuta el build completo (childoflight-build).
+#
+# OJO — EL WORKFLOW LOCAL ESTÁ DESACTUALIZADO:
+#   La copia local ~/workspace/col-recomp/.github/workflows/... todavía tiene
+#   las claves VIEJAS (8 claves, non_volatile_as_local = true, skip_msr = false,
+#   6 flagNames). Este pipeline espeja el HEAD REMOTO (commit a4c93be, alice-t1t2):
+#   7 claves inyectadas (SIN non_volatile_as_local; skip_msr = true) y 5 flagNames
+#   en la verificación. Si el workflow remoto cambia, actualiza este archivo.
+#
+# DISEÑO:
+#   - Dos pipelines manuales (sin `events`: solo se ejecutan a mano, igual que
+#     el workflow_dispatch de GitHub Actions).
+#   - Una sola VM Windows por build: las acciones 02-04 reutilizan la VM de la
+#     acción 01 (vm_from_prev_action). Si la reutilización falla, la acción 02
+#     aborta con un mensaje claro (comprueba el marcador C:\work\.vm-marker).
+#   - El repo clonado vive en C:\buddy (filesystem del pipeline, se sincroniza
+#     en ambas direcciones). TODO lo pesado vive en C:\work (fuera del sync):
+#     rexauto, el juego, el SDK de Android, autoports. Solo los entregables
+#     se copian a C:\buddy\out\ (port-src.zip, cover.png, la APK, logs, fuentes).
+#   - PowerShell 5.1 en todas las acciones (la VM trae Windows PowerShell, no
+#     pwsh). Las variables de Buddy se leen con
+#     [Environment]::GetEnvironmentVariable('NOMBRE') — NUNCA con $env:NOMBRE,
+#     porque Buddy sustituye texto $... en los comandos y podría romperlo.
+#   - Después de cada llamada nativa se comprueba $LASTEXITCODE: un exe que
+#     falla NO lanza excepción en PowerShell por sí solo.
+# =============================================================================
+
+- pipeline: childoflight-probe
+  name: "Child of Light — Sonda (probe)"
+  definition_source: LOCAL
+  always_from_scratch: true
+  clone_depth: 0
+  resources: LARGE
+  cache_scope: PIPELINE
+  variables:
+    - key: "ISO_URL"
+      value: "https://drive.google.com/file/d/1zej6Zdo6xYnrpnTOteEMl_MlZ3sxGcEw/view?usp=sharing"
+      settable: "enabled"
+      description: "Enlace público de Drive del juego (STFS 1.5 GB, se baja con gdown)"
+    - key: "ISO_SHA256"
+      value: "9ed5ed9c9210903f2da04a47bacb25bbcb880284b43c09c187960f19c30f3750"
+      settable: "enabled"
+      description: "SHA-256 esperado del juego (vacío = no comprobar)"
+    - key: "RUNHEAL"
+      value: "false"
+      settable: "enabled"
+      description: "true = heal dinámico hasta el final; false = parar en build"
+    - key: "HEAL_ITERS"
+      value: "6"
+      settable: "enabled"
+      description: "Iteraciones de heal estático de rexauto"
+    - key: "BASELINE_ARM"
+      value: "false"
+      settable: "enabled"
+      description: "true = baseline ARM (solo build completo)"
+    - key: "REXAUTO_REF"
+      value: "dac49b331f2632f0b050f469e35747721300b8b2"
+      settable: "enabled"
+      description: "Pin de rexauto (Player124413/rexauto, público)"
+    - key: "REXGLUE_BUNDLE_URL"
+      value: "https://github.com/sndaniel-arch/Xbox-juego-port/releases/download/sdk-v0.10.1-repack/rexglue-sdk-0.10.1-win-amd64-raw.zip"
+      settable: "enabled"
+      description: "SDK rexglue reempaquetado (release sdk-v0.10.1-repack). La descarga es AUTENTICADA con BUDDY_GITHUB_PAT: el repo está marcado y el acceso anónimo da 404"
+    - key: "REX_PROJECT"
+      value: "childoflight"
+      settable: "enabled"
+      description: "Nombre del proyecto rexauto"
+  actions:
+    - action: "01 Sonda entorno Windows"
+      type: NATIVE_BUILD_WINDOWS
+      trigger_time: ON_EVERY_EXECUTION
+      timeout: 7200
+      # Tamaño de VM: el enum de la API es GENERAL_MEDIUM/LARGE/XLARGE/2XLARGE
+      # (también COMPUTE_* y ARM_*). La GUI mostró por defecto "AMD General
+      # Medium (2vCPU/4GB)". Se pide LARGE (se asume 4vCPU/8GB, SIN verificar).
+      # Si la importación YAML rechaza esta clave, bórrala y pon el tamaño en
+      # la GUI de la acción. La sonda imprime la CPU/RAM real para confirmarlo.
+      instance_type: GENERAL_LARGE
+      shell: POWERSHELL
+      working_directory: "C:\\buddy"
+      commands: |
+        # ==================================================================
+        # SONDA — espejo del job `recompile` de GitHub Actions hasta la
+        # inyección de claves. NO compila nada: mide VM, admin, internet,
+        # disco, toolchain, SDK, juego y rexauto --until init.
+        # Si algo falla aquí, el build completo fallaría igual.
+        # ==================================================================
+        $ErrorActionPreference = 'Stop'
+        $work = 'C:\work'
+        $out = 'C:\buddy\out\probe'
+        $repo = 'C:\buddy'
+        New-Item -ItemType Directory -Force -Path $work, $out | Out-Null
+
+        # --- 0. Variables del pipeline ---
+        $isoUrl = [Environment]::GetEnvironmentVariable('ISO_URL')
+        $isoSha = [Environment]::GetEnvironmentVariable('ISO_SHA256')
+        $rexRef = [Environment]::GetEnvironmentVariable('REXAUTO_REF')
+        $sdkUrl = [Environment]::GetEnvironmentVariable('REXGLUE_BUNDLE_URL')
+        $healIters = [Environment]::GetEnvironmentVariable('HEAL_ITERS')
+        if (-not $isoUrl) { throw 'ISO_URL vacío — define la variable en el pipeline' }
+        if (-not $rexRef) { throw 'REXAUTO_REF vacío' }
+        if (-not $sdkUrl) { throw 'REXGLUE_BUNDLE_URL vacío' }
+        Write-Host "ISO_URL=$isoUrl"
+        Write-Host "REXAUTO_REF=$rexRef"
+        Write-Host "REXGLUE_BUNDLE_URL=$sdkUrl"
+        Write-Host "HEAL_ITERS=$healIters"
+
+        # --- 1. Entorno: quién soy, admin, CPU, RAM, disco ---
+        Write-Host '== 1. Entorno =='
+        whoami
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        Write-Host "ADMIN=$isAdmin"
+        Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, CsProcessors, CsTotalPhysicalMemory | Format-List
+        Get-CimInstance Win32_ComputerSystem | Select-Object NumberOfProcessors, NumberOfLogicalProcessors, TotalPhysicalMemory | Format-List
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+        Write-Host ("DISCO C: libre {0:N1} GB de {1:N1} GB" -f ($disk.FreeSpace/1GB), ($disk.Size/1GB))
+        if ($disk.FreeSpace -lt 25GB) { throw 'Menos de 25 GB libres en C: — el build no cabe' }
+        $PSVersionTable
+        if (Get-Command choco -ErrorAction SilentlyContinue) { choco --version } else { Write-Host 'SIN choco en PATH' }
+
+        # --- 2. Herramientas base ---
+        Write-Host '== 2. Herramientas base =='
+        function Refresh-Path {
+          $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+          $u = [Environment]::GetEnvironmentVariable('Path','User')
+          [Environment]::SetEnvironmentVariable('Path', "$m;$u", 'Process')
+        }
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { throw 'Chocolatey no está en PATH — el manifiesto de Buddy dice que viene preinstalado; revisa la imagen' }
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+          choco install git -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install git falló ($LASTEXITCODE)" }
+          Refresh-Path
+        }
+        git --version
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+          $pyExe = "$work\python-3.12.7-amd64.exe"
+          curl.exe -L -o $pyExe 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de Python 3.12.7 falló' }
+          Start-Process -FilePath $pyExe -ArgumentList '/quiet','InstallAllUsers=1','PrependPath=1','Include_test=0' -Wait
+          Refresh-Path
+        }
+        python --version
+        # gdown PIN 5.2.0: ci_fetch.py usa gdown.download(fuzzy=True); 6.x
+        # ELIMINÓ fuzzy y el gdown preinstalado es anterior a fuzzy (el run #2
+        # de GitHub Actions murió por esto mismo). pillow lo usa android_icon.py.
+        python -m pip install -q --upgrade pip pillow "gdown==5.2.0"
+        if ($LASTEXITCODE -ne 0) { throw 'pip install pillow/gdown falló' }
+        python -c "import gdown; print('gdown version:', gdown.__version__)"
+        $jdkHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
+        if (-not $jdkHome -or -not (Test-Path "$jdkHome\bin\java.exe")) {
+          $jdkZip = "$work\jdk17.zip"
+          curl.exe -L -o $jdkZip 'https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de JDK 17 (Adoptium) falló' }
+          Expand-Archive -Path $jdkZip -DestinationPath "$work\jdk17" -Force
+          $jdkDir = Get-ChildItem "$work\jdk17" -Directory | Select-Object -First 1
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkDir.FullName, 'Machine')
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkDir.FullName, 'Process')
+        } else {
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkHome, 'Process')
+        }
+        & (([Environment]::GetEnvironmentVariable('JAVA_HOME')) + '\bin\java.exe') -version
+        if (-not (Get-Command gradle -ErrorAction SilentlyContinue)) {
+          # El repo NO trae gradlew.bat (solo el script gradlew de Unix), así
+          # que Gradle se instala vía Chocolatey y se llama como `gradle`.
+          choco install gradle --version=8.14 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'choco install gradle 8.14 falló' }
+          Refresh-Path
+        }
+        gradle --version
+        choco install cmake ninja 7zip llvm -y --no-progress
+        if ($LASTEXITCODE -ne 0) { throw 'choco install cmake/ninja/7zip/llvm falló' }
+        Refresh-Path
+
+        # --- Android SDK (cmdline-tools; la caché de pipeline es de 1 GB y el
+        # SDK NO cabe: se descarga en cada build, como en GitHub Actions) ---
+        Write-Host '== 2b. Android SDK =='
+        $sdkRoot = "$work\android-sdk"
+        $sdkman = "$sdkRoot\cmdline-tools\latest\bin\sdkmanager.bat"
+        if (-not (Test-Path $sdkman)) {
+          $cmdZip = "$work\cmdtools.zip"
+          curl.exe -L -o $cmdZip 'https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de cmdline-tools falló' }
+          New-Item -ItemType Directory -Force -Path "$work\cmdtools-tmp" | Out-Null
+          Expand-Archive -Path $cmdZip -DestinationPath "$work\cmdtools-tmp" -Force
+          New-Item -ItemType Directory -Force -Path "$sdkRoot\cmdline-tools\latest" | Out-Null
+          Copy-Item -Recurse -Force "$work\cmdtools-tmp\cmdline-tools\*" "$sdkRoot\cmdline-tools\latest\"
+          Remove-Item -Recurse -Force "$work\cmdtools-tmp"
+        }
+        [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Machine')
+        [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT', $sdkRoot, 'Process')
+        1..40 | ForEach-Object { 'y' } | & $sdkman --licenses | Out-Null
+        & $sdkman 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'cmake;3.31.1' 'ndk;27.2.12479018'
+        if ($LASTEXITCODE -ne 0) { throw 'sdkmanager falló' }
+
+        # --- 3. Toolchain MSVC / clang (en la sonda SOLO se informa) ---
+        Write-Host '== 3. Toolchain MSVC / clang (informe) =='
+        $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+        $vcvars = $null
+        if (Test-Path $vswhere) {
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          Write-Host "VS installationPath=$vsPath"
+          $cand = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (Test-Path $cand) { $vcvars = $cand; Write-Host "VCVARS=$vcvars" } else { Write-Host 'SIN vcvars64.bat (el manifiesto trae universalbuildtools, no NativeDesktop: el build completo lo instalará)' }
+        } else { Write-Host 'SIN vswhere.exe' }
+        $clang = 'C:\Program Files\LLVM\bin\clang.exe'
+        if (Test-Path $clang) { & $clang --version } else { Write-Host 'SIN clang.exe' }
+        "VCVARS=$vcvars" | Out-File -FilePath "$out\toolchain.txt" -Encoding utf8
+
+        # --- 4. rexauto (repo PÚBLICO: clon anónimo, sin token) ---
+        Write-Host '== 4. rexauto =='
+        Set-Location $work
+        if (-not (Test-Path "$work\rexauto\rexauto.py")) {
+          git clone --depth 1 https://github.com/Player124413/rexauto.git rexauto
+          if ($LASTEXITCODE -ne 0) { throw 'git clone rexauto falló' }
+        }
+        Set-Location "$work\rexauto"
+        git fetch --depth 1 origin $rexRef
+        if ($LASTEXITCODE -ne 0) { throw 'git fetch rexauto (pin) falló' }
+        git checkout $rexRef
+        if ($LASTEXITCODE -ne 0) { throw 'git checkout rexauto (pin) falló' }
+        git rev-parse HEAD
+
+        # --- 5. SDK rexglue: descarga AUTENTICADA (el repo tiene flag y el
+        # acceso anónimo da 404). El token NUNCA va en la línea de comandos:
+        # se pasa por un fichero -K de curl que se borra después. ---
+        Write-Host '== 5. SDK rexglue (descarga autenticada) =='
+        $pat = [Environment]::GetEnvironmentVariable('BUDDY_GITHUB_PAT')
+        if (-not $pat) { throw 'BUDDY_GITHUB_PAT vacío — la integración de GitHub no expone el PAT como variable de entorno; créalo como variable Secure en Buddy (Variables, Keys & Assets) con el PAT buddy-port-clone' }
+        $sdkZip = "$work\rexglue-sdk.zip"
+        $curlCfg = "$work\curl-auth.txt"
+        "header = `"Authorization: Bearer $pat`"" | Set-Content -Path $curlCfg -Encoding ascii
+        try {
+          curl.exe -K $curlCfg -L -o $sdkZip $sdkUrl
+          if ($LASTEXITCODE -ne 0) { throw "Descarga del SDK falló ($LASTEXITCODE)" }
+        } finally {
+          Remove-Item $curlCfg -Force -ErrorAction SilentlyContinue
+        }
+        $magic = [System.IO.File]::ReadAllBytes($sdkZip)[0..1]
+        if (-not ($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B)) { throw 'El SDK descargado no es un ZIP (no empieza por PK) — probablemente una página de error 404 HTML' }
+        Write-Host ("SDK ZIP OK: {0:N1} MB" -f ((Get-Item $sdkZip).Length/1MB))
+
+        # --- 6. Instalar y verificar el SDK rexglue ---
+        Write-Host '== 6. Instalar y verificar el SDK rexglue =='
+        $bundleUrl = 'file:///' + ($sdkZip -replace '\\','/')
+        [Environment]::SetEnvironmentVariable('REXGLUE_BUNDLE_URL', $bundleUrl, 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_SDK_PIN', '0', 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_PORTABLE', '1', 'Process')
+        python tools/ci_sdk.py install
+        if ($LASTEXITCODE -ne 0) { throw 'ci_sdk.py install falló' }
+        python tools/ci_sdk.py verify
+        if ($LASTEXITCODE -ne 0) { throw 'ci_sdk.py verify falló' }
+
+        # --- 7. Juego (Drive, gdown) + SHA-256 ---
+        Write-Host '== 7. Juego =='
+        [Environment]::SetEnvironmentVariable('REXAUTO_WORK', "$work\autoports", 'Process')
+        New-Item -ItemType Directory -Force -Path "$work\input" | Out-Null
+        $fetchOut = python tools/ci_fetch.py $isoUrl "$work\input"
+        if ($LASTEXITCODE -ne 0) { throw 'ci_fetch.py falló' }
+        $container = ($fetchOut | Select-Object -Last 1).Trim()
+        Write-Host "CONTAINER=$container"
+        if ($isoSha) {
+          $actual = (Get-FileHash -Algorithm SHA256 $container).Hash
+          Write-Host "SHA esperado: $($isoSha.Trim().ToUpper())"
+          Write-Host "SHA real:     $actual"
+          if ($actual -ne $isoSha.Trim().ToUpper()) { throw 'SHA-256 del juego no coincide' }
+        }
+
+        # --- 8. rexauto fase 1 (--until init) ---
+        Write-Host '== 8. rexauto fase 1 (--until init) =='
+        $proj = [Environment]::GetEnvironmentVariable('REX_PROJECT')
+        if (-not $proj) { $proj = 'childoflight' }
+        New-Item -ItemType Directory -Force -Path "$work\autoports\$proj" | Out-Null
+        $args1 = @($container, '--name', $proj, '--no-jumptables', '--heal-iters', $healIters, '--publish-gabarito', '--until', 'init')
+        python rexauto.py @args1 2>&1 | Tee-Object -FilePath "$work\autoports\$proj\_pipeline-init.log"
+        if ($LASTEXITCODE -ne 0) { throw 'rexauto fase 1 falló' }
+
+        # --- 9. Inyección register-as-local (valores del HEAD remoto) ---
+        Write-Host '== 9. Inyección register-as-local =='
+        $port = "$work\autoports\$proj\port"
+        $manifest = Join-Path $port "${proj}_manifest.toml"
+        if (-not (Test-Path $manifest)) { throw "manifest no encontrado en $manifest — la fase init no lo produjo" }
+        # Alice T1/T2: non_volatile_as_local NO se inyecta (glitchea texturas
+        # en ARM64) pero SÍ va en $names para borrar copias viejas; skip_msr
+        # = true (la mayor ganancia de CPU medida en la familia ReXGlue).
+        $keys = @(
+          'ctr_as_local = true',
+          'xer_as_local = true',
+          'reserved_as_local = true',
+          'cr_as_local = true',
+          'non_argument_as_local = true',
+          'skip_lr = false',
+          'skip_msr = true'
+        )
+        $names = @('ctr_as_local','xer_as_local','reserved_as_local','cr_as_local','non_argument_as_local','non_volatile_as_local','skip_lr','skip_msr')
+        $lines = [System.IO.File]::ReadAllLines($manifest)
+        $kept = @()
+        foreach ($l in $lines) {
+          $m = [regex]::Match($l, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+          if ($m.Success -and ($names -contains $m.Groups[1].Value)) { continue }
+          $kept += $l
+        }
+        $idx = -1
+        for ($i = 0; $i -lt $kept.Count; $i++) { if ($kept[$i] -match '^\s*\[entrypoint\]\s*$') { $idx = $i; break } }
+        if ($idx -lt 0) { throw '[entrypoint] no encontrado en el manifest' }
+        $block = @('# register-as-local (inyectado por el pipeline; el SDK lee estas claves de [entrypoint], NO del nivel superior):') + $keys
+        $new = @()
+        $new += $kept[0..$idx]
+        $new += $block
+        if (($idx + 1) -lt $kept.Count) { $new += $kept[($idx+1)..($kept.Count-1)] }
+        [System.IO.File]::WriteAllLines($manifest, $new)
+        $flagNames = @('ctr_as_local','xer_as_local','reserved_as_local','cr_as_local','non_argument_as_local')
+        foreach ($k in $flagNames) {
+          $hits = @(Select-String -Path $manifest -Pattern ("^\s*$k\s*=\s*true\s*$"))
+          if ($hits.Count -ne 1) { throw "la clave '$k = true' aparece $($hits.Count) veces en el manifest (se esperaba 1)" }
+        }
+        Write-Host 'Inyección verificada: 5 claves = true en [entrypoint]'
+
+        # --- 10. Copiar logs al filesystem del pipeline ---
+        Copy-Item "$work\autoports\$proj\*.log" $out -ErrorAction SilentlyContinue
+        Copy-Item $manifest "$out\" -ErrorAction SilentlyContinue
+        Write-Host 'SONDA COMPLETA — revisa el log y los archivos en out/probe/'
+
+- pipeline: childoflight-build
+  name: "Child of Light — Build completo"
+  definition_source: LOCAL
+  always_from_scratch: true
+  clone_depth: 0
+  resources: LARGE
+  cache_scope: PIPELINE
+  variables:
+    - key: "ISO_URL"
+      value: "https://drive.google.com/file/d/1zej6Zdo6xYnrpnTOteEMl_MlZ3sxGcEw/view?usp=sharing"
+      settable: "enabled"
+      description: "Enlace público de Drive del juego (STFS 1.5 GB, se baja con gdown)"
+    - key: "ISO_SHA256"
+      value: "9ed5ed9c9210903f2da04a47bacb25bbcb880284b43c09c187960f19c30f3750"
+      settable: "enabled"
+      description: "SHA-256 esperado del juego (vacío = no comprobar)"
+    - key: "RUNHEAL"
+      value: "false"
+      settable: "enabled"
+      description: "true = heal dinámico hasta el final; false = parar en build"
+    - key: "HEAL_ITERS"
+      value: "6"
+      settable: "enabled"
+      description: "Iteraciones de heal estático de rexauto"
+    - key: "BASELINE_ARM"
+      value: "false"
+      settable: "enabled"
+      description: "true = baseline ARM en el build de Gradle"
+    - key: "REXAUTO_REF"
+      value: "dac49b331f2632f0b050f469e35747721300b8b2"
+      settable: "enabled"
+      description: "Pin de rexauto (Player124413/rexauto, público)"
+    - key: "REXGLUE_BUNDLE_URL"
+      value: "https://github.com/sndaniel-arch/Xbox-juego-port/releases/download/sdk-v0.10.1-repack/rexglue-sdk-0.10.1-win-amd64-raw.zip"
+      settable: "enabled"
+      description: "SDK rexglue reempaquetado (release sdk-v0.10.1-repack). Descarga AUTENTICADA con BUDDY_GITHUB_PAT"
+    - key: "REX_PROJECT"
+      value: "childoflight"
+      settable: "enabled"
+      description: "Nombre del proyecto rexauto"
+  actions:
+    - action: "01 Setup toolchain"
+      type: NATIVE_BUILD_WINDOWS
+      trigger_time: ON_EVERY_EXECUTION
+      timeout: 5400
+      instance_type: GENERAL_LARGE
+      shell: POWERSHELL
+      working_directory: "C:\\buddy"
+      commands: |
+        # ==================================================================
+        # ACCIÓN 01 — Setup toolchain (espejo de los primeros pasos del job
+        # `recompile` + `apk` de GitHub Actions). Instala todo lo que el
+        # build necesita y deja la VM lista. Escribe el marcador
+        # C:\work\.vm-marker para que las acciones siguientes comprueben que
+        # siguen en LA MISMA VM.
+        # ==================================================================
+        $ErrorActionPreference = 'Stop'
+        $work = 'C:\work'
+        $out = 'C:\buddy\out'
+        New-Item -ItemType Directory -Force -Path $work, $out | Out-Null
+
+        # Variables de entorno persistentes (Machine) para que las acciones
+        # siguientes las vean aunque abran otra shell en la misma VM.
+        [Environment]::SetEnvironmentVariable('REXAUTO_WORK', "$work\autoports", 'Machine')
+        [Environment]::SetEnvironmentVariable('REXAUTO_PORTABLE', '1', 'Machine')
+        [Environment]::SetEnvironmentVariable('REXAUTO_SDK_PIN', '0', 'Machine')
+        [Environment]::SetEnvironmentVariable('PYTHONUTF8', '1', 'Machine')
+        [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'Machine')
+        [Environment]::SetEnvironmentVariable('GRADLE_USER_HOME', "$work\gradle-home", 'Machine')
+        [Environment]::SetEnvironmentVariable('REXAUTO_WORK', "$work\autoports", 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_PORTABLE', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_SDK_PIN', '0', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONUTF8', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'Process')
+        [Environment]::SetEnvironmentVariable('GRADLE_USER_HOME', "$work\gradle-home", 'Process')
+
+        # --- 1. Entorno ---
+        Write-Host '== 1. Entorno =='
+        whoami
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        Write-Host "ADMIN=$isAdmin"
+        Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, CsProcessors, CsTotalPhysicalMemory | Format-List
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+        Write-Host ("DISCO C: libre {0:N1} GB de {1:N1} GB" -f ($disk.FreeSpace/1GB), ($disk.Size/1GB))
+        if ($disk.FreeSpace -lt 25GB) { throw 'Menos de 25 GB libres en C: — el build no cabe' }
+
+        # --- 2. Herramientas base (igual que la sonda) ---
+        Write-Host '== 2. Herramientas base =='
+        function Refresh-Path {
+          $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+          $u = [Environment]::GetEnvironmentVariable('Path','User')
+          [Environment]::SetEnvironmentVariable('Path', "$m;$u", 'Process')
+        }
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { throw 'Chocolatey no está en PATH' }
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+          choco install git -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install git falló ($LASTEXITCODE)" }
+          Refresh-Path
+        }
+        git --version
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+          $pyExe = "$work\python-3.12.7-amd64.exe"
+          curl.exe -L -o $pyExe 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de Python 3.12.7 falló' }
+          Start-Process -FilePath $pyExe -ArgumentList '/quiet','InstallAllUsers=1','PrependPath=1','Include_test=0' -Wait
+          Refresh-Path
+        }
+        python --version
+        python -m pip install -q --upgrade pip pillow "gdown==5.2.0"
+        if ($LASTEXITCODE -ne 0) { throw 'pip install pillow/gdown falló' }
+        python -c "import gdown; print('gdown version:', gdown.__version__)"
+        $jdkHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
+        if (-not $jdkHome -or -not (Test-Path "$jdkHome\bin\java.exe")) {
+          $jdkZip = "$work\jdk17.zip"
+          curl.exe -L -o $jdkZip 'https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de JDK 17 (Adoptium) falló' }
+          Expand-Archive -Path $jdkZip -DestinationPath "$work\jdk17" -Force
+          $jdkDir = Get-ChildItem "$work\jdk17" -Directory | Select-Object -First 1
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkDir.FullName, 'Machine')
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkDir.FullName, 'Process')
+        } else {
+          [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkHome, 'Process')
+        }
+        & (([Environment]::GetEnvironmentVariable('JAVA_HOME')) + '\bin\java.exe') -version
+        if (-not (Get-Command gradle -ErrorAction SilentlyContinue)) {
+          choco install gradle --version=8.14 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'choco install gradle 8.14 falló' }
+          Refresh-Path
+        }
+        gradle --version
+        choco install cmake ninja 7zip llvm -y --no-progress
+        if ($LASTEXITCODE -ne 0) { throw 'choco install cmake/ninja/7zip/llvm falló' }
+        Refresh-Path
+
+        # --- Android SDK ---
+        Write-Host '== 2b. Android SDK =='
+        $sdkRoot = "$work\android-sdk"
+        $sdkman = "$sdkRoot\cmdline-tools\latest\bin\sdkmanager.bat"
+        if (-not (Test-Path $sdkman)) {
+          $cmdZip = "$work\cmdtools.zip"
+          curl.exe -L -o $cmdZip 'https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de cmdline-tools falló' }
+          New-Item -ItemType Directory -Force -Path "$work\cmdtools-tmp" | Out-Null
+          Expand-Archive -Path $cmdZip -DestinationPath "$work\cmdtools-tmp" -Force
+          New-Item -ItemType Directory -Force -Path "$sdkRoot\cmdline-tools\latest" | Out-Null
+          Copy-Item -Recurse -Force "$work\cmdtools-tmp\cmdline-tools\*" "$sdkRoot\cmdline-tools\latest\"
+          Remove-Item -Recurse -Force "$work\cmdtools-tmp"
+        }
+        [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Machine')
+        [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT', $sdkRoot, 'Process')
+        1..40 | ForEach-Object { 'y' } | & $sdkman --licenses | Out-Null
+        & $sdkman 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'cmake;3.31.1' 'ndk;27.2.12479018'
+        if ($LASTEXITCODE -ne 0) { throw 'sdkmanager falló' }
+
+        # --- 3. Toolchain MSVC: si no hay vcvars64, instalar VS Build Tools
+        # (workload NativeDesktop). El manifiesto de Buddy trae
+        # universalbuildtools + webbuildtools, NO vctools: es MUY probable
+        # que este paso se ejecute (20-40 min, ~3-5 GB). ---
+        Write-Host '== 3. Toolchain MSVC / clang =='
+        $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+        $vcvars = $null
+        if (Test-Path $vswhere) {
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if ($vsPath) {
+            $cand = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+            if (Test-Path $cand) { $vcvars = $cand }
+          }
+        }
+        if (-not $vcvars) {
+          Write-Host 'vcvars64.bat NO existe: instalando VS Build Tools (NativeDesktop)...'
+          $vsExe = "$work\vs_BuildTools.exe"
+          curl.exe -L -o $vsExe 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'Descarga de vs_BuildTools.exe falló' }
+          Start-Process -FilePath $vsExe -ArgumentList '--add','Microsoft.VisualStudio.Workload.NativeDesktop','--includeRecommended','--passive','--wait' -Wait
+          Refresh-Path
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          $cand = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $cand)) { throw 'vcvars64.bat sigue sin existir tras instalar NativeDesktop' }
+          $vcvars = $cand
+        }
+        Write-Host "VCVARS=$vcvars"
+        $clang = 'C:\Program Files\LLVM\bin\clang.exe'
+        if (-not (Test-Path $clang)) {
+          Write-Host 'clang.exe NO existe: instalando LLVM...'
+          choco install llvm -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'choco install llvm falló' }
+          Refresh-Path
+          if (-not (Test-Path $clang)) { throw 'clang sigue sin existir tras instalar LLVM' }
+        }
+        & $clang --version
+        # rexauto necesita el entorno MSVC activo (vcvars64) o clang en PATH:
+        # el paso de Toolchain de GitHub Actions solo guarda las rutas; aquí
+        # se deja constancia de ambas para la acción 02.
+        "VCVARS=$vcvars" | Out-File -FilePath "$work\toolchain.txt" -Encoding utf8
+        "CLANG=$clang" | Out-File -FilePath "$work\toolchain.txt" -Append -Encoding utf8
+
+        # --- Marcador de VM (la acción 02 lo comprueba) ---
+        "VM lista: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') — admin=$isAdmin — vcvars=$vcvars" | Out-File -FilePath "$work\.vm-marker" -Encoding utf8
+        Write-Host 'SETUP COMPLETO — VM lista para codegen'
+
+    - action: "02 Recompile codegen"
+      type: NATIVE_BUILD_WINDOWS
+      trigger_time: ON_EVERY_EXECUTION
+      timeout: 12600
+      instance_type: GENERAL_LARGE
+      shell: POWERSHELL
+      working_directory: "C:\\buddy"
+      vm_from_prev_action: true
+      vm_action_name: "01 Setup toolchain"
+      commands: |
+        # ==================================================================
+        # ACCIÓN 02 — Codegen (espejo del job `recompile` de GitHub Actions):
+        # rexauto + SDK + juego + fase 1 + inyección + fase 2 + localize +
+        # Verify + title meta + Pack (port-src.zip). Reutiliza la VM de la
+        # acción 01; si no es la misma VM, aborta (marcador ausente).
+        # ==================================================================
+        $ErrorActionPreference = 'Stop'
+        $work = 'C:\work'
+        $out = 'C:\buddy\out'
+        $repo = 'C:\buddy'
+        New-Item -ItemType Directory -Force -Path $work, $out | Out-Null
+        if (-not (Test-Path "$work\.vm-marker")) { throw 'La VM NO es la misma de la acción 01 (falta C:\work\.vm-marker): vm_from_prev_action no mantuvo la VM. Revisa la reutilización de VM en Buddy; sin ella cada acción arranca una VM limpia y el build no puede continuar' }
+        Get-Content "$work\.vm-marker"
+
+        # Variables de entorno de esta sesión (las Machine ya las puso la 01).
+        [Environment]::SetEnvironmentVariable('REXAUTO_WORK', "$work\autoports", 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_PORTABLE', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('REXAUTO_SDK_PIN', '0', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONUTF8', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'Process')
+        $jdkHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
+        if ($jdkHome) { [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkHome, 'Process') }
+        $sdkRoot = [Environment]::GetEnvironmentVariable('ANDROID_HOME','Machine')
+        if ($sdkRoot) {
+          [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Process')
+          [Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT', $sdkRoot, 'Process')
+        }
+        $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+        $u = [Environment]::GetEnvironmentVariable('Path','User')
+        [Environment]::SetEnvironmentVariable('Path', "$m;$u", 'Process')
+
+        $isoUrl = [Environment]::GetEnvironmentVariable('ISO_URL')
+        $isoSha = [Environment]::GetEnvironmentVariable('ISO_SHA256')
+        $rexRef = [Environment]::GetEnvironmentVariable('REXAUTO_REF')
+        $sdkUrl = [Environment]::GetEnvironmentVariable('REXGLUE_BUNDLE_URL')
+        $healIters = [Environment]::GetEnvironmentVariable('HEAL_ITERS')
+        $runheal = [Environment]::GetEnvironmentVariable('RUNHEAL')
+        $proj = [Environment]::GetEnvironmentVariable('REX_PROJECT')
+        if (-not $proj) { $proj = 'childoflight' }
+
+        # --- 4. rexauto (público, clon anónimo) ---
+        Write-Host '== 4. rexauto =='
+        Set-Location $work
+        if (-not (Test-Path "$work\rexauto\rexauto.py")) {
+          git clone --depth 1 https://github.com/Player124413/rexauto.git rexauto
+          if ($LASTEXITCODE -ne 0) { throw 'git clone rexauto falló' }
+        }
+        Set-Location "$work\rexauto"
+        git fetch --depth 1 origin $rexRef
+        if ($LASTEXITCODE -ne 0) { throw 'git fetch rexauto (pin) falló' }
+        git checkout $rexRef
+        if ($LASTEXITCODE -ne 0) { throw 'git checkout rexauto (pin) falló' }
+        git rev-parse HEAD
+
+        # --- 5. SDK rexglue (descarga AUTENTICADA, token por fichero -K) ---
+        Write-Host '== 5. SDK rexglue =='
+        $pat = [Environment]::GetEnvironmentVariable('BUDDY_GITHUB_PAT')
+        if (-not $pat) { throw 'BUDDY_GITHUB_PAT vacío — créalo como variable Secure en Buddy con el PAT buddy-port-clone' }
+        $sdkZip = "$work\rexglue-sdk.zip"
+        $curlCfg = "$work\curl-auth.txt"
+        "header = `"Authorization: Bearer $pat`"" | Set-Content -Path $curlCfg -Encoding ascii
+        try {
+          curl.exe -K $curlCfg -L -o $sdkZip $sdkUrl
+          if ($LASTEXITCODE -ne 0) { throw "Descarga del SDK falló ($LASTEXITCODE)" }
+        } finally {
+          Remove-Item $curlCfg -Force -ErrorAction SilentlyContinue
+        }
+        $magic = [System.IO.File]::ReadAllBytes($sdkZip)[0..1]
+        if (-not ($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B)) { throw 'El SDK descargado no es un ZIP (no empieza por PK)' }
+        Write-Host ("SDK ZIP OK: {0:N1} MB" -f ((Get-Item $sdkZip).Length/1MB))
+        $bundleUrl = 'file:///' + ($sdkZip -replace '\\','/')
+        [Environment]::SetEnvironmentVariable('REXGLUE_BUNDLE_URL', $bundleUrl, 'Process')
+        python tools/ci_sdk.py install
+        if ($LASTEXITCODE -ne 0) { throw 'ci_sdk.py install falló' }
+        python tools/ci_sdk.py verify
+        if ($LASTEXITCODE -ne 0) { throw 'ci_sdk.py verify falló' }
+
+        # --- 7. Juego + SHA-256 ---
+        Write-Host '== 7. Juego =='
+        New-Item -ItemType Directory -Force -Path "$work\input" | Out-Null
+        $fetchOut = python tools/ci_fetch.py $isoUrl "$work\input"
+        if ($LASTEXITCODE -ne 0) { throw 'ci_fetch.py falló' }
+        $container = ($fetchOut | Select-Object -Last 1).Trim()
+        Write-Host "CONTAINER=$container"
+        if ($isoSha) {
+          $actual = (Get-FileHash -Algorithm SHA256 $container).Hash
+          Write-Host "SHA esperado: $($isoSha.Trim().ToUpper())"
+          Write-Host "SHA real:     $actual"
+          if ($actual -ne $isoSha.Trim().ToUpper()) { throw 'SHA-256 del juego no coincide' }
+        }
+
+        # --- 8. rexauto fase 1 (--until init) ---
+        Write-Host '== 8. rexauto fase 1 (--until init) =='
+        New-Item -ItemType Directory -Force -Path "$work\autoports\$proj" | Out-Null
+        $args1 = @($container, '--name', $proj, '--no-jumptables', '--heal-iters', $healIters, '--publish-gabarito', '--until', 'init')
+        python rexauto.py @args1 2>&1 | Tee-Object -FilePath "$work\autoports\$proj\_pipeline-init.log"
+        if ($LASTEXITCODE -ne 0) { throw 'rexauto fase 1 falló' }
+
+        # --- 9. Inyección register-as-local (HEAD remoto, alice-t1t2) ---
+        Write-Host '== 9. Inyección register-as-local =='
+        $port = "$work\autoports\$proj\port"
+        $manifest = Join-Path $port "${proj}_manifest.toml"
+        if (-not (Test-Path $manifest)) { throw "manifest no encontrado en $manifest" }
+        $keys = @(
+          'ctr_as_local = true',
+          'xer_as_local = true',
+          'reserved_as_local = true',
+          'cr_as_local = true',
+          'non_argument_as_local = true',
+          'skip_lr = false',
+          'skip_msr = true'
+        )
+        $names = @('ctr_as_local','xer_as_local','reserved_as_local','cr_as_local','non_argument_as_local','non_volatile_as_local','skip_lr','skip_msr')
+        $lines = [System.IO.File]::ReadAllLines($manifest)
+        $kept = @()
+        foreach ($l in $lines) {
+          $m = [regex]::Match($l, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+          if ($m.Success -and ($names -contains $m.Groups[1].Value)) { continue }
+          $kept += $l
+        }
+        $idx = -1
+        for ($i = 0; $i -lt $kept.Count; $i++) { if ($kept[$i] -match '^\s*\[entrypoint\]\s*$') { $idx = $i; break } }
+        if ($idx -lt 0) { throw '[entrypoint] no encontrado en el manifest' }
+        $block = @('# register-as-local (inyectado por el pipeline; el SDK lee estas claves de [entrypoint], NO del nivel superior):') + $keys
+        $new = @()
+        $new += $kept[0..$idx]
+        $new += $block
+        if (($idx + 1) -lt $kept.Count) { $new += $kept[($idx+1)..($kept.Count-1)] }
+        [System.IO.File]::WriteAllLines($manifest, $new)
+        $flagNames = @('ctr_as_local','xer_as_local','reserved_as_local','cr_as_local','non_argument_as_local')
+        foreach ($k in $flagNames) {
+          $hits = @(Select-String -Path $manifest -Pattern ("^\s*$k\s*=\s*true\s*$"))
+          if ($hits.Count -ne 1) { throw "la clave '$k = true' aparece $($hits.Count) veces en el manifest (se esperaba 1)" }
+        }
+        Write-Host 'Inyección verificada: 5 claves = true en [entrypoint]'
+
+        # --- 10. rexauto fase 2 (--from setjmp [+ --until build]) ---
+        Write-Host '== 10. rexauto fase 2 =='
+        $args2 = @($container, '--name', $proj, '--no-jumptables', '--heal-iters', $healIters, '--publish-gabarito', '--from', 'setjmp')
+        if ($runheal -ne 'true') { $args2 += @('--until', 'build') }
+        python rexauto.py @args2 2>&1 | Tee-Object -FilePath "$work\autoports\$proj\_pipeline.log"
+        if ($LASTEXITCODE -ne 0) { throw 'rexauto fase 2 falló' }
+
+        # --- 11. Localize (tools/localize_fix_col.py del REPO, sobre el
+        # árbol generado). Es el script del repo (adaptado a la sintaxis del
+        # SDK: DEFINE_REX_FUNC / REX_CALL_INDIRECT_FUNC). ---
+        Write-Host '== 11. Localize =='
+        $gen = "$work\autoports\$proj\port\generated\default"
+        python "$repo\tools\localize_fix_col.py" "$gen\childoflight_recomp.*.cpp"
+        if ($LASTEXITCODE -ne 0) { throw 'localize_fix_col.py falló' }
+
+        # --- 12. Verify: manifest + init + tripwire LOCALIZE_FIX ---
+        Write-Host '== 12. Verify register-as-local + localize =='
+        foreach ($k in $flagNames) {
+          if ((Select-String -Path $manifest -Pattern "^\s*$k\s*=\s*true\s*$").Count -ne 1) { throw "el manifest perdió $k = true" }
+        }
+        $initCpp = Join-Path $gen "${proj}_init.cpp"
+        if (-not (Test-Path $initCpp)) { throw "falta el init generado: $initCpp" }
+        foreach ($k in $flagNames) {
+          if ((Select-String -Path $initCpp -Pattern "\.$k\s*=\s*true").Count -lt 1) { throw "el init generado no muestra .$k = true — el codegen ignoró el manifest" }
+        }
+        $marks = (Get-ChildItem $gen -Filter 'childoflight_recomp.*.cpp' | Select-String -Pattern 'LOCALIZE_FIX').Count
+        if (-not $marks) { throw '0 marcadores LOCALIZE_FIX — localize_fix_col.py no transformó el código del SDK. NO se envía código sin localizar.' }
+        Write-Host "Verificado: manifest + init + $marks marcadores LOCALIZE_FIX"
+
+        # --- 13. Title metadata (nombre, Title ID, portada) ---
+        Write-Host '== 13. Title metadata =='
+        $metaDir = "$work\meta"
+        New-Item -ItemType Directory -Force -Path $metaDir | Out-Null
+        $gameDir = "$work\autoports\$proj\game"
+        $xex = Get-ChildItem $gameDir -Recurse -Filter 'default.xex' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($xex) { $metaOut = python tools/title_meta.py $xex.FullName $metaDir } else { $metaOut = python tools/title_meta.py $container $metaDir }
+        if ($LASTEXITCODE -ne 0) { throw 'title_meta.py falló' }
+        $metaJson = ($metaOut | Select-Object -Last 1).Trim()
+        $meta = $metaJson | ConvertFrom-Json
+        $meta.title | Out-File -FilePath "$metaDir\title.txt" -Encoding utf8
+        $meta.title_id | Out-File -FilePath "$metaDir\title_id.txt" -Encoding utf8
+        $metaJson | Out-File -FilePath "$metaDir\meta.json" -Encoding utf8
+        Copy-Item "$metaDir\cover.png" "$out\cover.png" -ErrorAction SilentlyContinue
+        Copy-Item "$metaDir\meta.json" "$out\meta.json" -ErrorAction SilentlyContinue
+        Write-Host "Título: $($meta.title) ($($meta.title_id))"
+
+        # --- 14. Pack (port-src.zip) — con if: always() en GitHub Actions:
+        # se empaqueta aunque el Verify falle, para diagnosticar. Aquí se
+        # empaqueta al final de la acción: si el Verify falló, la acción ya
+        # abortó y el zip no existe (limitación conocida de Buddy frente a
+        # GitHub Actions; el log queda en out/ de todos modos). ---
+        Write-Host '== 14. Pack =='
+        if (-not (Test-Path "$port\generated\default\sources.cmake")) { throw 'No hay código generado (sources.cmake falta) — codegen falló' }
+        $packDir = "$work\port-src"
+        New-Item -ItemType Directory -Force -Path $packDir | Out-Null
+        Copy-Item -Recurse "$port\generated" "$packDir\generated"
+        Copy-Item -Recurse "$port\src" "$packDir\src"
+        Get-ChildItem $port -File -Filter '*.toml' | Copy-Item -Destination $packDir
+        Get-ChildItem $port -File -Filter '*.cmake' -ErrorAction SilentlyContinue | Copy-Item -Destination $packDir
+        Compress-Archive -Path "$packDir\*" -DestinationPath "$out\port-src.zip" -Force
+        Copy-Item "$work\autoports\$proj\*.log" $out -ErrorAction SilentlyContinue
+        Copy-Item $manifest "$out\" -ErrorAction SilentlyContinue
+        Write-Host 'CODEGEN COMPLETO — port-src.zip en out/'
+
+    - action: "03 Gradle assembleRelease"
+      type: NATIVE_BUILD_WINDOWS
+      trigger_time: ON_EVERY_EXECUTION
+      timeout: 10800
+      instance_type: GENERAL_LARGE
+      shell: POWERSHELL
+      working_directory: "C:\\buddy"
+      vm_from_prev_action: true
+      vm_action_name: "02 Recompile codegen"
+      commands: |
+        # ==================================================================
+        # ACCIÓN 03 — APK (espejo del job `apk` de GitHub Actions, que en
+        # GitHub corre en ubuntu-24.04 y aquí corre EN LA MISMA VM Windows):
+        # overlay del árbol del port, SDK Android parcheado, assets, firma y
+        # Gradle assembleRelease. Los logs de Gradle se copian a out/ aunque
+        # el build falle (try/finally).
+        # ==================================================================
+        $ErrorActionPreference = 'Stop'
+        $work = 'C:\work'
+        $out = 'C:\buddy\out'
+        $repo = 'C:\buddy'
+        $proj = [Environment]::GetEnvironmentVariable('REX_PROJECT')
+        if (-not $proj) { $proj = 'childoflight' }
+        try {
+          if (-not (Test-Path "$work\.vm-marker")) { throw 'La VM NO es la misma de la acción 01 (falta C:\work\.vm-marker)' }
+          if (-not (Test-Path "$out\port-src.zip")) { throw 'port-src.zip no existe en out/ — la acción 02 no produjo el port' }
+
+          # Entorno de esta sesión.
+          [Environment]::SetEnvironmentVariable('REXAUTO_WORK', "$work\autoports", 'Process')
+          [Environment]::SetEnvironmentVariable('REXAUTO_PORTABLE', '1', 'Process')
+          $jdkHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
+          if ($jdkHome) { [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkHome, 'Process') }
+          $sdkRoot = [Environment]::GetEnvironmentVariable('ANDROID_HOME','Machine')
+          if ($sdkRoot) {
+            [Environment]::SetEnvironmentVariable('ANDROID_HOME', $sdkRoot, 'Process')
+            [Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT', $sdkRoot, 'Process')
+          }
+          $gradleHome = [Environment]::GetEnvironmentVariable('GRADLE_USER_HOME','Machine')
+          if ($gradleHome) { [Environment]::SetEnvironmentVariable('GRADLE_USER_HOME', $gradleHome, 'Process') }
+          $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+          $u = [Environment]::GetEnvironmentVariable('Path','User')
+          [Environment]::SetEnvironmentVariable('Path', "$m;$u", 'Process')
+          $rexauto = "$work\rexauto"
+          $portDir = "$work\autoports\$proj\port"
+
+          # --- Desempaquetar el port (espejo de download-artifact + unpack) ---
+          Write-Host '== Desempaquetar port-src.zip =='
+          New-Item -ItemType Directory -Force -Path $portDir | Out-Null
+          Expand-Archive -Path "$out\port-src.zip" -DestinationPath $portDir -Force
+          if (-not (Test-Path "$portDir\src\main.cpp")) { throw 'port-src.zip no trae src/main.cpp' }
+          Get-ChildItem "$portDir\generated\default" -File | Select-Object -First 12 Name
+
+          # --- Overlay del árbol del port sobre rexauto ---
+          Write-Host '== Overlay del árbol del port =='
+          Copy-Item -Recurse -Force "$repo\tools\rexauto\android\*" "$rexauto\android\"
+          Copy-Item -Force "$repo\tools\rexauto\tools\android_sdk.sh" "$rexauto\tools\android_sdk.sh"
+          if (-not (Test-Path "$rexauto\android\app\src\main\java\com\rexauto\port\gamepad\VirtualPadView.java")) { throw 'Falta VirtualPadView.java tras el overlay' }
+          if (-not (Select-String -Path "$rexauto\tools\android_sdk.sh" -Pattern 'mali-vertex-stores' -Quiet)) { throw 'android_sdk.sh no trae mali-vertex-stores' }
+          if (-not (Select-String -Path "$rexauto\android\app\src\main\java\com\rexauto\port\GraphicsSettings.java" -Pattern 'vulkan_async_skip_incomplete_frames", "false"' -Quiet)) { throw 'GraphicsSettings.java no trae el flag esperado' }
+
+          # --- SDK ReXGlue Android parcheado (bash; clona rexglue-sdk v0.10.0
+          # público, aplica 11 parches, clona libadrenotools +
+          # liblinkernsbypass). Necesita Git Bash. ---
+          Write-Host '== ReXGlue SDK Android (android_sdk.sh) =='
+          $bash = 'C:\Program Files\Git\bin\bash.exe'
+          if (-not (Test-Path $bash)) { throw 'Git Bash no existe — git no se instaló bien' }
+          & $bash -lc 'cd /c/work/rexauto && bash tools/android_sdk.sh'
+          if ($LASTEXITCODE -ne 0) { throw 'android_sdk.sh falló' }
+
+          # --- Re-overlay de los ficheros SDK trackeados (android_sdk.sh
+          # borra el SDK y lo reconstruye solo con parches; los ficheros
+          # trackeados — STFS VFS, WaitMultiple, mprotect — no los produce
+          # ningún parche y se perderían sin este paso). ---
+          Write-Host '== Re-overlay ficheros SDK trackeados =='
+          Copy-Item -Recurse -Force "$repo\tools\rexauto\android\sdk\*" "$rexauto\android\sdk\"
+          if (-not (Test-Path "$rexauto\android\sdk\rexglue-sdk\src\filesystem\devices\stfs_data_file.cpp")) { throw 'Falta stfs_data_file.cpp tras el re-overlay' }
+          if (-not (Test-Path "$rexauto\android\sdk\rexglue-sdk\src\filesystem\stfs_asset_source.cpp")) { throw 'Falta stfs_asset_source.cpp tras el re-overlay' }
+
+          # --- CMake 3.31.1 + NDK 27.2.12479018 ---
+          Write-Host '== CMake + NDK =='
+          $sdkman = "$sdkRoot\cmdline-tools\latest\bin\sdkmanager.bat"
+          1..40 | ForEach-Object { 'y' } | & $sdkman --licenses | Out-Null
+          & $sdkman 'cmake;3.31.1' 'ndk;27.2.12479018'
+          if ($LASTEXITCODE -ne 0) { throw 'sdkmanager (cmake/ndk) falló' }
+
+          # --- Assets: title DB, portada, icono ---
+          Write-Host '== Assets =='
+          New-Item -ItemType Directory -Force -Path "$rexauto\android\app\src\main\assets" | Out-Null
+          Copy-Item "$rexauto\tools\xbox360_titles.json" "$rexauto\android\app\src\main\assets\" -Force
+          if (Test-Path "$out\cover.png") {
+            Copy-Item "$out\cover.png" "$rexauto\android\app\src\main\assets\cover.png" -Force
+            python "$rexauto\tools\android_icon.py" "$out\cover.png" "$rexauto\android\app\src\main\res"
+          } else {
+            python "$rexauto\tools\android_icon.py" "$rexauto\gui\rexauto_icon.png" "$rexauto\android\app\src\main\res"
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'android_icon.py falló' }
+
+          # --- gradle.properties: quitar las líneas trustStore LOCALES ---
+          # El gradle.properties del repo trae
+          # -Djavax.net.ssl.trustStore=/home/hatch/workspace/.../mitm-truststore.jks
+          # (ruta de la VM de desarrollo). Si se deja, Gradle falla al
+          # descargar dependencias en esta VM. Es un cambio SOLO del build,
+          # no del repo.
+          $gp = "$rexauto\android\gradle.properties"
+          if (Test-Path $gp) {
+            $kept = [System.IO.File]::ReadAllLines($gp) | Where-Object { $_ -notmatch 'trustStore' }
+            [System.IO.File]::WriteAllLines($gp, $kept)
+            Write-Host 'gradle.properties: eliminadas las líneas trustStore locales'
+          }
+
+          # --- Firma: keystore estable desde secretos, o keystore aleatorio ---
+          Write-Host '== Firma =='
+          $ksB64 = [Environment]::GetEnvironmentVariable('CI_KEYSTORE_BASE64')
+          $ksPath = "$rexauto\android\ci-release.jks"
+          if ($ksB64) {
+            [System.IO.File]::WriteAllBytes($ksPath, [Convert]::FromBase64String($ksB64))
+            $storePass = [Environment]::GetEnvironmentVariable('CI_KEYSTORE_STORE_PASSWORD')
+            $keyPass = [Environment]::GetEnvironmentVariable('CI_KEYSTORE_KEY_PASSWORD')
+            $keyAlias = [Environment]::GetEnvironmentVariable('CI_KEYSTORE_KEY_ALIAS')
+            if (-not $storePass -or -not $keyPass) { throw 'CI_KEYSTORE_BASE64 está definido pero faltan CI_KEYSTORE_STORE_PASSWORD / CI_KEYSTORE_KEY_PASSWORD' }
+            if (-not $keyAlias) { $keyAlias = 'childoflight<3' }
+            Write-Host 'Keystore estable desde secretos (misma clave que GitHub Actions)'
+          } else {
+            # Sin keystore estable: se genera uno con contraseña ALEATORIA
+            # (nunca un literal). La APK NO instalará sobre builds anteriores
+            # (otra clave de firma) — pon los secretos antes del primer run
+            # de producción.
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $rb = New-Object byte[] 24
+            $rng.GetBytes($rb)
+            $storePass = ([Convert]::ToBase64String($rb) -replace '[^A-Za-z0-9]','')
+            $keyPass = $storePass
+            $keyAlias = 'rexauto'
+            $keytool = ([Environment]::GetEnvironmentVariable('JAVA_HOME')) + '\bin\keytool.exe'
+            & $keytool -genkeypair -keystore $ksPath -storepass $storePass -keypass $keyPass -alias $keyAlias -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rexauto $proj, O=rexauto"
+            if ($LASTEXITCODE -ne 0) { throw 'keytool -genkeypair falló' }
+            Write-Host 'AVISO: sin CI_KEYSTORE_BASE64 — keystore aleatorio generado; esta APK NO instalará sobre builds anteriores'
+          }
+          [Environment]::SetEnvironmentVariable('CI_KEYSTORE_STORE_PASSWORD', $storePass, 'Process')
+          [Environment]::SetEnvironmentVariable('CI_KEYSTORE_KEY_PASSWORD', $keyPass, 'Process')
+          [Environment]::SetEnvironmentVariable('CI_KEYSTORE_KEY_ALIAS', $keyAlias, 'Process')
+
+          # --- Gradle assembleRelease ---
+          Write-Host '== Gradle assembleRelease =='
+          $rexTitle = ''
+          $rexTitleId = ''
+          if (Test-Path "$work\meta\title.txt") { $rexTitle = (Get-Content "$work\meta\title.txt" -Raw).Trim() }
+          if (Test-Path "$work\meta\title_id.txt") { $rexTitleId = (Get-Content "$work\meta\title_id.txt" -Raw).Trim() }
+          if (-not $rexTitle) { $rexTitle = $proj }
+          if (-not $rexTitleId -or $rexTitleId -eq '00000000') { throw 'REX_TITLE_ID vacío o 00000000 — title_meta.py no produjo nada' }
+          $baselineArm = [Environment]::GetEnvironmentVariable('BASELINE_ARM')
+          if ($baselineArm -eq 'true') { [Environment]::SetEnvironmentVariable('REX_ANDROID_BASELINE_ARM', '1', 'Process') }
+          # VersionCode: en GitHub Actions es github.run_number; en Buddy no
+          # hay equivalente, así que se usa la fecha AAAAMMDD (monótona por día).
+          $versionCode = (Get-Date).ToString('yyyyMMdd')
+          $sdkDir = "$rexauto\android\sdk\rexglue-sdk"
+          $gradleArgs = @('assembleRelease','--no-daemon','--stacktrace',
+            "-PrexName=$proj",
+            "-PrexTitle=$rexTitle",
+            "-PrexTitleId=$rexTitleId",
+            "-PrexPortDir=$portDir",
+            "-PrexSdkDir=$sdkDir",
+            "-PrexVersionCode=$versionCode",
+            "-PrexVersionName=1.$versionCode")
+          Write-Host "Título: $rexTitle ($rexTitleId) — VersionCode $versionCode"
+          Set-Location "$rexauto\android"
+          gradle @gradleArgs 2>&1 | Tee-Object -FilePath "$out\gradle.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Gradle assembleRelease falló' }
+
+          # --- Verificar la APK ---
+          Write-Host '== Verificar APK =='
+          $apk = "$rexauto\android\app\build\outputs\apk\release\app-release.apk"
+          if (-not (Test-Path $apk)) { throw 'No se generó app-release.apk' }
+          $listing = 7z l $apk
+          if ($LASTEXITCODE -ne 0) { throw '7z l sobre la APK falló' }
+          $listingText = $listing -join "`n"
+          if ($listingText -notmatch 'lib/arm64-v8a/libmain\.so') { throw 'libmain.so falta en la APK' }
+          if ($listingText -notmatch 'lib/arm64-v8a/librexgpu-xenos[^ ]*\.so') { throw 'Plugin GPU librexgpu-xenos falta en la APK' }
+          if ($listingText -notmatch 'assets/xbox360_titles\.json') { throw 'xbox360_titles.json falta en la APK' }
+          if ($listingText -notmatch 'lib/arm64-v8a/libadrenotools\.so' -or $listingText -notmatch 'lib/arm64-v8a/libmain_hook\.so') { Write-Host 'AVISO: libadrenotools no empaquetado — los drivers GPU personalizados no estarán disponibles' }
+          $apksigner = "$sdkRoot\build-tools\35.0.0\apksigner.bat"
+          & $apksigner verify --print-certs $apk | Tee-Object -FilePath "$out\apksigner-verify.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'apksigner verify falló — la APK no se puede instalar' }
+          Copy-Item $apk "$out\$proj-android.apk" -Force
+          $sizeMb = [math]::Round((Get-Item "$out\$proj-android.apk").Length / 1MB, 1)
+          Write-Host "APK LISTA: $proj-android.apk ($sizeMb MB, arm64-v8a, Vulkan) en out/"
+        } finally {
+          # Logs de Gradle / CMake siempre a out/, falle o no el build.
+          $cxxLogs = Get-ChildItem "$work\rexauto\android\app\.cxx" -Recurse -Filter '*.log' -ErrorAction SilentlyContinue
+          if ($cxxLogs) { New-Item -ItemType Directory -Force -Path "$out\cxx-logs" | Out-Null; $cxxLogs | Copy-Item -Destination "$out\cxx-logs\" -ErrorAction SilentlyContinue }
+          Copy-Item "$work\autoports\$proj\*.log" $out -ErrorAction SilentlyContinue
+        }
+
+    - action: "04 Collect outputs"
+      type: NATIVE_BUILD_WINDOWS
+      trigger_time: ON_EVERY_EXECUTION
+      timeout: 900
+      instance_type: GENERAL_LARGE
+      shell: POWERSHELL
+      working_directory: "C:\\buddy"
+      vm_from_prev_action: true
+      vm_action_name: "03 Gradle assembleRelease"
+      commands: |
+        # ==================================================================
+        # ACCIÓN 04 — Recogida (espejo de "Collect project sources" de GitHub
+        # Actions): el proyecto Android completo + el port recompilado, listos
+        # para abrir en Android Studio. trigger_time ON_EVERY_EXECUTION: la
+        # intención es que corra también si Gradle falló, para rescatar las
+        # fuentes y los logs (sin verificar en la práctica — ver notas).
+        # ==================================================================
+        $ErrorActionPreference = 'Stop'
+        $work = 'C:\work'
+        $out = 'C:\buddy\out'
+        $proj = [Environment]::GetEnvironmentVariable('REX_PROJECT')
+        if (-not $proj) { $proj = 'childoflight' }
+        $srcOut = "$out\source-$proj"
+        New-Item -ItemType Directory -Force -Path $srcOut | Out-Null
+        # robocopy: códigos 0-7 = éxito; >= 8 = error real.
+        robocopy "$work\rexauto\android" "$srcOut\android" /E /XD sdk build .gradle /XF *.jks
+        if ($LASTEXITCODE -ge 8) { throw "robocopy android falló ($LASTEXITCODE)" }
+        $portDir = "$work\autoports\$proj\port"
+        if (Test-Path $portDir) {
+          robocopy $portDir "$srcOut\port" /E /XD build
+          if ($LASTEXITCODE -ge 8) { throw "robocopy port falló ($LASTEXITCODE)" }
+        }
+        Copy-Item "$work\rexauto\tools\android_sdk.sh" "$srcOut\" -ErrorAction SilentlyContinue
+        Copy-Item -Recurse "$work\rexauto\android\patches" "$srcOut\android\" -ErrorAction SilentlyContinue
+        @"
+        $proj -- Android project sources
+
+        android/   launcher app (proyecto Gradle)
+        port/      juego recompilado (C++ generado + src + *.toml)
+        Build: run ./android_sdk.sh (needs android/sdk), then
+          cd android && gradle assembleRelease -PrexName=$proj `
+            -PrexPortDir=`$PWD/../port -PrexSdkDir=`$PWD/sdk/rexglue-sdk
+        "@ | Out-File -FilePath "$srcOut\README.txt" -Encoding utf8
+        Get-ChildItem $out | Select-Object Name, Length | Format-Table -AutoSize
+        Write-Host 'ENTREGABLES EN out/: port-src.zip, cover.png, meta.json, childoflight-android.apk, source-childoflight/'

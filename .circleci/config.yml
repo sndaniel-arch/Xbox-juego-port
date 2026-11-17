@@ -1,0 +1,226 @@
+# CircleCI config — MEDICIÓN del recompile del port nativo (Child of Light).
+#
+# Job ÚNICO de medición: checkout + SDK + descarga del juego + recompile
+# (fase 1 init + inyección de register-as-local + fase 2 hasta build),
+# con temporizador por fase. NO hace el build Gradle ni la APK.
+# El número que sale de aquí decide todo: un solo job (< 55 min),
+# split en 2 jobs, Windows Large, o Daytona (sin límite de tiempo).
+#
+# El repo es PÚBLICO (2026-11-15), así que el SDK (release
+# sdk-v0.10.1-repack) se descarga anónimo, sin PAT.
+# El juego se descarga del enlace público de Drive con gdown, igual que
+# en GitHub Actions. Los pasos son un espejo del job `recompile` de
+# .github/workflows/recompile-android-rexauto.yml (HEAD 3b833f1).
+# La verificación estricta (tripwire LOCALIZE_FIX) NO va aquí: hoy
+# falla a propósito (localize_fix_col.py aún no entiende la sintaxis
+# del SDK) y esto es solo una medición de tiempo.
+#
+# Créditos: Windows Medium (4 vCPU/16 GB) = 40 créditos/min.
+# Un recompile de 60 min = 2.400 créditos (8% de los 30.000/mes del
+# plan gratis). Artefactos: solo logs y el resumen de tiempos.
+
+version: 2.1
+
+orbs:
+  win: circleci/windows@5.0
+
+parameters:
+  iso_url:
+    type: string
+    default: "https://drive.google.com/file/d/1zej6Zdo6xYnrpnTOteEMl_MlZ3sxGcEw/view?usp=sharing"
+  iso_sha256:
+    type: string
+    default: "9ed5ed9c9210903f2da04a47bacb25bbcb880284b43c09c187960f19c30f3750"
+  heal_iters:
+    type: string
+    default: "6"
+  runheal:
+    type: boolean
+    default: false
+
+executors:
+  win-medium:
+    machine: true
+    resource_class: windows.medium
+    shell: powershell.exe
+
+jobs:
+  measure-recompile:
+    executor: win-medium
+    environment:
+      REX_PROJECT: childoflight
+      REXAUTO_REF: dac49b331f2632f0b050f469e35747721300b8b2
+      REXAUTO_PORTABLE: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      REXGLUE_BUNDLE_URL: https://github.com/sndaniel-arch/Xbox-juego-port/releases/download/sdk-v0.10.1-repack/rexglue-sdk-0.10.1-win-amd64-raw.zip
+      REXAUTO_SDK_PIN: "0"
+    steps:
+      - checkout
+
+      - run:
+          name: Job start (timer)
+          command: |
+            $env:REXAUTO_WORK = "$env:CIRCLE_WORKING_DIRECTORY\autoports"
+            $env:REXAUTO_WORK | Out-File -FilePath "$env:CIRCLE_WORKING_DIRECTORY\autoports.env" -Encoding utf8
+            $start = Get-Date
+            $start.ToString("o") | Out-File -FilePath "$env:CIRCLE_WORKING_DIRECTORY\job-start.txt" -Encoding utf8
+            Write-Host "JOB_START=$start"
+
+      - run:
+          name: Checkout rexauto (pinned commit)
+          command: |
+            git clone https://github.com/Player124413/rexauto.git rexauto
+            Set-Location rexauto
+            git checkout $env:REXAUTO_REF
+            git rev-parse HEAD
+
+      - run:
+          name: Python deps (gdown 5.2.0, pin por fuzzy)
+          command: |
+            python --version
+            python -m pip install -q --upgrade pip pillow "gdown==5.2.0"
+            python -c "import gdown; print('gdown version:', gdown.__version__)"
+
+      - run:
+          name: Toolchain (vcvars + clang)
+          command: |
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+            if (-not (Test-Path $vcvars)) { Write-Host "vcvars64.bat not found"; exit 1 }
+            "VCVARS=$vcvars" | Out-File -FilePath $env:CIRCLE_WORKING_DIRECTORY\toolchain.env -Append -Encoding utf8
+            if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+              "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:CIRCLE_WORKING_DIRECTORY\toolchain.env -Append -Encoding utf8
+              "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:CIRCLE_WORKING_DIRECTORY\toolchain.env -Append -Encoding utf8
+            }
+            Write-Host "toolchain OK"
+
+      - run:
+          name: Install ReXGlue SDK
+          command: |
+            Set-Location rexauto
+            python tools/ci_sdk.py install
+
+      - run:
+          name: Verify SDK pin
+          command: |
+            Set-Location rexauto
+            python tools/ci_sdk.py verify
+
+      - run:
+          name: Download game input
+          command: |
+            Set-Location rexauto
+            python tools/ci_fetch.py "<< parameters.iso_url >>" "$env:TEMP\input"
+
+      - run:
+          name: Verify ISO SHA-256
+          command: |
+            $expected = "<< parameters.iso_sha256 >>".Trim().ToUpper()
+            $container = Get-ChildItem "$env:TEMP\input" -File | Select-Object -First 1
+            $actual = (Get-FileHash -Algorithm SHA256 $container.FullName).Hash
+            Write-Host "expected: $expected"
+            Write-Host "actual:   $actual"
+            if ($actual -ne $expected) { Write-Host "SHA-256 mismatch"; exit 1 }
+
+      - run:
+          name: "Recompile phase 1 (extract + init) [TIMED]"
+          command: |
+            $work = "$env:CIRCLE_WORKING_DIRECTORY\autoports"
+            $env:REXAUTO_WORK = $work
+            Set-Location rexauto
+            $t = Measure-Command {
+              $args = @("$env:TEMP\input", "--name", $env:REX_PROJECT,
+                        "--no-jumptables", "--heal-iters", "<< parameters.heal_iters >>", "--publish-gabarito",
+                        "--until", "init")
+              New-Item -ItemType Directory -Force "$work\$env:REX_PROJECT" | Out-Null
+              python rexauto.py @args 2>&1 | Tee-Object -FilePath "$work\$env:REX_PROJECT\_pipeline-init.log"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            "PHASE1_INIT_MINUTES=$([math]::Round($t.TotalMinutes, 2))" | Out-File -FilePath "$env:CIRCLE_WORKING_DIRECTORY\timing.txt" -Append -Encoding utf8
+            Write-Host "PHASE1_INIT_MINUTES=$([math]::Round($t.TotalMinutes, 2))"
+
+      - run:
+          name: Inject register-as-local into the manifest
+          command: |
+            $work = "$env:CIRCLE_WORKING_DIRECTORY\autoports"
+            $port = "$work\$env:REX_PROJECT\port"
+            $manifest = Join-Path $port "$env:REX_PROJECT`_manifest.toml"
+            if (-not (Test-Path $manifest)) { Write-Host "manifest not found at $manifest"; exit 1 }
+            $keys = @(
+              "ctr_as_local = true",
+              "xer_as_local = true",
+              "reserved_as_local = true",
+              "cr_as_local = true",
+              "non_argument_as_local = true",
+              "skip_lr = false",
+              "skip_msr = true"
+            )
+            $names = @("ctr_as_local","xer_as_local","reserved_as_local","cr_as_local","non_argument_as_local","non_volatile_as_local","skip_lr","skip_msr")
+            $lines = [System.IO.File]::ReadAllLines($manifest)
+            $kept = @()
+            foreach ($l in $lines) {
+              $m = [regex]::Match($l, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+              if ($m.Success -and ($names -contains $m.Groups[1].Value)) { continue }
+              $kept += $l
+            }
+            $idx = -1
+            for ($i = 0; $i -lt $kept.Count; $i++) { if ($kept[$i] -match '^\s*\[entrypoint\]\s*$') { $idx = $i; break } }
+            if ($idx -lt 0) { Write-Host "[entrypoint] section not found in $manifest"; exit 1 }
+            $block = @("# register-as-local (injected by the workflow; hunt 4 P0-1; Alice T1/T2 2026-11-15: no non_volatile_as_local, skip_msr = true):") + $keys
+            $new = @()
+            $new += $kept[0..$idx]
+            $new += $block
+            if (($idx + 1) -lt $kept.Count) { $new += $kept[($idx+1)..($kept.Count-1)] }
+            [System.IO.File]::WriteAllLines($manifest, $new)
+            Write-Host "manifest updated: $($keys.Count) codegen keys injected"
+
+      - run:
+          name: "Recompile phase 2 (codegen + heal + build) [TIMED]"
+          command: |
+            $work = "$env:CIRCLE_WORKING_DIRECTORY\autoports"
+            $env:REXAUTO_WORK = $work
+            Set-Location rexauto
+            $t = Measure-Command {
+              $args = @("$env:TEMP\input", "--name", $env:REX_PROJECT,
+                        "--no-jumptables", "--heal-iters", "<< parameters.heal_iters >>", "--publish-gabarito",
+                        "--from", "setjmp")
+              if ("<< parameters.runheal >>" -ne "true") { $args += @("--until", "build") }
+              python rexauto.py @args 2>&1 | Tee-Object -FilePath "$work\$env:REX_PROJECT\_pipeline.log"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            "PHASE2_CODEGEN_MINUTES=$([math]::Round($t.TotalMinutes, 2))" | Out-File -FilePath "$env:CIRCLE_WORKING_DIRECTORY\timing.txt" -Append -Encoding utf8
+            Write-Host "PHASE2_CODEGEN_MINUTES=$([math]::Round($t.TotalMinutes, 2))"
+
+      - run:
+          name: Localize generated code (sin tripwire — medición)
+          command: |
+            $work = "$env:CIRCLE_WORKING_DIRECTORY\autoports"
+            $gen = "$work\$env:REX_PROJECT\port\generated\default"
+            python "$env:CIRCLE_WORKING_DIRECTORY\tools\localize_fix_col.py" "$gen\childoflight_recomp.*.cpp"
+            exit $LASTEXITCODE
+
+      - run:
+          name: Timing summary
+          command: |
+            $start = [datetime]::Parse((Get-Content "$env:CIRCLE_WORKING_DIRECTORY\job-start.txt"))
+            $total = (Get-Date) - $start
+            "TOTAL_JOB_MINUTES=$([math]::Round($total.TotalMinutes, 2))" | Out-File -FilePath "$env:CIRCLE_WORKING_DIRECTORY\timing.txt" -Append -Encoding utf8
+            Get-Content "$env:CIRCLE_WORKING_DIRECTORY\timing.txt"
+
+      - store_artifacts:
+          path: timing.txt
+          destination: timing.txt
+
+      - store_artifacts:
+          path: autoports/childoflight/_pipeline.log
+          destination: pipeline.log
+
+      - store_artifacts:
+          path: autoports/childoflight/_pipeline-init.log
+          destination: pipeline-init.log
+
+workflows:
+  measure:
+    jobs:
+      - measure-recompile
