@@ -125,17 +125,22 @@ export GRADLE_USER_HOME=$HOME/.gradle
 export GRADLE_OPTS="-Djava.net.preferIPv4Stack=true"
 export CMAKE_BUILD_PARALLEL_LEVEL=1
 export PATH=$JAVA_HOME/bin:$HOME/workspace/tools/gradle-8.14/bin:$PATH
+# (Ronda 10, auditor F - R10-F3.) VersionCode 6, no 5: la 1.4.1 plana
+# (run-release-build-v141.sh:50) ya usa el 5, y Android ordena solo por
+# versionCode: dos releases distintas con el mismo codigo no se
+# distinguen al actualizar. El resto de pares full/plano comparten
+# codigo porque son LA MISMA version; aqui 1.4.2-full > 1.4.1.
+# NOTA (2026-11-17): este comentario NO puede ir DENTRO del comando
+# gradle de abajo: una linea de comentario corta la continuacion
+# (backslash al final) y la linea siguiente se ejecuta como comando
+# suelto (-PrexVersionCode=6: command not found) y el build sale sin
+# -PrexFull=true. Por eso vive aqui arriba, fuera del comando.
 /home/hatch/workspace/tools/gradle-8.14/bin/gradle :app:assembleRelease \
   --no-daemon --max-workers=1 --offline \
   -x lintVitalAnalyzeRelease -x lintVitalReportRelease -x lintVitalRelease \
   -PrexName=childoflight -PrexTitle="Child of Light" -PrexTitleId=5841140D \
   -PrexPortDir=$HOME/workspace/col-recomp/autoports/childoflight/port \
   -PrexSdkDir=$HOME/workspace/col-recomp/tools/rexauto/android/sdk/rexglue-sdk \
-  # (Ronda 10, auditor F - R10-F3.) VersionCode 6, no 5: la 1.4.1 plana
-  # (run-release-build-v141.sh:50) ya usa el 5, y Android ordena solo por
-  # versionCode: dos releases distintas con el mismo codigo no se
-  # distinguen al actualizar. El resto de pares full/plano comparten
-  # codigo porque son LA MISMA version; aqui 1.4.2-full > 1.4.1.
   -PrexVersionCode=6 -PrexVersionName=1.4.2-full -PrexFull=true || exit 1
 echo "[full] APK base construida: $(stat -c%s "$APK") B"
 # --- inyeccion del STFS como entrada STORED (sin comprimir) ---
