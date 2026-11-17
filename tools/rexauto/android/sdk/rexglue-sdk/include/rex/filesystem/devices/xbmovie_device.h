@@ -26,11 +26,20 @@
 #include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 
+// Declared at global scope, like every other REXCVAR_DECLARE in the SDK
+// (rex/filesystem/vfs.h, rex/graphics/flags.h, rex/filesystem/flags.h):
+// the matching REXCVAR_DEFINE_BOOL in xbmovie_device.cpp is at global scope,
+// and the cvar is read from namespace rex (runtime.cpp) and
+// rex::kernel::xboxkrnl (xboxkrnl_io.cpp), where an unqualified REXCVAR_GET
+// only finds global-scope names. Declaring it inside rex::filesystem made
+// runtime.cpp:418 fail with "use of undeclared identifier
+// 'FLAGS_xbmovie_probe_storage_'" (run #4) and would have left the declared
+// rex::filesystem:: accessor without a definition at link.
+REXCVAR_DECLARE(bool, xbmovie_probe);
+
 namespace rex::filesystem {
 
 class XbMovieEntry;
-
-REXCVAR_DECLARE(bool, xbmovie_probe);
 
 class XbMovieDevice : public Device {
  public:
