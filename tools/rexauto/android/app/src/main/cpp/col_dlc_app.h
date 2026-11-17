@@ -5,7 +5,7 @@
 // has no ReXApp hooks at all, so there is no place to run post-setup work.
 // This subclass adds the one hook the port needs: OnPostSetup runs the DLC
 // installer (col_dlc_installer) once the kernel state and content manager
-// exist, before the game starts. It keeps ChildOfLightApp as its base so
+// exist, before the game starts. It keeps ChildoflightApp as its base so
 // any behaviour the generated app gains later is inherited.
 //
 // Registration lives in col_main.cpp (REX_DEFINE_APP), compiled into the
@@ -19,15 +19,23 @@
 
 #include <rex/logging.h>
 
+// The generated childoflight_app.h uses PPCImageConfig (declared extern in
+// the generated PCH, via childoflight_init.h) but includes neither header
+// itself: the generated src/main.cpp provides it by including the init header
+// first. Our col_main.cpp bypasses that main.cpp, so include it here, before
+// the app header, or this TU fails with "use of undeclared identifier
+// 'PPCImageConfig'" (run #1, APK job, Gradle assembleRelease). The init header
+// lives in generated/default/, which CMake adds to this target's includes.
+#include "childoflight_init.h"
 #include "childoflight_app.h"
 #include "col_dlc_installer.h"
 
-class ColDlcApp : public ChildOfLightApp {
+class ColDlcApp : public ChildoflightApp {
  public:
-  using ChildOfLightApp::ChildOfLightApp;
+  using ChildoflightApp::ChildoflightApp;
 
   // NOTE: the return type must be unique_ptr<WindowedApp> (the Creator
-  // type), exactly like ChildOfLightApp::Create — NOT unique_ptr<ColDlcApp>.
+  // type), exactly like ChildoflightApp::Create — NOT unique_ptr<ColDlcApp>.
   // A function returning unique_ptr<Derived> does NOT convert to a function
   // pointer returning unique_ptr<Base>, so REX_DEFINE_APP rejects it
   // ("no matching constructor for CreatorRegistration"). The inner

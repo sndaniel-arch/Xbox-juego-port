@@ -108,7 +108,7 @@ add_library(main SHARED
     android_main.cpp
     stfs_asset_jni.cpp
     # M1 v1.4.2: the port src/main.cpp is NOT used here. It registers
-    # ChildOfLightApp, which has no ReXApp hooks; col_main.cpp registers
+    # ChildoflightApp, which has no ReXApp hooks; col_main.cpp registers
     # ColDlcApp instead (same "childoflight" identifier), whose OnPostSetup
     # installs the DLC packages. Keeping the registration in this tracked
     # tree also means a future `rexglue init` regenerating the port
