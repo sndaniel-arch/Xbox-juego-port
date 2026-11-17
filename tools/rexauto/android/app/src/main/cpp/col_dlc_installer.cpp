@@ -111,7 +111,7 @@ bool InstalledHeaderMatchesPackage(const std::filesystem::path& header_path,
     return false;
   }
   constexpr uint64_t kHeaderSize =
-      sizeof(rex::system::XCONTENT_AGGREGATE_DATA) + sizeof(uint32_t) +
+      sizeof(rex::system::xam::XCONTENT_AGGREGATE_DATA) + sizeof(uint32_t) +
       sizeof(uint64_t);
   if (header_size != kHeaderSize) {
     return false;
@@ -122,7 +122,7 @@ bool InstalledHeaderMatchesPackage(const std::filesystem::path& header_path,
   }
   uint64_t stored_size = 0;
   const long size_offset =
-      long(sizeof(rex::system::XCONTENT_AGGREGATE_DATA) + sizeof(uint32_t));
+      long(sizeof(rex::system::xam::XCONTENT_AGGREGATE_DATA) + sizeof(uint32_t));
   bool ok = std::fseek(file, size_offset, SEEK_SET) == 0 &&
             std::fread(&stored_size, 1, sizeof(stored_size), file) ==
                 sizeof(stored_size);
