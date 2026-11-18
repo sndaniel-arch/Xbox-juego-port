@@ -93,7 +93,7 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
   std::vector<uint8_t> patched_binary;
   const uint8_t* module_bytes = translated_binary().data();
   size_t module_size = translated_binary().size();
-  if (spirv_patch_enable) {
+  if (REXCVAR_GET(spirv_patch_enable)) {
     patched_binary = translated_binary();
     size_t word_count = patched_binary.size() / sizeof(uint32_t);
     if (!rex::graphics::spirv_patch::PatchForVulkan11(

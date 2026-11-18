@@ -2107,7 +2107,7 @@ size_t SpirvShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
   // texture binding: bounded degradation (the wrong texture instead of a
   // missing draw), never a crash. The 1x1-placeholder upgrade is a
   // follow-up (see batch README).
-  if (spirv_clamp_texture_bindings && !texture_bindings_.empty() &&
+  if (REXCVAR_GET(spirv_clamp_texture_bindings) && !texture_bindings_.empty() &&
       texture_bindings_.size() >= features_.max_per_stage_sampled_images) {
     if (!texture_bindings_clamped_) {
       texture_bindings_clamped_ = true;
@@ -2180,7 +2180,7 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
   // (Batch 1 — descriptor-set audit.) Same clamp as textures, against
   // maxPerStageDescriptorSamplers. Overflow samplers reuse the shader's
   // first sampler binding.
-  if (spirv_clamp_texture_bindings && !sampler_bindings_.empty() &&
+  if (REXCVAR_GET(spirv_clamp_texture_bindings) && !sampler_bindings_.empty() &&
       sampler_bindings_.size() >= features_.max_per_stage_samplers) {
     if (!sampler_bindings_clamped_) {
       sampler_bindings_clamped_ = true;

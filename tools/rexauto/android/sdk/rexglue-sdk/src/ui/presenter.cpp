@@ -1551,7 +1551,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       // Make outdated if previously optimal, now suboptimal, but don't cause
       // the connection to become outdated if it has been suboptimal from the
       // very beginning.
-      if (presenter_recreate_on_suboptimal &&
+      if (REXCVAR_GET(presenter_recreate_on_suboptimal) &&
           surface_paint_connection_was_optimal_at_successful_paint_) {
         surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
         const uint32_t recreate_n = ++suboptimal_recreate_count;
