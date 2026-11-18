@@ -31,6 +31,21 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
+// (Batch 1 — swapchain audit, Rayman recipe.) When true (default), a
+// VK_SUBOPTIMAL_KHR present still marks the connection outdated the first
+// time it follows an optimal present — the current behavior, which is
+// correct in steady state. When false, the swapchain is never recreated
+// for a merely suboptimal present (Rayman-strict: recreate only on
+// VK_ERROR_OUT_OF_DATE_KHR / VK_ERROR_SURFACE_LOST_KHR); use it to test
+// whether a recreate loop is costing frames on the phone. The diagnostic
+// counters in PaintAndPresent log suboptimal presents and recreates so a
+// loop is visible in the log either way.
+REXCVAR_DEFINE_BOOL(presenter_recreate_on_suboptimal, true, "UI/Presenter",
+                    "Recreate the swapchain when a present returns "
+                    "VK_SUBOPTIMAL_KHR after an optimal present. False = "
+                    "Rayman-strict: recreate only on OUT_OF_DATE or "
+                    "SURFACE_LOST.");
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
@@ -1525,14 +1540,34 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
       break;
-    case PaintResult::kPresentedSuboptimal:
+    case PaintResult::kPresentedSuboptimal: {
+      // (Batch 1 — swapchain audit.) Diagnostic counters so a suboptimal /
+      // recreate loop is visible in the phone log. PaintAndPresent can run
+      // from more than one thread, so the counters are atomic; exactness
+      // does not matter, the order of magnitude does.
+      static std::atomic<uint32_t> suboptimal_present_count = 0;
+      static std::atomic<uint32_t> suboptimal_recreate_count = 0;
+      const uint32_t suboptimal_n = ++suboptimal_present_count;
       // Make outdated if previously optimal, now suboptimal, but don't cause
       // the connection to become outdated if it has been suboptimal from the
       // very beginning.
-      if (surface_paint_connection_was_optimal_at_successful_paint_) {
+      if (presenter_recreate_on_suboptimal &&
+          surface_paint_connection_was_optimal_at_successful_paint_) {
         surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
+        const uint32_t recreate_n = ++suboptimal_recreate_count;
+        REXLOG_INFO(
+            "Presenter: suboptimal present #{} triggered swapchain recreate "
+            "#{} (set presenter_recreate_on_suboptimal=false to test "
+            "Rayman-strict mode)",
+            suboptimal_n, recreate_n);
+      } else if (suboptimal_n % 600 == 0) {
+        REXLOG_INFO(
+            "Presenter: {} suboptimal presents so far, {} recreates "
+            "triggered by them",
+            suboptimal_n, suboptimal_recreate_count.load());
       }
       break;
+    }
     case PaintResult::kNotPresentedConnectionOutdated:
       surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
       break;

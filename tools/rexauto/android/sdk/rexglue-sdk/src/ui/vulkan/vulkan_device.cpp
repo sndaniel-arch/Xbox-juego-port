@@ -749,6 +749,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSampledImages)
   XE_UI_VULKAN_LIMIT(maxPerStageResources)
+  // (Batch 1 — descriptor-set audit.) Now read and logged for the first
+  // time: until now nothing ever looked at maxBoundDescriptorSets, even
+  // though the guest shader layout needs exactly 4 sets (the Vulkan
+  // minimum).
+  XE_UI_VULKAN_LIMIT(maxBoundDescriptorSets)
   XE_UI_VULKAN_LIMIT(maxVertexOutputComponents)
   XE_UI_VULKAN_LIMIT(maxTessellationEvaluationOutputComponents)
   XE_UI_VULKAN_LIMIT(maxGeometryInputComponents)
@@ -774,6 +779,21 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
+
+  // (Batch 1 — descriptor-set audit.) The guest shader pipeline layout
+  // binds exactly 4 descriptor sets (see SpirvShaderTranslator::
+  // kDescriptorSetCount). The Vulkan minimum for maxBoundDescriptorSets is
+  // 4, so a conformant device always fits — but if one ever reports less,
+  // say so loudly in the log instead of failing later with an opaque
+  // pipeline-layout error. The device is NOT rejected here: a below-minimum
+  // report is a driver bug worth diagnosing, not a reason to refuse to run.
+  if (device->properties_.maxBoundDescriptorSets < 4) {
+    REXLOG_ERROR(
+        "Vulkan device reports maxBoundDescriptorSets = {}, but the guest "
+        "shader layout needs 4 descriptor sets; pipeline creation will "
+        "likely fail",
+        device->properties_.maxBoundDescriptorSets);
+  }
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)

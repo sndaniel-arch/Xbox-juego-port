@@ -345,6 +345,82 @@ jobs:
           }
           Write-Host "manifest updated: $($keys.Count) codegen keys injected into $manifest"
 
+      - name: Inject phone-reported functions into functions.toml
+        shell: pwsh
+        run: |
+          # Run #7 seed (2026-11-17): the phone hit two guest functions the
+          # recompile never emitted (0x8290ACE0, 0x82170148 -- "Call to invalid
+          # or unregistered function" then SIGSEGV in sub_8231A960 after ~7 s
+          # of black screen), and the coverage audit found 22 more of the
+          # same family as XEX pointers (run7/coverage-audit.md; the method
+          # validated 2/2 on the proven crashes). The Windows runheal loop
+          # never reaches these: they are called right after the SDL
+          # controller enumeration + audio init, which differs on Windows.
+          # Seed them, plus the 7 cured by run #6 (a clean checkout would
+          # otherwise regress them), into childoflight_functions.toml -- the
+          # only function input the recompile accepts (created empty by
+          # stage_init, read by codegen; runheal writes there too).
+          # Idempotent: any previous copy of these addresses is dropped
+          # first (re-runs). The file must end with exactly 31 entries.
+          $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
+          $fns = Join-Path $port "${{ env.REX_PROJECT }}_functions.toml"
+          if (-not (Test-Path $fns)) { Write-Host "::error::functions.toml not found at $fns -- the init stage did not produce it"; exit 1 }
+          $addrs = @(
+            "0x827AE120",
+            "0x827AE140",
+            "0x8290F800",
+            "0x8290F818",
+            "0x82923D18",
+            "0x82CCAA18",
+            "0x82CCC8F8",
+            "0x8290ACE0",
+            "0x82170148",
+            "0x82170128",
+            "0x82170138",
+            "0x822285B8",
+            "0x822285C8",
+            "0x822285D8",
+            "0x8290ACA8",
+            "0x8290ACB0",
+            "0x8290ACB8",
+            "0x8290ACC0",
+            "0x8290ACD0",
+            "0x8290ACD8",
+            "0x8290AD38",
+            "0x8290F810",
+            "0x82910BC0",
+            "0x82910BD0",
+            "0x82910BD8",
+            "0x82910BE0",
+            "0x82910BE8",
+            "0x82910BF0",
+            "0x82910BF8",
+            "0x82910C00",
+            "0x82910C08"
+          )
+          $lines = [System.IO.File]::ReadAllLines($fns)
+          $kept = @()
+          foreach ($l in $lines) {
+            $m = [regex]::Match($l, '^\s*"(0x[0-9A-Fa-f]+)"\s*=')
+            if ($m.Success -and ($addrs -contains $m.Groups[1].Value)) { continue }
+            $kept += $l
+          }
+          $idx = -1
+          for ($i = 0; $i -lt $kept.Count; $i++) { if ($kept[$i] -match '^\s*\[functions\]\s*$') { $idx = $i; break } }
+          if ($idx -lt 0) { Write-Host "::error::[functions] section not found in $fns"; exit 1 }
+          $block = @()
+          foreach ($a in $addrs) { $block += "`"$a`" = {}" }
+          $new = @()
+          $new += $kept[0..$idx]
+          $new += $block
+          if (($idx + 1) -lt $kept.Count) { $new += $kept[($idx+1)..($kept.Count-1)] }
+          [System.IO.File]::WriteAllLines($fns, $new)
+          foreach ($a in $addrs) {
+            $hits = @(Select-String -Path $fns -Pattern ('^\s*"' + [regex]::Escape($a) + '"\s*=\s*\{\}\s*$'))
+            if ($hits.Count -ne 1) { Write-Host "::error::functions entry '$a' found $($hits.Count) times (want exactly 1)"; exit 1 }
+          }
+          Write-Host "functions.toml updated: $($addrs.Count) phone-reported + audit functions seeded into $fns"
+
       - name: Recompile (codegen + static heal + build check)
         shell: pwsh
         working-directory: rexauto

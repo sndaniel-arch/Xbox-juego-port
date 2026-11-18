@@ -3348,6 +3348,26 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
     return it_existing->second;
   }
 
+  // (Batch 1 — descriptor-set audit.) The translator already clamps texture
+  // and sampler bindings to the device limits, so reaching this point with
+  // more bindings than the device allows means a shader bypassed the clamp
+  // (or a non-translator caller asked for too many). Fail loudly instead of
+  // building a descriptor set layout the device cannot honor.
+  {
+    const auto& properties = GetVulkanDevice()->properties();
+    if (texture_count > properties.maxPerStageDescriptorSampledImages ||
+        sampler_count > properties.maxPerStageDescriptorSamplers) {
+      REXGPU_ERROR(
+          "VulkanCommandProcessor: texture descriptor set layout requested "
+          "with {} textures / {} samplers, but the device allows only {} / "
+          "{} per stage; the translator clamp was bypassed",
+          texture_count, sampler_count,
+          properties.maxPerStageDescriptorSampledImages,
+          properties.maxPerStageDescriptorSamplers);
+      return VK_NULL_HANDLE;
+    }
+  }
+
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
