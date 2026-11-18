@@ -472,7 +472,7 @@ jobs:
             "0x82B612E8",
             "0x82C2BAD0",
             "0x82C5AAA8",
-            "0x82C65C10",
+            "0x82C65C10"
           )
           $lines = [System.IO.File]::ReadAllLines($fns)
           $kept = @()
