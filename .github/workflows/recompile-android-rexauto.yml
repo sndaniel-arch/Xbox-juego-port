@@ -134,6 +134,12 @@ on:
         default: false
         type: boolean
 
+      xbmovie_probe:
+        description: "Enable the xbmovie probe device for this run (run #9 experiment: the logo movie open returns EOF instead of failing, to test whether the guest waits for the movie)"
+        required: false
+        default: false
+        type: boolean
+
 run-name: "Android: childoflight (rexauto)"
 
 permissions:
@@ -348,20 +354,22 @@ jobs:
       - name: Inject phone-reported functions into functions.toml
         shell: pwsh
         run: |
-          # Run #7 seed (2026-11-17): the phone hit two guest functions the
-          # recompile never emitted (0x8290ACE0, 0x82170148 -- "Call to invalid
-          # or unregistered function" then SIGSEGV in sub_8231A960 after ~7 s
-          # of black screen), and the coverage audit found 22 more of the
-          # same family as XEX pointers (run7/coverage-audit.md; the method
-          # validated 2/2 on the proven crashes). The Windows runheal loop
-          # never reaches these: they are called right after the SDL
-          # controller enumeration + audio init, which differs on Windows.
-          # Seed them, plus the 7 cured by run #6 (a clean checkout would
-          # otherwise regress them), into childoflight_functions.toml -- the
-          # only function input the recompile accepts (created empty by
-          # stage_init, read by codegen; runheal writes there too).
+          # Run #9 seed (2026-11-18): the phone hit one more guest function
+          # the recompile never emitted (0x8291FEE0 -- "Call to invalid or
+          # unregistered function" in the FULL v1.4.3 log, right before the
+          # logo movie lookup), and the expert sweep (run9/expert-sweep.md)
+          # re-derived the whole gap: 68 more of the same family as XEX
+          # pointers, drag 0 (none calls another gap function directly),
+          # all with complete bodies. The phone proved the pattern 3 times
+          # (crash 1 -> 2, crash 2 -> 2, now 0x8291FEE0), so all 68 go in
+          # this run instead of one cycle each. Plus the 31 from runs #6-#8
+          # (a clean checkout would otherwise regress them), into
+          # childoflight_functions.toml -- the only function input the
+          # recompile accepts (created empty by stage_init, read by codegen;
+          # runheal writes there too). NEVER seed 0x82A51854 (switch label)
+          # or the 9 code-region addresses (expert-sweep.md §5).
           # Idempotent: any previous copy of these addresses is dropped
-          # first (re-runs). The file must end with exactly 31 entries.
+          # first (re-runs). The file must end with exactly 99 entries.
           $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
           $fns = Join-Path $port "${{ env.REX_PROJECT }}_functions.toml"
           if (-not (Test-Path $fns)) { Write-Host "::error::functions.toml not found at $fns -- the init stage did not produce it"; exit 1 }
@@ -396,7 +404,75 @@ jobs:
             "0x82910BF0",
             "0x82910BF8",
             "0x82910C00",
-            "0x82910C08"
+            "0x82910C08",
+            "0x82251278",
+            "0x822C4440",
+            "0x8237CE08",
+            "0x82391570",
+            "0x82391768",
+            "0x823942B0",
+            "0x82399D00",
+            "0x8239AEB0",
+            "0x823B7DE8",
+            "0x823FA170",
+            "0x823FC8B8",
+            "0x823FF290",
+            "0x823FF2B0",
+            "0x82403F38",
+            "0x8240A460",
+            "0x8240EC08",
+            "0x824896A8",
+            "0x8251ED38",
+            "0x82597EB0",
+            "0x8260FA20",
+            "0x826B22A8",
+            "0x826B22B8",
+            "0x826D0DA8",
+            "0x826DC7B8",
+            "0x827030D8",
+            "0x8272AA48",
+            "0x827CF9B0",
+            "0x828FDF18",
+            "0x829005B8",
+            "0x8291FEE0",
+            "0x82920A60",
+            "0x829217C0",
+            "0x82924698",
+            "0x8292C0F8",
+            "0x8292D900",
+            "0x8292D908",
+            "0x8292F170",
+            "0x8292F188",
+            "0x8292F198",
+            "0x8294CA7C",
+            "0x82951C24",
+            "0x82952B18",
+            "0x8295A368",
+            "0x8295A380",
+            "0x8295A3A0",
+            "0x8295A528",
+            "0x8295A548",
+            "0x8295A568",
+            "0x8295A588",
+            "0x8295A5A8",
+            "0x8295A5C8",
+            "0x8295A5E8",
+            "0x8295A608",
+            "0x8295A628",
+            "0x8295A648",
+            "0x82961660",
+            "0x82A5A310",
+            "0x82AB9858",
+            "0x82AB98E0",
+            "0x82AB9908",
+            "0x82AB9930",
+            "0x82AB9958",
+            "0x82AB9D70",
+            "0x82AB9D90",
+            "0x82B612E8",
+            "0x82C2BAD0",
+            "0x82C5AAA8",
+            "0x82C65C10",
           )
           $lines = [System.IO.File]::ReadAllLines($fns)
           $kept = @()
@@ -644,6 +720,27 @@ jobs:
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_device.cpp
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_entry.cpp
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_file.cpp
+
+      - name: Enable xbmovie_probe for this run (if requested)
+        if: inputs.xbmovie_probe
+        run: |
+          set -euo pipefail
+          # Run #9 experiment (blackscreen-diagnosis.md §6.3, expert-sweep.md
+          # §8.1.3): the guest may be waiting for the end of the logo movie,
+          # and the xbmovie: device does not exist, so the open fails. With
+          # the probe on, the open succeeds and reads return EOF at once, so
+          # the movie "ends" immediately. Only the default in the overlaid
+          # SDK copy (the file CMake compiles) is flipped, only when the
+          # workflow input is true; the tracked file keeps default false.
+          # Reversible by design: the next run without the input rebuilds
+          # from the tracked default.
+          f="rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_device.cpp"
+          test -f "$f"
+          n="$(grep -c 'REXCVAR_DEFINE_BOOL(xbmovie_probe, false,' "$f")"
+          if [ "$n" != "1" ]; then echo "::error::xbmovie_probe default pattern found $n times (want 1)"; exit 1; fi
+          sed -i 's/REXCVAR_DEFINE_BOOL(xbmovie_probe, false,/REXCVAR_DEFINE_BOOL(xbmovie_probe, true,/' "$f"
+          grep -n 'REXCVAR_DEFINE_BOOL(xbmovie_probe' "$f"
+          echo "xbmovie_probe default set to true for this run (input xbmovie_probe=true)"
 
       - name: Android CMake 3.31.1
         run: |
