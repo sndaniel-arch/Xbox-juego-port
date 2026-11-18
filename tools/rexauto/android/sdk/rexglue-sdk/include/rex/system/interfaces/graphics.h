@@ -65,6 +65,14 @@ class IGraphicsSystem {
   // the pin when it is null).
   virtual ::rex::graphics::CommandProcessor* command_processor() const { return nullptr; }
 
+  // Pin the GPU command processor worker thread to the given big-core mask.
+  // Default: no-op. ReXApp's big-core pin uses this instead of calling
+  // CommandProcessor::CallInThread() directly: the command processor lives
+  // in the GPU plugin (librexgpu-xenos.so), which consumers never link, so
+  // a direct call from the app fails at link time (run #13). The override
+  // runs the pin on the worker thread itself, inside the plugin.
+  virtual void pin_command_processor_thread(uint64_t mask) { (void)mask; }
+
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
     (void)callback;

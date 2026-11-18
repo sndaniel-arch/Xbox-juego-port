@@ -70,6 +70,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const override { return command_processor_.get(); }
+  void pin_command_processor_thread(uint64_t mask) override;
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override;
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;

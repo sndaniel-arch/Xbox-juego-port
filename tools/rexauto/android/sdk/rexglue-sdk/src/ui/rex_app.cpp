@@ -528,14 +528,12 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
     // Pin the command processor ("GPU Commands") worker too. It lives in
     // librexgpu-xenos.so, whose cvar registry copy cannot see
     // pin_big_cores_mask (rexcore is an OBJECT library), so the effective
-    // mask resolved above is passed by value through CallInThread, which
-    // runs the pin on the worker thread itself.
+    // mask resolved above is passed by value through the IGraphicsSystem
+    // pin_command_processor_thread() capability, which runs the pin on the
+    // worker thread itself inside the plugin (the app never calls the
+    // plugin's CommandProcessor directly — run #13 link failure).
     if (auto* graphics_system = runtime_->graphics_system()) {
-      if (auto* command_processor = graphics_system->command_processor()) {
-        command_processor->CallInThread([big_core_mask]() {
-          rex::big_core::PinCurrentThreadToBigCores(big_core_mask, "GPU Commands");
-        });
-      }
+      graphics_system->pin_command_processor_thread(big_core_mask);
     }
 #endif
 
