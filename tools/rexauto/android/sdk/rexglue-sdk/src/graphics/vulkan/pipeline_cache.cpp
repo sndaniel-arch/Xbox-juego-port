@@ -3613,6 +3613,40 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;
+  // (Run #9, watchdog.) The phone stalls inside vkCreateGraphicsPipelines
+  // for one pipeline (VS CDCF790FF0DF4360, 2026-11-18) with no timeout
+  // anywhere in this path: dump the full description on entry and the
+  // elapsed time on every exit, so a hang shows up as an entry line without
+  // an exit line. Logs only, no behavior change.
+  const auto watchdog_start = std::chrono::steady_clock::now();
+  {
+    const uint32_t color_rts_used = description.render_pass_key.depth_and_color_used >> 1;
+    uint32_t color_rt_count = 0;
+    bool color_blend_states_differ = false;
+    int first_color_rt = -1;
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if ((color_rts_used & (uint32_t(1) << i)) == 0) {
+        continue;
+      }
+      ++color_rt_count;
+      if (first_color_rt < 0) {
+        first_color_rt = int(i);
+      } else if (std::memcmp(&description.render_targets[i],
+                             &description.render_targets[first_color_rt],
+                             sizeof(PipelineRenderTarget)) != 0) {
+        color_blend_states_differ = true;
+      }
+    }
+    REXGPU_INFO(
+        "VulkanPipelineCache: creating pipeline (watchdog): topo={}, "
+        "tess_mode={}, render_pass_key=0x{:08X}, msaa_samples={}, "
+        "polygon_mode={}, depth_clamp_enable={}, color_rts={}, "
+        "color_blend_states_differ={}",
+        uint32_t(description.primitive_topology), uint32_t(description.tessellation_mode),
+        description.render_pass_key.key, uint32_t(description.render_pass_key.msaa_samples),
+        uint32_t(description.polygon_mode), uint32_t(description.depth_clamp_enable),
+        color_rt_count, uint32_t(color_blend_states_differ));
+  }
   if (!ArePipelineRequirementsMet(description)) {
     assert_always(
         "When creating a new pipeline, the description must not require "
@@ -4072,12 +4106,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     REXGPU_ERROR(
         "VulkanPipelineCache: vkCreateGraphicsPipelines failed (result={}, vs={:016X}, "
         "ps={:016X}, topo={}, geom={}, tess_mode={}, patch_cp={}, render_pass_key=0x{:08X}, "
-        "dynamic_rendering={})",
+        "dynamic_rendering={}, elapsed_ms={})",
         int32_t(create_result), creation_arguments.vertex_shader->shader().ucode_data_hash(),
         ps_hash, uint32_t(description.primitive_topology), uint32_t(description.geometry_shader),
         uint32_t(description.tessellation_mode),
         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
-        uint32_t(use_dynamic_rendering));
+        uint32_t(use_dynamic_rendering),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - watchdog_start)
+            .count());
     return false;
   }
   bool was_placeholder =
@@ -4104,6 +4141,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // blob.
   pipelines_created_count_.fetch_add(1, std::memory_order_relaxed);
 
+  // (Run #9, watchdog.) Log the creation time on the success path too:
+  // with the entry dump above, a hang is an entry line with no exit line.
+  REXGPU_INFO(
+      "VulkanPipelineCache: pipeline created in {} ms (vs={:016X}, ps={:016X})",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - watchdog_start)
+          .count(),
+      creation_arguments.vertex_shader->shader().ucode_data_hash(),
+      creation_arguments.pixel_shader ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                                      : 0);
+
   return true;
 }
 
@@ -4128,7 +4176,26 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       ++creation_threads_busy_;
     }
 
+    // (Run #9, watchdog.) vkCreateGraphicsPipelines has no timeout and
+    // cannot be cancelled: if it ever returns after more than 5 s, say so
+    // out loud. A hang that never returns shows up as the entry dump in
+    // EnsurePipelineCreated with no exit line.
+    const auto thread_watchdog_start = std::chrono::steady_clock::now();
     bool created = EnsurePipelineCreated(creation_arguments);
+    const auto thread_watchdog_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - thread_watchdog_start)
+            .count();
+    if (thread_watchdog_elapsed_ms > 5000) {
+      REXGPU_ERROR(
+          "VulkanPipelineCache: pipeline creation exceeded 5 s (worker still inside "
+          "vkCreate?): vs={:016X}, ps={:016X}, elapsed_ms={}",
+          creation_arguments.vertex_shader->shader().ucode_data_hash(),
+          creation_arguments.pixel_shader
+              ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+              : 0,
+          thread_watchdog_elapsed_ms);
+    }
     if (!created) {
       bool has_placeholder =
           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
