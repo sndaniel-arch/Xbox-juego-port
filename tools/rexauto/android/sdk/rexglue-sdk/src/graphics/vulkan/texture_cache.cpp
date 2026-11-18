@@ -111,36 +111,6 @@ namespace {
 constexpr VkFormat kInvalidTextureFetchFallbackFormat = VK_FORMAT_R8G8B8A8_UNORM;
 const VkClearColorValue kInvalidTextureFetchFallbackColor = {{0.0f, 0.0f, 0.0f, 0.0f}};
 
-// (Run #11, F3, point 7.) Placeholder textures: keys whose load failed
-// deterministically (no load shader, or no load pipeline for the format).
-// The flag lives here, in this file's anonymous namespace, keyed by the
-// texture identity (TextureKey) instead of on Texture itself, because
-// Texture is defined in rex/graphics/pipeline/texture/cache.h, out of scope
-// for this round. GetActiveBindingOrNullImageView() consults this set and
-// serves the cache's 1x1 null image instead of the uninitialized image, so
-// a format without a loader degrades to one valid texel instead of black
-// or garbage. Only deterministic failures are marked: transient failures
-// (scratch/descriptor allocation) keep retrying on the next frame.
-// All callers run on the graphics thread (same as RequestTextures).
-std::unordered_set<TextureKey, TextureKey::Hasher> g_placeholder_texture_keys;
-
-bool IsTexturePlaceholder(const TextureKey& key) {
-  return g_placeholder_texture_keys.find(key) != g_placeholder_texture_keys.end();
-}
-
-void MarkTexturePlaceholder(const TextureKey& key) {
-  if (g_placeholder_texture_keys.insert(key).second) {
-    REXGPU_WARN(
-        "VulkanTextureCache: Texture {}x{} {} (base at 0x{:08X}) has no loader "
-        "on this device; serving the 1x1 placeholder image",
-        key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name, key.base_page << 12);
-  }
-}
-
-void ClearTexturePlaceholder(const TextureKey& key) {
-  g_placeholder_texture_keys.erase(key);
-}
-
 // (Run #11, F3, point 6.) CPU staging for BC -> ETC2 transcoded uploads.
 // The shared-memory upload pool is private to VulkanSharedMemory, and the
 // compute scratch buffer is device-local, so the transcode path owns its
@@ -153,6 +123,40 @@ void ClearTexturePlaceholder(const TextureKey& key) {
 std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> g_etc2_upload_pool;
 constexpr VkDeviceSize kEtc2UploadPoolPageSize = VkDeviceSize(16) * 1024 * 1024;
 
+}  // namespace
+
+// (Run #12 fix for run #11, F3 points 6-7.) The helpers below used to live
+// as free functions in the anonymous namespace above, but they take
+// TextureKey, a PROTECTED nested type of TextureCache: free functions
+// cannot name the type at all, which broke the run #12 build. They are
+// private static members of VulkanTextureCache now (declared in
+// rex/graphics/vulkan/texture_cache.h); all callers are members, so call
+// sites are unchanged.
+bool VulkanTextureCache::IsTexturePlaceholder(const TextureKey& key) {
+  return PlaceholderTextureKeys().find(key) != PlaceholderTextureKeys().end();
+}
+
+void VulkanTextureCache::MarkTexturePlaceholder(const TextureKey& key) {
+  // Placeholder textures: keys whose load failed deterministically (no load
+  // shader, or no load pipeline for the format). GetActiveBindingOrNullImageView()
+  // consults this set and serves the cache's 1x1 null image instead of the
+  // uninitialized image, so a format without a loader degrades to one valid
+  // texel instead of black or garbage. Only deterministic failures are
+  // marked: transient failures (scratch/descriptor allocation) keep retrying
+  // on the next frame. All callers run on the graphics thread (same as
+  // RequestTextures).
+  if (PlaceholderTextureKeys().insert(key).second) {
+    REXGPU_WARN(
+        "VulkanTextureCache: Texture {}x{} {} (base at 0x{:08X}) has no loader "
+        "on this device; serving the 1x1 placeholder image",
+        key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name, key.base_page << 12);
+  }
+}
+
+void VulkanTextureCache::ClearTexturePlaceholder(const TextureKey& key) {
+  PlaceholderTextureKeys().erase(key);
+}
+
 // Reads one BC block (8 bytes for BC1, 16 for BC3) of a texture level from
 // guest CPU memory, applying the fetch endianness swap, and returns false
 // if the texture has no data for it. `level_layout` / `guest_level_base`
@@ -160,11 +164,11 @@ constexpr VkDeviceSize kEtc2UploadPoolPageSize = VkDeviceSize(16) * 1024 * 1024;
 // does (for a packed mip tail, the tail extent and its own base). Block
 // coordinates are in 4x4 blocks; `slice` is the array slice (1 for 3D,
 // where `bz` is the depth slice instead).
-bool ReadGuestBcBlock(const SharedMemory& shared_memory,
-                      const texture_util::TextureGuestLayout::Level& level_layout,
-                      uint32_t guest_level_base, const TextureKey& key, bool is_3d_tiling,
-                      uint32_t bx, uint32_t by, uint32_t bz, uint32_t slice, uint8_t* block_out,
-                      uint32_t bytes_per_block) {
+bool VulkanTextureCache::ReadGuestBcBlock(
+    const SharedMemory& shared_memory,
+    const texture_util::TextureGuestLayout::Level& level_layout, uint32_t guest_level_base,
+    const TextureKey& key, bool is_3d_tiling, uint32_t bx, uint32_t by, uint32_t bz,
+    uint32_t slice, uint8_t* block_out, uint32_t bytes_per_block) {
   uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
   uint32_t pitch_blocks = level_layout.row_pitch_bytes / bytes_per_block;
   uint32_t block_offset;
@@ -203,8 +207,9 @@ bool ReadGuestBcBlock(const SharedMemory& shared_memory,
 // the transparent texels render opaque. Game textures are static data, so
 // this is accepted for run #11; the correct fix is storing the decision on
 // the Texture at creation (needs cache.h, out of scope here).
-bool Dxt1TextureHasOneBitAlpha(const SharedMemory& shared_memory, const TextureKey& key,
-                               const texture_util::TextureGuestLayout& guest_layout) {
+bool VulkanTextureCache::Dxt1TextureHasOneBitAlpha(
+    const SharedMemory& shared_memory, const TextureKey& key,
+    const texture_util::TextureGuestLayout& guest_layout) {
   static std::unordered_map<TextureKey, bool, TextureKey::Hasher> memo;
   auto it = memo.find(key);
   if (it != memo.end()) {
@@ -232,8 +237,6 @@ bool Dxt1TextureHasOneBitAlpha(const SharedMemory& shared_memory, const TextureK
   memo.emplace(key, has_alpha);
   return has_alpha;
 }
-
-}  // namespace
 
 static_assert(VK_FORMAT_UNDEFINED == VkFormat(0),
               "Assuming that skipping a VkFormat in an initializer results in "
