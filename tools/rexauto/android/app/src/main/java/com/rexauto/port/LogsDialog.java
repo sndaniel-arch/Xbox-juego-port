@@ -130,8 +130,8 @@ public final class LogsDialog {
     public static boolean showCrashReportIfAny(Activity activity, Runnable onDismiss) {
         File c = crashFile(activity);
         if (!c.isFile()) return false;
-        String report = tail(c, 6000);
-        String log = tail(gameLog(activity), 3000);
+        String report = tail(c, 20000);
+        String log = tail(gameLog(activity), 20000);
         String text = report + "\n--- últimas líneas del registro ---\n" + log;
         TextView tv = new TextView(activity);
         tv.setText(text);
@@ -166,7 +166,7 @@ public final class LogsDialog {
     public static void show(Activity activity) {
         String prev = tail(new File(logsDir(activity), "crash.prev.txt"), 4000);
         String cur = tail(crashFile(activity), 4000);
-        String log = tail(gameLog(activity), 6000);
+        String log = tail(gameLog(activity), 200000);
         String prof = tail(new File(logsDir(activity), "profile.txt"), 5000);
         String text = (cur.isEmpty() ? prev : cur);
         if (!text.isEmpty()) text = "--- último fallo ---\n" + text + "\n";

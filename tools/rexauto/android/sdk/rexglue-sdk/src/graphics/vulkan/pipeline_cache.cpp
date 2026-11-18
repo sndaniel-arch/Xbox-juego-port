@@ -31,6 +31,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/thread.h>
+#include <rex/thread/big_core_affinity.h>
 #include <rex/memory.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -379,7 +380,16 @@ bool VulkanPipelineCache::Initialize() {
     }
     for (size_t i = 0; i < creation_thread_count; ++i) {
       std::unique_ptr<rex::thread::Thread> creation_thread =
-          rex::thread::Thread::Create({}, [this, i]() { CreationThread(i); });
+          rex::thread::Thread::Create({}, [this, i]() {
+            // (Run #11, F1.) vkCreateGraphicsPipelines is CPU-heavy; keep
+            // creation off the little cores like the guest main thread.
+            // Auto-detected mask: the pin_big_cores_mask cvar lives in
+            // libmain.so and this TU is in librexgpu-xenos.so, whose cvar
+            // registry copy cannot see it (see big_core_affinity.h).
+            rex::big_core::PinCurrentThreadToBigCores(
+                rex::big_core::ResolveBigCoreMask(0), "Vulkan Pipelines");
+            CreationThread(i);
+          });
       assert_not_null(creation_thread);
       creation_thread->set_name("Vulkan Pipelines");
       creation_threads_.push_back(std::move(creation_thread));
@@ -851,8 +861,17 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads;
       creation_threads.reserve(creation_thread_count);
       for (size_t i = 0; i < creation_thread_count; ++i) {
+        // (Run #11, F1.) Same big-core pin as the persistent creation pool
+        // above; the preload workers do the same vkCreateGraphicsPipelines
+        // work at startup. Wrapped in a lambda (not inside creation_worker
+        // itself) so the inline path below (count <= 1) does not pin the
+        // calling thread.
         std::unique_ptr<rex::thread::Thread> creation_thread =
-            rex::thread::Thread::Create({}, creation_worker);
+            rex::thread::Thread::Create({}, [&creation_worker]() {
+              rex::big_core::PinCurrentThreadToBigCores(
+                  rex::big_core::ResolveBigCoreMask(0), "Vulkan Pipelines");
+              creation_worker();
+            });
         assert_not_null(creation_thread);
         creation_thread->set_name("Vulkan Pipelines");
         creation_threads.push_back(std::move(creation_thread));

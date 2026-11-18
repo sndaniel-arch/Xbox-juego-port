@@ -13,11 +13,17 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <chrono>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <thread>
 
 #if REX_PLATFORM_ANDROID
 #include <sched.h>
+
+#include <rex/graphics/command_processor.h>
+#include <rex/thread/big_core_affinity.h>
 #endif
 
 #include <rex/assert.h>
@@ -58,6 +64,19 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+#if REX_PLATFORM_ANDROID
+// (Run #11, F1.) Forced big-core affinity mask for the guest main thread
+// (and, via CallInThread, the command processor worker). 0 = auto-detect
+// the fastest cluster from sysfs (see rex/thread/big_core_affinity.h).
+// On the G99 the A76s are CPUs 6-7, so 0xC0 forces them when the detector
+// cannot read the device (e.g. sysfs unreadable on Android 16). The mask
+// is verified by reading the affinity back after the set.
+REXCVAR_DEFINE_UINT64(pin_big_cores_mask, 0, "System",
+                      "Forced affinity mask for the guest main thread (e.g. 0xC0 for the "
+                      "G99 A76s); 0 = auto-detect the fastest cores")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
 
 namespace rex {
 
@@ -450,147 +469,19 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
 }
 
 #if REX_PLATFORM_ANDROID
-namespace {
-// Pin the guest main thread to the device's fastest ("big") cores.
+// Pinning to the device's fastest ("big") cores lives in
+// rex/thread/big_core_affinity.h (shared with the pipeline creation
+// threads and the command processor worker): the guest main thread is
+// the CPU bottleneck (96% of a core in the v1.3 phone profile), so it
+// belongs on the fastest cluster, not wherever the scheduler happened
+// to place it. The layout is read from the device at startup - nothing
+// is assumed about the SoC (the G99 is 2x Cortex-A76 + 6x Cortex-A55,
+// but another phone may differ).
 //
-// Android big.LITTLE: the guest main thread is the CPU bottleneck (96% of a
-// core in the v1.3 phone profile), so it belongs on the fastest cluster, not
-// wherever the scheduler happened to place it. The cluster layout is read
-// from the device at startup - nothing is assumed about the SoC (the G99 is
-// 2x Cortex-A76 + 6x Cortex-A55, but another phone may differ).
-//
-// This is a HOST decision about one thread. It does not touch the guest's
-// own affinity requests, which stay ignored via --ignore_thread_affinities
-// (those map 360 CPU indices to single host CPUs; see XThread::SetActiveCpu).
-// Only the main thread is pinned; every other thread keeps migrating freely.
-//
-// Returns 0 when the layout cannot be determined or the device is
-// homogeneous, in which case the caller leaves the thread alone.
-bool ReadSysInt(const std::string& path, int* value_out) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    return false;
-  }
-  int value = 0;
-  file >> value;
-  if (file.fail() || value <= 0) {
-    return false;
-  }
-  *value_out = value;
-  return true;
-}
-
-// Parses a non-negative decimal integer at text[pos..]; advances pos past
-// the digits. No exceptions (the codebase avoids them here).
-bool ParseCpuNumber(const std::string& text, size_t* pos_inout, int* value_out) {
-  size_t pos = *pos_inout;
-  if (pos >= text.size() || text[pos] < '0' || text[pos] > '9') {
-    return false;
-  }
-  int value = 0;
-  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
-    value = value * 10 + (text[pos] - '0');
-    ++pos;
-  }
-  *pos_inout = pos;
-  *value_out = value;
-  return true;
-}
-
-// /sys/devices/system/cpu/online looks like "0-7", "0-3,5-7" or "0".
-uint64_t ReadOnlineCpuMask() {
-  std::ifstream file("/sys/devices/system/cpu/online");
-  if (!file.is_open()) {
-    return 0;
-  }
-  std::string text;
-  std::getline(file, text);
-  uint64_t mask = 0;
-  size_t pos = 0;
-  while (pos < text.size()) {
-    int first = 0;
-    int last = 0;
-    if (!ParseCpuNumber(text, &pos, &first)) {
-      return 0;
-    }
-    last = first;
-    if (pos < text.size() && text[pos] == '-') {
-      ++pos;
-      if (!ParseCpuNumber(text, &pos, &last)) {
-        return 0;
-      }
-    }
-    if (first > last || last >= 64) {
-      return 0;
-    }
-    for (int cpu = first; cpu <= last; ++cpu) {
-      mask |= uint64_t(1) << cpu;
-    }
-    if (pos < text.size() && text[pos] == ',') {
-      ++pos;
-      continue;
-    }
-    break;
-  }
-  return mask;
-}
-
-uint64_t GetBigCoreAffinityMask() {
-  const uint64_t online_mask = ReadOnlineCpuMask();
-  if (!online_mask) {
-    return 0;
-  }
-  // Pick the ranking metric once, from the first online CPU: cpu_capacity
-  // when the kernel exposes it, otherwise the max frequency. Never mix the
-  // two - they are on unrelated scales.
-  int first_cpu = 0;
-  while (first_cpu < 64 && !(online_mask & (uint64_t(1) << first_cpu))) {
-    ++first_cpu;
-  }
-  const bool use_capacity =
-      std::ifstream(fmt::format("/sys/devices/system/cpu/cpu{}/cpu_capacity", first_cpu))
-          .good();
-  const char* metric_file = use_capacity ? "cpu_capacity" : "cpufreq/cpuinfo_max_freq";
-  int best_metric = 0;
-  uint64_t best_mask = 0;
-  for (int cpu = 0; cpu < 64; ++cpu) {
-    if (!(online_mask & (uint64_t(1) << cpu))) {
-      continue;
-    }
-    int metric = 0;
-    if (!ReadSysInt(fmt::format("/sys/devices/system/cpu/cpu{}/{}", cpu, metric_file),
-                    &metric)) {
-      return 0;  // Cannot rank every core: do not pin.
-    }
-    if (metric > best_metric) {
-      best_metric = metric;
-      best_mask = uint64_t(1) << cpu;
-    } else if (metric == best_metric) {
-      best_mask |= uint64_t(1) << cpu;
-    }
-  }
-  if (!best_mask || best_mask == online_mask) {
-    return 0;  // Homogeneous device: pinning buys nothing.
-  }
-  // Never pin outside the CPUs this process is actually allowed to run on
-  // (cpuset restrictions would make sched_setaffinity fail).
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-    uint64_t allowed_mask = 0;
-    for (int cpu = 0; cpu < 64; ++cpu) {
-      if (CPU_ISSET(cpu, &allowed)) {
-        allowed_mask |= uint64_t(1) << cpu;
-      }
-    }
-    best_mask &= allowed_mask;
-    if (!best_mask) {
-      return 0;
-    }
-  }
-  return best_mask;
-}
-}  // namespace
+// This is a HOST decision about one thread. It does not touch the
+// guest's own affinity requests, which stay ignored via
+// --ignore_thread_affinities (those map 360 CPU indices to single host
+// CPUs; see XThread::SetActiveCpu).
 #endif  // REX_PLATFORM_ANDROID
 
 void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
@@ -623,13 +514,28 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
 
 #if REX_PLATFORM_ANDROID
     // Pin the guest main thread to the device's fastest cores (big cluster).
-    // GetBigCoreAffinityMask() reads the layout from the device; when it
-    // returns 0 the thread is left alone. Done before Resume() so the
-    // thread starts on a big core.
-    if (uint64_t big_core_mask = GetBigCoreAffinityMask()) {
-      main_thread->thread()->set_affinity_mask(big_core_mask);
-      REXLOG_INFO("Pinning guest main thread to big cores (affinity mask 0x{:X})",
-                  big_core_mask);
+    // The mask resolves once here: pin_big_cores_mask cvar (0 = auto-detect
+    // from sysfs, see rex/thread/big_core_affinity.h). Done before Resume()
+    // so the thread starts on a big core. PinThreadToBigCores verifies the
+    // affinity by reading it back: set_affinity_mask() cannot report
+    // failure (assert_always() is a no-op in Release), so the old code's
+    // unconditional "Pinning..." line proved nothing.
+    const uint64_t big_core_mask =
+        rex::big_core::ResolveBigCoreMask(REXCVAR_GET(pin_big_cores_mask));
+    rex::big_core::PinThreadToBigCores(main_thread->thread(), big_core_mask,
+                                       "guest main thread");
+
+    // Pin the command processor ("GPU Commands") worker too. It lives in
+    // librexgpu-xenos.so, whose cvar registry copy cannot see
+    // pin_big_cores_mask (rexcore is an OBJECT library), so the effective
+    // mask resolved above is passed by value through CallInThread, which
+    // runs the pin on the worker thread itself.
+    if (auto* graphics_system = runtime_->graphics_system()) {
+      if (auto* command_processor = graphics_system->command_processor()) {
+        command_processor->CallInThread([big_core_mask]() {
+          rex::big_core::PinCurrentThreadToBigCores(big_core_mask, "GPU Commands");
+        });
+      }
     }
 #endif
 
@@ -644,6 +550,92 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
 
     OnPostLaunchModule(main_thread.get());
     main_thread->Resume();
+
+#if REX_PLATFORM_ANDROID
+    // (Run #11, F1.) Sample which CPU the guest main thread REALLY runs on:
+    // 1 Hz for the first 10 s. sched_getcpu() here would report the
+    // *caller's* CPU (this lambda runs on the UI thread), so the sampler
+    // reads /proc/self/task/<tid>/stat (field 39, processor) for the thread
+    // whose comm starts with "Main XThread" (KernelState names the launch
+    // thread that; pthread names truncate to 15 chars). Detached: it owns
+    // nothing but its own copies and exits after the 10th sample.
+    std::thread([]() {
+      constexpr const char* kGuestThreadCommPrefix = "Main XThread";
+      uint64_t cpu_samples[64] = {};
+      int found_samples = 0;
+      for (int sample = 1; sample <= 10; ++sample) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        int cpu = -1;
+        int tid = -1;
+        std::error_code ec;  // Fresh per sample: a stale error must not abort the next one.
+        for (const auto& entry :
+             std::filesystem::directory_iterator("/proc/self/task", ec)) {
+          if (ec) {
+            break;
+          }
+          std::ifstream comm_file(entry.path() / "comm");
+          std::string comm;
+          std::getline(comm_file, comm);
+          if (comm.rfind(kGuestThreadCommPrefix, 0) != 0) {
+            continue;
+          }
+          // stat is "pid (comm) state ppid ... processor ..."; comm itself
+          // contains parens, so split after the LAST ')' - the fields after
+          // it start at field 3 (state), making processor (field 39)
+          // token 36.
+          std::ifstream stat_file(entry.path() / "stat");
+          std::string stat_line;
+          std::getline(stat_file, stat_line);
+          const size_t close_paren = stat_line.rfind(')');
+          if (close_paren == std::string::npos) {
+            continue;
+          }
+          std::istringstream rest(stat_line.substr(close_paren + 1));
+          std::string token;
+          int token_index = 0;
+          while (rest >> token) {
+            if (token_index == 36) {
+              cpu = std::atoi(token.c_str());
+              break;
+            }
+            ++token_index;
+          }
+          if (cpu >= 0 && cpu < 64) {
+            tid = std::atoi(entry.path().filename().string().c_str());
+          }
+          break;
+        }
+        if (cpu >= 0) {
+          ++found_samples;
+          cpu_samples[cpu]++;
+          REXLOG_INFO("Guest main thread CPU sample {}/10: CPU {} (tid {})", sample, cpu,
+                      tid);
+        } else {
+          REXLOG_WARN("Guest main thread CPU sample {}/10: thread '{}' not found in "
+                      "/proc/self/task yet",
+                      sample, kGuestThreadCommPrefix);
+        }
+      }
+      if (found_samples > 0) {
+        std::string summary;
+        for (int cpu = 0; cpu < 64; ++cpu) {
+          if (cpu_samples[cpu] == 0) {
+            continue;
+          }
+          if (!summary.empty()) {
+            summary += ", ";
+          }
+          summary += fmt::format("CPU{} x{}", cpu, cpu_samples[cpu]);
+        }
+        REXLOG_INFO("Guest main thread CPU samples (10s, found {}/10): {}", found_samples,
+                    summary);
+      } else {
+        REXLOG_WARN("Guest main thread CPU samples (10s): thread '{}' never found in "
+                    "/proc/self/task; the pin could not be confirmed from the CPU side",
+                    kGuestThreadCommPrefix);
+      }
+    }).detach();
+#endif
 
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
       main_thread->Wait(0, 0, 0, nullptr);

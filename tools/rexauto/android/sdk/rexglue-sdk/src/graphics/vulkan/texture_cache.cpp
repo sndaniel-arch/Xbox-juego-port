@@ -13,7 +13,11 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
@@ -31,7 +35,10 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/ui_samplers.h>
+#include <rex/ui/vulkan/upload_buffer_pool.h>
 #include <rex/ui/vulkan/util.h>
+
+#include "etc2_encode.h"
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
@@ -103,6 +110,128 @@ namespace {
 // descriptors, which force all sampled channels to 0.
 constexpr VkFormat kInvalidTextureFetchFallbackFormat = VK_FORMAT_R8G8B8A8_UNORM;
 const VkClearColorValue kInvalidTextureFetchFallbackColor = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+// (Run #11, F3, point 7.) Placeholder textures: keys whose load failed
+// deterministically (no load shader, or no load pipeline for the format).
+// The flag lives here, in this file's anonymous namespace, keyed by the
+// texture identity (TextureKey) instead of on Texture itself, because
+// Texture is defined in rex/graphics/pipeline/texture/cache.h, out of scope
+// for this round. GetActiveBindingOrNullImageView() consults this set and
+// serves the cache's 1x1 null image instead of the uninitialized image, so
+// a format without a loader degrades to one valid texel instead of black
+// or garbage. Only deterministic failures are marked: transient failures
+// (scratch/descriptor allocation) keep retrying on the next frame.
+// All callers run on the graphics thread (same as RequestTextures).
+std::unordered_set<TextureKey, TextureKey::Hasher> g_placeholder_texture_keys;
+
+bool IsTexturePlaceholder(const TextureKey& key) {
+  return g_placeholder_texture_keys.find(key) != g_placeholder_texture_keys.end();
+}
+
+void MarkTexturePlaceholder(const TextureKey& key) {
+  if (g_placeholder_texture_keys.insert(key).second) {
+    REXGPU_WARN(
+        "VulkanTextureCache: Texture {}x{} {} (base at 0x{:08X}) has no loader "
+        "on this device; serving the 1x1 placeholder image",
+        key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name, key.base_page << 12);
+  }
+}
+
+void ClearTexturePlaceholder(const TextureKey& key) {
+  g_placeholder_texture_keys.erase(key);
+}
+
+// (Run #11, F3, point 6.) CPU staging for BC -> ETC2 transcoded uploads.
+// The shared-memory upload pool is private to VulkanSharedMemory, and the
+// compute scratch buffer is device-local, so the transcode path owns its
+// own VulkanUploadBufferPool here (same 2 MiB default page size would be
+// too small for a single 4096x4096 ETC2 RGBA level at 16 MB, so pages are
+// 16 MiB). Pages are reclaimed in BeginSubmission() and the pool is
+// destroyed with the cache; a single VulkanTextureCache instance is
+// assumed, like the sampler code below already assumes. Writes are flushed
+// explicitly after each transcoded texture (see the ETC2 load path).
+std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> g_etc2_upload_pool;
+constexpr VkDeviceSize kEtc2UploadPoolPageSize = VkDeviceSize(16) * 1024 * 1024;
+
+// Reads one BC block (8 bytes for BC1, 16 for BC3) of a texture level from
+// guest CPU memory, applying the fetch endianness swap, and returns false
+// if the texture has no data for it. `level_layout` / `guest_level_base`
+// describe one loop level exactly like LoadTextureDataFromResidentMemoryImpl
+// does (for a packed mip tail, the tail extent and its own base). Block
+// coordinates are in 4x4 blocks; `slice` is the array slice (1 for 3D,
+// where `bz` is the depth slice instead).
+bool ReadGuestBcBlock(const SharedMemory& shared_memory,
+                      const texture_util::TextureGuestLayout::Level& level_layout,
+                      uint32_t guest_level_base, const TextureKey& key, bool is_3d_tiling,
+                      uint32_t bx, uint32_t by, uint32_t bz, uint32_t slice, uint8_t* block_out,
+                      uint32_t bytes_per_block) {
+  uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
+  uint32_t pitch_blocks = level_layout.row_pitch_bytes / bytes_per_block;
+  uint32_t block_offset;
+  if (key.tiled || is_3d_tiling) {
+    if (is_3d_tiling) {
+      // Height in blocks, like the 3D resolve path passes it.
+      block_offset = uint32_t(texture_util::GetTiledOffset3D(
+          int32_t(bx), int32_t(by), int32_t(bz), pitch_blocks, level_layout.y_extent_blocks,
+          bytes_per_block_log2));
+    } else {
+      block_offset = uint32_t(texture_util::GetTiledOffset2D(int32_t(bx), int32_t(by),
+                                                             pitch_blocks, bytes_per_block_log2));
+    }
+  } else {
+    block_offset = by * level_layout.row_pitch_bytes + bx * bytes_per_block +
+                   bz * level_layout.z_slice_stride_block_rows * level_layout.row_pitch_bytes;
+  }
+  uint32_t guest_address = guest_level_base + block_offset +
+                           slice * level_layout.array_slice_stride_bytes;
+  const uint8_t* guest_block = shared_memory.TranslatePhysicalForDebug(guest_address);
+  if (!guest_block) {
+    return false;
+  }
+  etc2::ApplyGuestEndian(uint32_t(key.endianness), block_out, guest_block, bytes_per_block);
+  return true;
+}
+
+// Whether a DXT1 texture uses 1-bit alpha anywhere in its base level (a
+// BC1 block with color0 <= color1 and a texel using index 3). ETC2_RGB8
+// has no alpha, so such a texture must stay on the RGBA8 compute fallback.
+// Memoized per TextureKey: the decision has to agree between CreateTexture
+// (which picks the image format) and every later GetHostFormatPair() call,
+// and re-scanning on the draw path would be far too expensive.
+// Caveat: if a texture's contents change from opaque to 1-bit-alpha under
+// the same key (dynamic texture reuse), the memoized answer goes stale and
+// the transparent texels render opaque. Game textures are static data, so
+// this is accepted for run #11; the correct fix is storing the decision on
+// the Texture at creation (needs cache.h, out of scope here).
+bool Dxt1TextureHasOneBitAlpha(const SharedMemory& shared_memory, const TextureKey& key,
+                               const texture_util::TextureGuestLayout& guest_layout) {
+  static std::unordered_map<TextureKey, bool, TextureKey::Hasher> memo;
+  auto it = memo.find(key);
+  if (it != memo.end()) {
+    return it->second;
+  }
+  bool has_alpha = false;
+  const texture_util::TextureGuestLayout::Level& level_layout = guest_layout.base;
+  uint32_t guest_base = key.base_page << 12;
+  bool is_3d = key.dimension == xenos::DataDimension::k3D;
+  uint8_t block[8];
+  for (uint32_t by = 0; by < level_layout.y_extent_blocks && !has_alpha; ++by) {
+    for (uint32_t bx = 0; bx < level_layout.x_extent_blocks; ++bx) {
+      if (!ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0,
+                            block, 8)) {
+        // Unreadable guest data: fall back to the safe RGBA8 path.
+        has_alpha = true;
+        break;
+      }
+      if (etc2::Bc1BlockHasOneBitAlpha(block)) {
+        has_alpha = true;
+        break;
+      }
+    }
+  }
+  memo.emplace(key, has_alpha);
+  return has_alpha;
+}
 
 }  // namespace
 
@@ -486,6 +615,10 @@ VulkanTextureCache::~VulkanTextureCache() {
   // textures before destroying VMA.
   DestroyAllTextures(true);
 
+  // (Run #11, F3, point 6.) Destroy the BC -> ETC2 staging pool with the
+  // cache; its pages are plain device memory, not VMA allocations.
+  g_etc2_upload_pool.reset();
+
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
   }
@@ -494,6 +627,11 @@ VulkanTextureCache::~VulkanTextureCache() {
 void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
 
+  // (Run #11, F3, point 6.) Recycle the BC -> ETC2 staging pages whose
+  // submissions have completed, like the shared-memory upload pool does.
+  if (g_etc2_upload_pool) {
+    g_etc2_upload_pool->Reclaim(command_processor_.GetCompletedSubmission());
+  }
   if (!null_images_cleared_ && null_image_2d_array_cube_ != VK_NULL_HANDLE &&
       null_image_3d_ != VK_NULL_HANDLE) {
     VkImage null_images[] = {null_image_2d_array_cube_, null_image_3d_};
@@ -667,6 +805,12 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
       image_view =
           is_signed ? vulkan_binding.image_view_signed : vulkan_binding.image_view_unsigned;
     }
+  }
+  // (Run #11, F3, point 7.) A texture whose load failed deterministically
+  // has no valid image contents: serve the cache's 1x1 null image instead of
+  // the uninitialized image, so the shader samples one valid texel.
+  if (binding && IsTexturePlaceholder(binding->key)) {
+    image_view = VK_NULL_HANDLE;
   }
   if (image_view != VK_NULL_HANDLE) {
     return image_view;
@@ -1243,11 +1387,250 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       host_format_is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned;
   LoadShaderIndex load_shader = host_format.load_shader;
   if (load_shader == kLoadShaderIndexUnknown) {
+    // (Run #11, F3, point 7.) No loader for this format on this device:
+    // deterministic failure, serve the 1x1 placeholder from now on.
+    MarkTexturePlaceholder(texture_key);
     return false;
+  }
+  // (Run #11, F3, point 6.) CPU BC -> ETC2 transcode upload. The host format
+  // is an ETC2 block format (same bytes per 4x4 block as the guest BC format),
+  // so each guest block is decoded to RGBA and re-encoded to ETC2 on the CPU,
+  // then uploaded directly with vkCmdCopyBufferToImage - no compute load
+  // shader runs at all. The load shader index stored with the ETC2 host
+  // format (kLoadShaderIndex64bpb / kLoadShaderIndex128bpb) is only a
+  // bytes-per-block sentinel for the format tables; it is never dispatched.
+  // DXT1 with 1-bit alpha never reaches this branch: GetHostFormatPair()
+  // sends it to the RGBA8 compute fallback instead.
+  if (host_format.format == VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK ||
+      host_format.format == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) {
+    const bool is_etc2_rgba = host_format.format == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+    const uint32_t etc2_bytes_per_block = is_etc2_rgba ? 16 : 8;
+    // Scaled-resolve textures cannot be transcoded on the CPU: their data
+    // lives in the GPU scaled resolve buffer, not in guest memory. This
+    // cannot happen when the ETC2 gate in Initialize() ran (it requires
+    // unscaled draw resolution), but if the scale ever changes under a live
+    // cache, fail deterministically instead of reading garbage.
+    if (texture_key.scaled_resolve) {
+      MarkTexturePlaceholder(texture_key);
+      return false;
+    }
+
+    const texture_util::TextureGuestLayout& guest_layout = vulkan_texture.guest_layout();
+    xenos::DataDimension dimension = texture_key.dimension;
+    bool is_3d = dimension == xenos::DataDimension::k3D;
+    bool is_3d_tiling = is_3d || vulkan_texture.force_load_3d_tiling();
+    uint32_t width = texture_key.GetWidth();
+    uint32_t height = texture_key.GetHeight();
+    uint32_t depth_or_array_size = texture_key.GetDepthOrArraySize();
+    uint32_t depth = is_3d ? depth_or_array_size : 1;
+    uint32_t array_size = is_3d ? 1 : depth_or_array_size;
+    xenos::TextureFormat guest_format = texture_key.format;
+    const FormatInfo* guest_format_info = FormatInfo::Get(guest_format);
+    uint32_t block_width = guest_format_info->block_width;
+    uint32_t block_height = guest_format_info->block_height;
+    uint32_t guest_bytes_per_block = guest_format_info->bytes_per_block();
+    uint32_t level_first = load_base ? 0 : 1;
+    uint32_t level_last = load_mips ? texture_key.mip_max_level : 0;
+    assert_true(level_first <= level_last);
+    uint32_t level_packed = guest_layout.packed_level;
+    uint32_t level_stored_first = std::min(level_first, level_packed);
+    uint32_t level_stored_last = std::min(level_last, level_packed);
+    uint32_t loop_level_first, loop_level_last;
+    if (level_packed == 0) {
+      // Packed mip tail is the level 0 - loop iteration 0 is the base tail,
+      // loop iteration 1 is the mips tail.
+      loop_level_first = uint32_t(level_first != 0);
+      loop_level_last = uint32_t(level_last != 0);
+    } else {
+      loop_level_first = level_stored_first;
+      loop_level_last = level_stored_last;
+    }
+
+    // Lazily create the staging pool (16 MiB pages: one page holds a whole
+    // 4096x4096 ETC2 RGBA level; see the pool comment in the anonymous
+    // namespace above).
+    if (!g_etc2_upload_pool) {
+      g_etc2_upload_pool = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+          command_processor_.GetVulkanDevice(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          size_t(kEtc2UploadPoolPageSize));
+    }
+    const uint64_t submission_current = command_processor_.GetCurrentSubmission();
+
+    // Transcode one loop level (or packed tail) per array slice into the
+    // staging pool, remembering where each upload landed for the copy below.
+    struct Etc2LevelUpload {
+      VkBuffer buffer;
+      VkDeviceSize offset;
+      uint32_t x_blocks;
+      uint32_t y_blocks;
+      uint32_t z_extent;
+      uint32_t loop_level;
+      uint32_t slice;
+    };
+    std::vector<Etc2LevelUpload> uploads;
+    const SharedMemory& guest_shared_memory = shared_memory();
+    for (uint32_t loop_level = loop_level_first; loop_level <= loop_level_last; ++loop_level) {
+      bool is_base = loop_level == 0;
+      uint32_t level = (level_packed == 0) ? 0 : loop_level;
+      const texture_util::TextureGuestLayout::Level& level_guest_layout =
+          is_base ? guest_layout.base : guest_layout.mips[level];
+      uint32_t level_width, level_height, level_depth;
+      if (level == level_packed) {
+        // Loading the packed tail - transcode the whole tail extent.
+        level_width = level_guest_layout.x_extent_blocks * block_width;
+        level_height = level_guest_layout.y_extent_blocks * block_height;
+        level_depth = level_guest_layout.z_extent;
+      } else {
+        level_width = std::max(width >> level, UINT32_C(1));
+        level_height = std::max(height >> level, UINT32_C(1));
+        level_depth = std::max(depth >> level, UINT32_C(1));
+      }
+      uint32_t x_blocks = (level_width + (block_width - 1)) / block_width;
+      uint32_t y_blocks = (level_height + (block_height - 1)) / block_height;
+      uint32_t guest_level_base =
+          is_base ? texture_key.base_page << 12
+                  : (texture_key.mip_page << 12) + guest_layout.mip_offsets_bytes[level];
+      VkDeviceSize slice_size =
+          VkDeviceSize(etc2_bytes_per_block) * x_blocks * y_blocks * level_depth;
+      for (uint32_t slice = 0; slice < array_size; ++slice) {
+        // One Request per (level, slice): a single level slice is at most
+        // 16 MiB (4096x4096 ETC2 RGBA), which is exactly one pool page.
+        // Bigger than that cannot be staged in one piece and is retried on
+        // the next frame, like a scratch buffer allocation failure.
+        // Not a placeholder: the failure is transient, not deterministic.
+        VkBuffer upload_buffer = VK_NULL_HANDLE;
+        VkDeviceSize upload_offset = 0;
+        uint8_t* upload_mapping = g_etc2_upload_pool->Request(
+            submission_current, size_t(slice_size), size_t(16), upload_buffer, upload_offset);
+        if (!upload_mapping) {
+          return false;
+        }
+        for (uint32_t bz = 0; bz < level_depth; ++bz) {
+          for (uint32_t by = 0; by < y_blocks; ++by) {
+            for (uint32_t bx = 0; bx < x_blocks; ++bx) {
+              uint8_t guest_block[16];
+              if (!ReadGuestBcBlock(guest_shared_memory, level_guest_layout, guest_level_base,
+                                    texture_key, is_3d_tiling, bx, by, bz, slice, guest_block,
+                                    guest_bytes_per_block)) {
+                return false;
+              }
+              etc2::Rgba pixels[16];
+              uint8_t* etc2_block =
+                  upload_mapping +
+                  (VkDeviceSize(etc2_bytes_per_block) *
+                   ((uint64_t(bz) * y_blocks + by) * x_blocks + bx));
+              if (is_etc2_rgba) {
+                etc2::DecodeBc3Block(guest_block, pixels);
+                etc2::EncodeEtc2Rgba8(pixels, etc2_block);
+              } else {
+                etc2::DecodeBc1Block(guest_block, pixels);
+                etc2::EncodeEtc2Rgb8(pixels, etc2_block);
+              }
+            }
+          }
+        }
+        uploads.push_back(Etc2LevelUpload{upload_buffer, upload_offset, x_blocks, y_blocks,
+                                          level_depth, loop_level, slice});
+      }
+    }
+    // Make the CPU writes visible to the device before recording the copies
+    // (same pattern as VulkanSharedMemory::UploadRanges: flush, no extra
+    // barrier for the staging buffer).
+    g_etc2_upload_pool->FlushWrites();
+
+    // Submit copying from the staging pool to the host texture, mirroring
+    // the tail of the compute path below (usage transition, barriers, one
+    // copy region per level and array slice).
+    vulkan_texture.MarkAsUsed();
+    VulkanTexture::Usage texture_old_usage =
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+    if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
+      VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+      VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+      VkImageLayout texture_old_layout, texture_new_layout;
+      GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                           texture_old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
+                           texture_dst_access_mask, texture_new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+          texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+          texture_dst_access_mask, texture_old_layout, texture_new_layout);
+    }
+    command_processor_.SubmitBarriers(true);
+    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+
+    // Group copy regions by staging buffer: regions sharing a buffer go in
+    // one CmdCopyBufferToImageEmplace call.
+    VkBuffer copy_buffer_current = VK_NULL_HANDLE;
+    std::vector<VkBufferImageCopy> copy_regions;
+    auto flush_copy_regions = [&]() {
+      if (copy_regions.empty()) {
+        return;
+      }
+      VkBufferImageCopy* regions = command_buffer.CmdCopyBufferToImageEmplace(
+          copy_buffer_current, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          uint32_t(copy_regions.size()));
+      std::memcpy(regions, copy_regions.data(), sizeof(VkBufferImageCopy) * copy_regions.size());
+      copy_regions.clear();
+    };
+    for (uint32_t level = level_first; level <= level_last; ++level) {
+      uint32_t loop_level =
+          (level_packed == 0) ? (level == 0 ? 0 : 1) : std::min(level, level_packed);
+      for (uint32_t slice = 0; slice < array_size; ++slice) {
+        const Etc2LevelUpload* upload = nullptr;
+        for (const Etc2LevelUpload& candidate : uploads) {
+          if (candidate.loop_level == loop_level && candidate.slice == slice) {
+            upload = &candidate;
+            break;
+          }
+        }
+        assert_not_null(upload);
+        if (!upload) {
+          return false;
+        }
+        if (upload->buffer != copy_buffer_current) {
+          flush_copy_regions();
+          copy_buffer_current = upload->buffer;
+        }
+        VkBufferImageCopy& copy_region = copy_regions.emplace_back();
+        copy_region.bufferOffset = upload->offset;
+        if (level >= level_packed) {
+          uint32_t level_offset_blocks_x, level_offset_blocks_y, level_offset_z;
+          texture_util::GetPackedMipOffset(width, height, depth, guest_format, level,
+                                           level_offset_blocks_x, level_offset_blocks_y,
+                                           level_offset_z);
+          copy_region.bufferOffset +=
+              etc2_bytes_per_block *
+              (level_offset_blocks_x +
+               VkDeviceSize(upload->x_blocks) *
+                   (level_offset_blocks_y + VkDeviceSize(upload->y_blocks) * level_offset_z));
+        }
+        copy_region.bufferRowLength = upload->x_blocks * block_width;
+        copy_region.bufferImageHeight = upload->y_blocks * block_height;
+        copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.imageSubresource.mipLevel = level;
+        copy_region.imageSubresource.baseArrayLayer = is_3d ? 0 : slice;
+        copy_region.imageSubresource.layerCount = 1;
+        copy_region.imageOffset.x = 0;
+        copy_region.imageOffset.y = 0;
+        copy_region.imageOffset.z = 0;
+        copy_region.imageExtent.width = std::max(width >> level, UINT32_C(1));
+        copy_region.imageExtent.height = std::max(height >> level, UINT32_C(1));
+        copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+      }
+    }
+    flush_copy_regions();
+
+    ClearTexturePlaceholder(texture_key);
+    return true;
   }
   VkPipeline pipeline = texture_key.scaled_resolve ? load_pipelines_scaled_[load_shader]
                                                    : load_pipelines_[load_shader];
   if (pipeline == VK_NULL_HANDLE) {
+    // (Run #11, F3, point 7.) The load pipeline was not created for this
+    // format: deterministic failure, serve the 1x1 placeholder.
+    MarkTexturePlaceholder(texture_key);
     return false;
   }
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
@@ -1273,6 +1656,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                  ? load_pipelines_scaled_[load_shader_float_convert]
                                  : load_pipelines_[load_shader_float_convert];
     if (pipeline_float_convert == VK_NULL_HANDLE) {
+      // (Run #11, F3, point 7.) Deterministic failure, like the load
+      // pipeline above: serve the 1x1 placeholder.
+      MarkTexturePlaceholder(texture_key);
       return false;
     }
     load_shader_info_float_convert = &GetLoadShaderInfo(load_shader_float_convert);
@@ -1796,6 +2182,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
   }
 
+  // (Run #11, F3, point 7.) A successful load clears any placeholder mark
+  // from an earlier deterministic failure (e.g. the texture became loadable
+  // after a format fallback change).
+  ClearTexturePlaceholder(texture_key);
   return true;
 }
 
@@ -2474,7 +2864,12 @@ bool VulkanTextureCache::Initialize() {
   // TODO(Triang3l): Raise the host texture memory usage limit if S3TC has to be
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
-  // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
+  // (Run #11, F3, point 6.) S3TC -> ETC2 is done for DXT1 (opaque) and DXT5
+  // below: when the BC format is not linear-filterable, the texture is
+  // transcoded on the CPU to ETC2 at load time instead of being decompressed
+  // to RGBA8, keeping the 4x memory saving. DXT3, DXN and DXT5A still use the
+  // RGBA8 compute fallback (DXT3 has explicit alpha per texel, DXN/DXT5A are
+  // single/dual-channel and have no ETC2 equivalent worth the transcode).
   // One-shot diagnostic for BC fallbacks: decompressing BC textures to RGBA8
   // multiplies texture memory and re-upload bandwidth 4x (and adds a compute
   // decode pass on every invalidation). On mobile this alone can dominate
@@ -2492,15 +2887,50 @@ bool VulkanTextureCache::Initialize() {
   };
   HostFormatPair& host_format_dxt1 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
+  VkFormatProperties format_properties_bc1;
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
-                                          &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    log_bc_fallback("k_DXT1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
-                    format_properties.optimalTilingFeatures);
-    host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
-    host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt1.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+                                          &format_properties_bc1);
+  // (Run #11, F3, point 6.) Whether the ETC2 transcode targets are usable:
+  // ETC2 is a core ES 3.0 format, but Vulkan makes it optional, so probe it
+  // like the BC formats above. Transcoding also requires unscaled draw
+  // resolution: with scaled resolve the guest data lives in the GPU scaled
+  // resolve buffer, which the CPU transcode path cannot read.
+  bool etc2_rgb8_supported = false;
+  bool etc2_rgba8_supported = false;
+  if (!IsDrawResolutionScaled()) {
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
+                                            &format_properties);
+    etc2_rgb8_supported =
+        (format_properties.optimalTilingFeatures & kLinearFilterFeatures) ==
+        kLinearFilterFeatures;
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device,
+                                            VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+                                            &format_properties);
+    etc2_rgba8_supported =
+        (format_properties.optimalTilingFeatures & kLinearFilterFeatures) ==
+        kLinearFilterFeatures;
+  }
+  if ((format_properties_bc1.optimalTilingFeatures & kLinearFilterFeatures) !=
+      kLinearFilterFeatures) {
+    if (etc2_rgb8_supported) {
+      // Same 8 bytes per 4x4 block as BC1: the transcode is a block-for-block
+      // replacement, no buffer resizing anywhere.
+      REXGPU_INFO(
+          "VulkanTextureCache: Transcoding k_DXT1 to ETC2 "
+          "(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK) on the CPU because BC1 is not "
+          "linear-filterable on this device");
+      host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndex64bpb;
+      host_format_dxt1.format_unsigned.format = VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+      host_format_dxt1.format_unsigned.block_compressed = true;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+    } else {
+      log_bc_fallback("k_DXT1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                      format_properties_bc1.optimalTilingFeatures);
+      host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
+      host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt1.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+    }
   }
   HostFormatPair& host_format_dxt2_3 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3)];
   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
@@ -2519,12 +2949,25 @@ bool VulkanTextureCache::Initialize() {
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
                                           &format_properties);
   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    log_bc_fallback("k_DXT4_5", VK_FORMAT_BC3_UNORM_BLOCK,
-                    format_properties.optimalTilingFeatures);
-    host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
-    host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt4_5.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    if (etc2_rgba8_supported) {
+      // Same 16 bytes per 4x4 block as BC3: the transcode is a block-for-block
+      // replacement, no buffer resizing anywhere.
+      REXGPU_INFO(
+          "VulkanTextureCache: Transcoding k_DXT4_5 to ETC2 "
+          "(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) on the CPU because BC3 is not "
+          "linear-filterable on this device");
+      host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndex128bpb;
+      host_format_dxt4_5.format_unsigned.format = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+      host_format_dxt4_5.format_unsigned.block_compressed = true;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    } else {
+      log_bc_fallback("k_DXT4_5", VK_FORMAT_BC3_UNORM_BLOCK,
+                      format_properties.optimalTilingFeatures);
+      host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
+      host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt4_5.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    }
   }
   HostFormatPair& host_format_dxn = host_formats_[uint32_t(xenos::TextureFormat::k_DXN)];
   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
@@ -3220,6 +3663,18 @@ const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
   // only select unaligned fallback mappings when block alignment is actually
   // violated for the current guest format.
   const FormatInfo* format_info = FormatInfo::Get(key.format);
+  // (Run #11, F3, point 6.) DXT1 with 1-bit alpha cannot use ETC2_RGB8 (no
+  // alpha channel): send it to the RGBA8 compute fallback instead. Only
+  // applies when the host format is the ETC2 transcode target; native BC1
+  // (desktop) handles 1-bit alpha itself, and misaligned textures already
+  // take the unaligned fallback in the switch below.
+  if ((key.format == xenos::TextureFormat::k_DXT1 ||
+       key.format == xenos::TextureFormat::k_DXT1_AS_16_16_16_16) &&
+      host_format_pair.format_unsigned.format ==
+          VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK &&
+      Dxt1TextureHasOneBitAlpha(shared_memory(), key, key.GetGuestLayout())) {
+    return kHostFormatDXT1Unaligned;
+  }
   if (!(key.GetWidth() & (format_info->block_width - 1)) &&
       !(key.GetHeight() & (format_info->block_height - 1))) {
     return host_format_pair;

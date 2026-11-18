@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <utility>
@@ -1593,6 +1594,43 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
     const uint64_t presented_frame_number =
         presented_frame_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    // (Run #11, F4.) Real guest FPS telemetry, 1 Hz. The "FPS 60" in
+    // screenshots is the display refresh, not the game (~6 fps real).
+    // presented_frame_count_ counts frames that actually reached the
+    // screen; guest_frame_count_ counts frames the guest produced. Both
+    // rates are logged so a present-side vs guest-side stall can be told
+    // apart (in kUIThreadOnRequest mode a UI repaint of the same mailbox
+    // image also counts as presented). steady_clock: wall time, immune
+    // to guest clock scaling.
+    {
+      using fps_clock = std::chrono::steady_clock;
+      static std::mutex fps_log_mutex;
+      static fps_clock::time_point last_log_time;
+      static uint64_t last_presented_count = 0;
+      static uint64_t last_guest_count = 0;
+      static bool fps_log_initialized = false;
+      std::lock_guard<std::mutex> lock(fps_log_mutex);
+      const fps_clock::time_point now = fps_clock::now();
+      if (!fps_log_initialized) {
+        fps_log_initialized = true;
+        last_log_time = now;
+        last_presented_count = presented_frame_number;
+        last_guest_count = guest_frame_count_.load(std::memory_order_relaxed);
+      } else if (now - last_log_time >= std::chrono::seconds(1)) {
+        const double elapsed =
+            std::chrono::duration<double>(now - last_log_time).count();
+        const double presented_fps =
+            double(presented_frame_number - last_presented_count) / elapsed;
+        const uint64_t guest_count = guest_frame_count_.load(std::memory_order_relaxed);
+        const double guest_fps = double(guest_count - last_guest_count) / elapsed;
+        const double frame_ms = presented_fps > 0.0 ? 1000.0 / presented_fps : 0.0;
+        REXLOG_INFO("Guest FPS: {:.1f} (frame {:.1f} ms, guest {:.1f} fps)", presented_fps,
+                    frame_ms, guest_fps);
+        last_log_time = now;
+        last_presented_count = presented_frame_number;
+        last_guest_count = guest_count;
+      }
+    }
     if (presented_frame_number == 300) {
       // Set once, before the first frame: android_main publishes the path
       // before the app starts, and it never changes for the process.

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -2396,16 +2397,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           "cache is {}x{}",
           texture_scale_x, texture_scale_y, rt_scale_x, rt_scale_y);
     }
-    static bool draw_scale_swap_sizes_logged = false;
-    if (!draw_scale_swap_sizes_logged) {
-      draw_scale_swap_sizes_logged = true;
-      REXGPU_WARN(
-          "Vulkan draw-scale swap sizing: packet={}x{}, src_scaled={}x{}, "
-          "src_unscaled={}x{}, active={}x{}",
-          frontbuffer_width, frontbuffer_height, frontbuffer_width_scaled,
-          frontbuffer_height_scaled, frontbuffer_width_unscaled, frontbuffer_height_unscaled,
-          guest_output_width, guest_output_height);
-    }
+  }
+  // (F5 instrumentation, run #11.) This one-shot sizing line used to live
+  // inside the IsDrawResolutionScaled() block above, so with the default
+  // resolution scale of 1 it never fired. It now logs on the first swap
+  // regardless of scale; the values logged are unchanged. The "draw-scale
+  // mismatch" warning above stays inside the if: it only makes sense when
+  // scaling is enabled.
+  static bool draw_scale_swap_sizes_logged = false;
+  if (!draw_scale_swap_sizes_logged) {
+    draw_scale_swap_sizes_logged = true;
+    REXGPU_WARN(
+        "Vulkan draw-scale swap sizing: packet={}x{}, src_scaled={}x{}, "
+        "src_unscaled={}x{}, active={}x{}",
+        frontbuffer_width, frontbuffer_height, frontbuffer_width_scaled,
+        frontbuffer_height_scaled, frontbuffer_width_unscaled, frontbuffer_height_unscaled,
+        guest_output_width, guest_output_height);
   }
   if (texture_cache_->IsDrawResolutionScaled() && !swap_source_scaled) {
     static bool draw_scale_swap_unscaled_logged = false;
@@ -3637,6 +3644,48 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  // F2 instrumentation (run #11, measurement only): per-second incidence of
+  // the conservative memexport path (full 512 MiB shared memory residency,
+  // whole-buffer barrier, global texture invalidation below). Counters and
+  // one log line per second only; no behavior change. The denominator counts
+  // every IssueDraw call, including draws dropped early below and kCopy
+  // redirects; the numerator counts draws that reach the unresolved-export
+  // block. IssueDraw runs on the command processor thread; the atomics match
+  // the throttled counters already used in this function.
+  static std::atomic<uint64_t> memexport_total_draws{0};
+  static std::atomic<uint64_t> memexport_global_path_draws{0};
+  static std::atomic<uint64_t> memexport_global_request_count{0};
+  static std::atomic<uint64_t> memexport_global_request_us{0};
+  static std::chrono::steady_clock::time_point memexport_stats_window_start =
+      std::chrono::steady_clock::now();
+  memexport_total_draws.fetch_add(1, std::memory_order_relaxed);
+  const auto memexport_stats_now = std::chrono::steady_clock::now();
+  if (memexport_stats_now - memexport_stats_window_start >= std::chrono::seconds(1)) {
+    memexport_stats_window_start = memexport_stats_now;
+    const uint64_t memexport_window_total_draws =
+        memexport_total_draws.exchange(0, std::memory_order_relaxed);
+    const uint64_t memexport_window_global_draws =
+        memexport_global_path_draws.exchange(0, std::memory_order_relaxed);
+    const uint64_t memexport_window_request_count =
+        memexport_global_request_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t memexport_window_request_us =
+        memexport_global_request_us.exchange(0, std::memory_order_relaxed);
+    const uint64_t memexport_global_percent =
+        memexport_window_total_draws
+            ? (memexport_window_global_draws * 100 / memexport_window_total_draws)
+            : 0;
+    const uint64_t memexport_request_avg_us =
+        memexport_window_request_count
+            ? (memexport_window_request_us / memexport_window_request_count)
+            : 0;
+    REXGPU_INFO(
+        "Memexport global path: {} / {} draws in the last second ({}%), full "
+        "shared memory requests: {} ({} ms total, {} us avg)",
+        memexport_window_global_draws, memexport_window_total_draws,
+        memexport_global_percent, memexport_window_request_count,
+        memexport_window_request_us / 1000, memexport_request_avg_us);
+  }
+
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -4165,7 +4214,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           "frame rate is low, this path is a likely cause.",
           unresolved_draw_index, uint32_t(SharedMemory::kBufferSize >> 20));
     }
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    // F2 instrumentation (run #11, measurement only): count this draw and
+    // time the full-range residency request. Counters only; the request,
+    // the barrier and the invalidation below are unchanged.
+    memexport_global_path_draws.fetch_add(1, std::memory_order_relaxed);
+    memexport_global_request_count.fetch_add(1, std::memory_order_relaxed);
+    const auto memexport_global_request_start = std::chrono::steady_clock::now();
+    const bool memexport_global_request_ok =
+        shared_memory_->RequestRange(0, SharedMemory::kBufferSize);
+    memexport_global_request_us.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - memexport_global_request_start)
+                .count()),
+        std::memory_order_relaxed);
+    if (!memexport_global_request_ok) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
