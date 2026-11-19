@@ -4147,9 +4147,18 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   } else {
     creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
     if (was_placeholder && old_pipeline != VK_NULL_HANDLE) {
+      // (Audit BL-2.) Do NOT stamp GetCurrentSubmission() here: this
+      // runs on the creation worker, and GetCurrentSubmission() reads
+      // submission_completed_ + submissions_in_flight_fences_.size(),
+      // both plain members mutated only by the CP thread (see the
+      // "cannot call GetCurrentSubmission(), it is not thread-safe"
+      // note in ConfigurePipeline). Enqueue unstamped; the CP thread
+      // stamps it in ProcessDeferredPipelineDestructions (EndSubmission)
+      // with the current submission, which is >= the install-time
+      // submission, so the old pipeline is never destroyed while a draw
+      // still references it.
       std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-      deferred_destroy_pipelines_.emplace_back(command_processor_.GetCurrentSubmission(),
-                                               old_pipeline);
+      deferred_destroy_pipelines_.emplace_back(kDeferredDestroyUnstamped, old_pipeline);
     }
   }
 
@@ -4300,6 +4309,17 @@ void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
     }
     auto it = deferred_destroy_pipelines_.begin();
     while (it != deferred_destroy_pipelines_.end()) {
+      // (Audit BL-2.) Stamp unstamped entries here, on the CP thread
+      // (EndSubmission), where GetCurrentSubmission() is legal. The stamp
+      // is taken after the install, so it is >= the submission in which
+      // the old pipeline was last drawn; the destroy below then waits for
+      // that submission to complete. Entries are stamped in queue order
+      // with non-decreasing submissions, so the sorted-queue assumption
+      // below keeps holding (an unstamped entry also implies every later
+      // entry is unstamped, so the break below stays correct).
+      if (it->first == kDeferredDestroyUnstamped) {
+        it->first = command_processor_.GetCurrentSubmission();
+      }
       if (force_all || it->first <= completed_submission) {
         pipelines_to_destroy.push_back(it->second);
         it = deferred_destroy_pipelines_.erase(it);
