@@ -12,7 +12,8 @@ no distribuye el juego ni nada derivado de él.
 
 ## Estado
 
-Trabajo en curso (ronda v1.4.2). El runtime arranca en el teléfono de
+Trabajo en curso (post-v1.4.5; la FULL local v1.4.5 llega al título en el
+teléfono de pruebas). El runtime arranca en el teléfono de
 pruebas y se depura por fases; nada de esto es una release. **Este repo no
 publica APKs ni builds**: no hay releases ni artefactos con el juego.
 
@@ -34,8 +35,12 @@ publica APKs ni builds**: no hay releases ni artefactos con el juego.
 
 En el hardware de pruebas (Helio G99 + Mali-G57 MC2), el proyecto hermano
 Zandatsu documenta que el renderer nativo Vulkan **pierde el dispositivo
-a los ~4 s** de abrir (causa desconocida). Por eso el launcher lleva
-perfil Mali-G57 (Vulkan 1.1, 4 descriptor sets, sin `shaderInt64`). El
+a los ~4 s** de abrir (causa desconocida). El launcher NO aplica ningún
+perfil Mali-G57 por detección: usa defaults globales pensados para Mali
+(preset Performance por defecto; sin `vertexPipelineStoresAndAtomics`;
+interruptor experimental para los requisitos de fragment stores). Lo de
+"sin `shaderInt64`" es ausencia por omisión en el código propio, no un
+ajuste. El
 plugin de GPU emulada (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige
 al arrancar: si el dispositivo Vulkan se pierde, el runtime aborta con
 `FatalError` — no hay cambio automático a otro backend en caliente. Se
