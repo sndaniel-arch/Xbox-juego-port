@@ -24,8 +24,11 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
 
 ## Cómo se llega a 60 fps
 
-1. **Cap de 60 fps** como cap de vblank del guest (el launcher de rexauto ya
-   lo trae: cap 30/60). Sin cap, el juego no puede dormirse entre frames.
+1. **Cap de 60 fps** opcional como cap de vblank del guest (el launcher
+   trae el selector 30/60/sin límite; **por defecto sin límite**: con el
+   cap en 0 no se emite `REX_FPS_CAP` y el vblank del guest — 60 Hz por
+   defecto — pauta el juego igualmente). Sin cap, el juego no puede
+   dormirse entre frames.
 2. **Escala de resolución**: 720p de objetivo; **540p como fallback** en GPUs
    débiles (misma receta que Zandatsu en RG Cube). La escala baja es mejor
    que perder frames.
@@ -35,27 +38,49 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
 4. **Shaders bajo demanda, no precompilación total**: precompilar todos los
    shaders al arrancar costaba 1,5–2,5 min de pantalla negra. En el port:
    compilar al usar, con caché persistente, y nunca bloquear el primer frame.
-5. **Perfiles por GPU + detección automática** (como Zandatsu): Adreno,
-   Mali, Xclipse y otros. El plugin de GPU emulada (`librexgpu-xenos.so`,
-   `--gpu_plugin=xenos`) se elige al arrancar; si el renderer nativo pierde
-   el dispositivo, el runtime aborta con `FatalError` — no hay cambio
-   automático a otro backend en caliente.
+5. **Ajustes globales + interruptor experimental (NO hay perfiles por GPU
+   ni detección automática).** Los presets Performance / Balanced /
+   Accuracy son globales, iguales para todas las GPUs. Las heurísticas
+   `isMali()`/`isAdreno()` solo eligen la familia del controlador dentro
+   de un zip importado por el usuario (PanVK en Mali, Turnip en Adreno)
+   y los textos del diálogo del controlador: no aplican ningún perfil de
+   rendimiento. El interruptor experimental apaga
+   `vulkan_require_fragment_stores_and_atomics` (vertex ya es `false`
+   siempre) cuando se usa un controlador alternativo. El plugin de GPU
+   emulada (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige al
+   arrancar; si el renderer nativo pierde el dispositivo, el runtime
+   aborta con `FatalError` — no hay cambio automático a otro backend en
+   caliente.
 6. **Capa de validación de Vulkan desde el primer día** (no al final): es el
    único procedimiento que ha convertido un "bug Mali" en "bug nuestro,
    arreglado" (NFSMW 0.5.5). Objetivo: cero avisos de sincronización.
+
+> **Nota — "Double Buffer" no existe como artefacto en este port.** El
+> buffering lo decide el swapchain (FIFO/FIFO_RELAXED, configurado en el
+> launcher); FIFO es el equivalente del Double Buffer clásico (vsync con
+> cola, sin tearing). No hay ningún cvar ni ajuste llamado "double
+> buffer": si el objetivo exige Double Buffer explícito, falta
+> implementarlo o aceptar esta equivalencia.
 
 ## El caso difícil: Mali-G57 (el teléfono del usuario)
 
 El riesgo de rendimiento no es Adreno (ahí 60 fps es lo esperado) sino Mali,
 donde el driver pierde el dispositivo a los ~4 s (Zandatsu KNOWN_ISSUES).
-El perfil Mali-G57 del port (12 puntos, todos con precedente verificado):
+Lo que sigue NO es un perfil Mali-G57 aplicado: no existe detección por
+GPU ni bundle Mali en el launcher. Es una checklist de 12 puntos de
+referencia (con precedente verificado en otros ports): una parte vive como
+defaults globales del launcher, otra sigue sin verificar en este port.
+Nada de esto se aplica solo al detectar una G57.
 
-1. Vulkan 1.1 + `VK_EXT_descriptor_indexing`; SPIR-V rebajado a 1.3.
+1. Vulkan 1.1 + `VK_EXT_descriptor_indexing`; SPIR-V rebajado a 1.3
+   (sin verificar en este port).
 2. Máximo **4 descriptor sets** (con 5, el driver cae en
-   `vkCreatePipelineLayout`).
-3. Sin `shaderInt64`, sin buffer device address, sin
-   `vertexPipelineStoresAndAtomics` (este último es el crash de Legends
-   issue #7 en Mali-G57).
+   `vkCreatePipelineLayout`) — sin verificar en este port.
+3. Sin buffer device address, sin `vertexPipelineStoresAndAtomics`
+   (este último es el crash de Legends issue #7 en Mali-G57; `false`
+   como default global en el launcher). "Sin `shaderInt64`" es ausencia
+   por omisión en el código propio (0 menciones fuera de thirdparty),
+   no un ajuste de ningún perfil.
 4. Texturas BC decodificadas en CPU (la G57 no tiene BC/DXT).
 5. Sin MSAA 2× (el hardware no lo anuncia; 4× o nada, o FXAA/CAS).
 6. Validación de Vulkan en todas las pruebas.
@@ -85,5 +110,7 @@ importable como zip, como en NFSMW y xendroid-mali.
   mínimo, medio y picos; el mínimo manda, no la media.
 - Aceptación: **60 fps sostenidos en gameplay en el teléfono del usuario**,
   y 60 fps en Adreno (matriz de comunidad: Redmi 10C, POCO X6 Pro,
-  Galaxy A56). Si un dispositivo no llega a 60, baja a 540p antes de bajar
-  a 30 fps.
+  Galaxy A56). Si un dispositivo no llega a 60, el usuario puede bajar a
+  540p a mano (opción 960×540 en el diálogo de gráficos) antes de bajar
+  a 30 fps: no hay bajada automática — no existe detección de
+  rendimiento ni cambio automático de modo de vídeo.
