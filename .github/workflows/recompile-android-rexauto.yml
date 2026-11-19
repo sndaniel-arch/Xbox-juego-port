@@ -159,7 +159,7 @@ jobs:
   # ------------------------------------------------------------------ codegen
   recompile:
     name: "codegen + static heal (windows)"
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 350
     outputs:
       title: ${{ steps.meta.outputs.title }}
