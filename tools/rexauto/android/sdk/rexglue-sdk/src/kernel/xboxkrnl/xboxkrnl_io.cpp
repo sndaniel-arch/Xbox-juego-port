@@ -14,10 +14,12 @@
 
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/xbmovie_device.h>
+#include <rex/filesystem/devices/xbmovie_file.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
+#include <rex/thread.h>
 #include <rex/types.h>
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
@@ -349,6 +351,18 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     io_status_block->information = 0;
   }
 
+  // (Hunt v1.4.6, A2-R6-12.) EOF backoff, lock-free: XFile::Read has
+  // returned by now, so no XFile lock is held (the old C-04 sleep ran
+  // inside ReadSync, under file_lock_). Only files that override
+  // EofBackoffMs() (the xbmovie probe) ever sleep here; every other file
+  // returns 0. The iosb already carries the real EOF status above.
+  if (file && result == X_STATUS_END_OF_FILE) {
+    uint32_t backoff_ms = file->file() ? file->file()->EofBackoffMs() : 0;
+    if (backoff_ms > 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(backoff_ms));
+    }
+  }
+
   if (ev && signal_event) {
     ev->Set(0, false);
   }
@@ -409,7 +423,11 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
         }
       }
 
-      if (!file->is_synchronous()) {
+      // (Hunt v1.4.6, A2-R6-08.) Same EOF exemption as NtReadFile above:
+      // END_OF_FILE is terminal -- no more data is coming -- so an async
+      // handle must see EOF, not PENDING (a caller that reads PENDING as
+      // "data is on its way" retries the read forever).
+      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
         result = X_STATUS_PENDING;
       }
 
@@ -444,6 +462,15 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
   if (XFAILED(result) && io_status_block) {
     io_status_block->status = result;
     io_status_block->information = 0;
+  }
+
+  // (Hunt v1.4.6, A2-R6-12.) EOF backoff, lock-free -- same as NtReadFile
+  // above: XFile::ReadScatter has returned, so no XFile lock is held.
+  if (file && result == X_STATUS_END_OF_FILE) {
+    uint32_t backoff_ms = file->file() ? file->file()->EofBackoffMs() : 0;
+    if (backoff_ms > 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(backoff_ms));
+    }
   }
 
   if (ev && signal_event) {
@@ -698,7 +725,11 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
   if (!object_attrs) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  assert_not_null(handle_out);
+  // (Audit A3, ronda 6, R6-06.) assert_not_null is a no-op in Release;
+  // a NULL handle_out used to write the handle to guest address 0.
+  if (!handle_out) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   assert_true(object_attrs->attributes == 64);  // case insensitive
 
@@ -777,63 +808,14 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
   const uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
   const uint32_t X_IOCTL_DISK_GET_PARTITION_INFO = 0x74004;
 
-  // (Audit C, ronda 2.) Probe for the xbmovie video device. This function
-  // only knows the two disk IOCTLs above; any other code falls through to
-  // REXKRNL_DEBUG (invisible at log_level=info) + assert_always (a no-op
-  // in Release) + INVALID_PARAMETER. If the handle belongs to the
-  // XbMovieDevice, log the IOCTL at WARN instead -- the code and the
-  // buffer lengths ARE the protocol, and the phone log is the only place
-  // that can reveal them -- and answer NOT_IMPLEMENTED so the caller can
-  // distinguish "unknown IOCTL on the video device" from "bad handle".
-  // Handles for any other device take the historical path unchanged.
-  {
-    auto xbmovie_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
-    if (xbmovie_file && xbmovie_file->device() &&
-        xbmovie_file->device()->name() == "XbMovieDevice") {
-      REXKRNL_WARN("NtDeviceIoControlFile(xbmovie): ioctl={:#x} in_len={} out_len={}",
-                   io_control_code, input_buffer_len, output_buffer_len);
-      // (Audit D, ronda 7, R7-D3.) Complete the call instead of returning
-      // bare: before this fix the branch returned NOT_IMPLEMENTED without
-      // writing the caller's IO_STATUS_BLOCK, without signalling its event
-      // and without queueing its APC, so a caller that waits on any of the
-      // three would hang (or read a STALE iosb status -- e.g. SUCCESS left
-      // over from a previous read -- and believe the IOCTL succeeded).
-      // NtReadFile/NtWriteFile in this file all complete synchronously
-      // this way; the disk-IOCTL branches below keep their historical path
-      // unchanged. Latently unreachable today (the game never resolves
-      // NtDeviceIoControlFile, R4-D2), but the probe exists to reveal the
-      // protocol if the component ever reaches it, and a hung game would
-      // reveal nothing after the first line.
-      if (io_status_block) {
-        auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
-        if (iosb) {
-          iosb->status = X_STATUS_NOT_IMPLEMENTED;
-          iosb->information = 0;
-        }
-      }
-      if (event_handle) {
-        auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-        if (ev) {
-          ev->Set(0, false);
-        }
-      }
-      if ((apc_routine & ~1u) && apc_context) {
-        auto thread = XThread::GetCurrentThread();
-        if (thread) {
-          thread->EnqueueApc(apc_routine & ~1u, apc_context, io_status_block, 0);
-        }
-      }
-      return X_STATUS_NOT_IMPLEMENTED;
-    }
-  }
-
-  // (Audit A-5.) Complete the call on every exit below, like the xbmovie
-  // branch above (R7-D3): write the caller's IO_STATUS_BLOCK, signal its
-  // event and queue its APC. The disk branches used to return bare, so a
-  // caller waiting on any of the three would hang (or read a STALE iosb
-  // status left over from a previous call and believe the IOCTL
-  // succeeded). `information` is the bytes written to the output buffer
-  // on success, 0 on error.
+  // (Audit A-5.) Complete the call on every exit below (R7-D3): write the
+  // caller's IO_STATUS_BLOCK, signal its event and queue its APC. The disk
+  // branches used to return bare, so a caller waiting on any of the three
+  // would hang (or read a STALE iosb status left over from a previous call
+  // and believe the IOCTL succeeded). `information` is the bytes written
+  // to the output buffer on success, 0 on error. Defined before the
+  // xbmovie branch so that branch uses it too instead of duplicating the
+  // completion by hand.
   auto complete_io = [&](X_STATUS status, uint32_t information) {
     if (io_status_block) {
       auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
@@ -855,6 +837,60 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
       }
     }
   };
+
+  // (Audit C, ronda 2.) Probe for the xbmovie video device. This function
+  // only knows the two disk IOCTLs above; any other code falls through to
+  // REXKRNL_DEBUG (invisible at log_level=info) + assert_always (a no-op
+  // in Release) + INVALID_PARAMETER. If the handle belongs to the
+  // XbMovieDevice, log the IOCTL at WARN instead -- the code and the
+  // buffer lengths ARE the protocol, and the phone log is the only place
+  // that can reveal them -- and answer NOT_IMPLEMENTED so the caller can
+  // distinguish "unknown IOCTL on the video device" from "bad handle".
+  // Handles for any other device take the historical path unchanged.
+  // (Hunt v1.4.6, A2-R6-01.) NOT_IMPLEMENTED forever was a trap, not a
+  // probe: a component that retries its start IOCTL until it succeeds
+  // spins with no sleep, no counter and no exit -- and every iteration
+  // used to emit an unthrottled WARN with a disk flush, so the log itself
+  // stole the guest thread. Now the streak is counted per handle with
+  // exponential backoff (1-8 ms, taken here -- this function holds no
+  // XFile lock), the log is throttled to the first 8 + every 16, and
+  // after 64 consecutive NOT_IMPLEMENTED answers to the SAME code the
+  // probe answers X_STATUS_END_OF_FILE instead: the probe's established
+  // "movie ended" signal (same as its reads), which lets a retrying
+  // component terminate and move on instead of spinning forever. The
+  // first 64 answers are still honest NOT_IMPLEMENTED, so a component
+  // that falls back to another method after a few failures never sees
+  // the terminal status. The call is still completed on every exit
+  // (iosb + event + APC, R7-D3) via complete_io above.
+  {
+    auto xbmovie_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
+    if (xbmovie_file && xbmovie_file->device() &&
+        xbmovie_file->device()->name() == "XbMovieDevice") {
+      auto* movie = xbmovie_file->file()
+                        ? static_cast<rex::filesystem::XbMovieFile*>(xbmovie_file->file())
+                        : nullptr;
+      bool terminate = false;
+      uint32_t backoff_ms = 0;
+      uint32_t streak = 0;
+      if (movie) {
+        terminate = movie->RecordUnimplementedIoctl(io_control_code);
+        backoff_ms = movie->IoctlBackoffMs();
+        streak = movie->ConsecutiveIoctlCount();
+      }
+      if (streak <= 8 || streak % 16 == 0 || terminate) {
+        REXKRNL_WARN(
+            "NtDeviceIoControlFile(xbmovie): ioctl={:#x} in_len={} out_len={} streak={}{}",
+            io_control_code, input_buffer_len, output_buffer_len, streak,
+            terminate ? " -> END_OF_FILE (start retry limit reached, movie ended)" : "");
+      }
+      X_STATUS status = terminate ? X_STATUS_END_OF_FILE : X_STATUS_NOT_IMPLEMENTED;
+      if (backoff_ms > 0 && !terminate) {
+        rex::thread::Sleep(std::chrono::milliseconds(backoff_ms));
+      }
+      complete_io(status, 0);
+      return status;
+    }
+  }
 
   uint32_t bytes_written = 0;
   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
@@ -887,6 +923,12 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
 }
 
 u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapped_u32 out_struct) {
+  // (Audit A3, ronda 6, R6-06.) A NULL out_struct used to write the
+  // device pointer to guest address 0, after leaking two heap allocs.
+  if (!out_struct) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // Called from XMountUtilityDrive XAM-task code
   // That code tries writing things to a pointer at out_struct+0x18
   // We'll alloc some scratch space for it so it doesn't cause any exceptions
@@ -908,12 +950,14 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
 
 u32 IoDismountVolumeByFileHandle_entry(u32 handle) {
   REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
-  return X_STATUS_SUCCESS;
+  // (Audit A3, ronda 6, R6-05.) Was SUCCESS without dismounting anything.
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 u32 IoDismountVolumeByName_entry(ppc_ptr_t<X_ANSI_STRING> name) {
   REXKRNL_WARN("IoDismountVolumeByName - stub");
-  return X_STATUS_SUCCESS;
+  // (Audit A3, ronda 6, R6-05.) Was SUCCESS without dismounting anything.
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_object,
@@ -921,19 +965,32 @@ u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_obje
                                               mapped_void output_buffer, u32 output_length,
                                               mapped_u32 returned_length, u32 unk) {
   REXKRNL_WARN("IoSynchronousDeviceIoControlRequest({:#x}) - stub", (uint32_t)ioctl);
-  return X_STATUS_SUCCESS;
+  // (Audit A3, ronda 6, R6-05.) Was SUCCESS without running the IOCTL or
+  // writing the out-params: callers believed the request ran and read
+  // output that was never produced. Fail honestly, and zero the byte
+  // count so a caller that ignores the status does not read a stale length.
+  if (returned_length) {
+    *returned_length = 0;
+  }
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 u32 StfsCreateDevice_entry(mapped_void device_object, u32 flags, mapped_u32 out_device) {
   REXKRNL_WARN("StfsCreateDevice - stub");
-  // if (out_device) *out_device = 0;
-  return X_STATUS_SUCCESS;
+  // (Audit A3, ronda 6, R6-05.) Was SUCCESS without creating the device
+  // or writing *out_device (the write was commented out): callers used
+  // an uninitialized device pointer. Write NULL and fail honestly.
+  if (out_device) {
+    *out_device = 0;
+  }
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 u32 StfsControlDevice_entry(mapped_void device_object, u32 ioctl, mapped_void input_buffer,
                             u32 input_length, mapped_void output_buffer, u32 output_length) {
   REXKRNL_WARN("StfsControlDevice({:#x}) - stub", (uint32_t)ioctl);
-  return X_STATUS_SUCCESS;
+  // (Audit A3, ronda 6, R6-05.) Was SUCCESS without running the IOCTL.
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 }  // namespace rex::kernel::xboxkrnl
