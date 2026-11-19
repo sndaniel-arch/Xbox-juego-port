@@ -12,8 +12,8 @@
  */
 
 #pragma once
-#include <atomic>
 
+#include <atomic>
 #include <span>
 #include <string>
 
@@ -35,7 +35,8 @@ class XbMovieFile : public File {
   X_STATUS WriteSync(std::span<const uint8_t> buffer, size_t byte_offset,
                      size_t* out_bytes_written) override;
   X_STATUS SetLength(size_t length) override;
-  // (Hunt v1.4.6, A2-R6-01.) Records one NOT_IMPLEMENTED answer to an
+  
+// (Hunt v1.4.6, A2-R6-01.) Records one NOT_IMPLEMENTED answer to an
   // IOCTL on this handle. Returns true once the same IOCTL code has been
   // answered NOT_IMPLEMENTED kMaxConsecutiveIoctlRetries times in a row:
   // the caller should then answer with the probe's terminal "movie ended"
@@ -80,7 +81,8 @@ class XbMovieFile : public File {
   // few NOT_IMPLEMENTEDs never reaches it, while one that retries its
   // start ioctl until SUCCESS terminates instead of spinning forever.
   static constexpr uint32_t kMaxConsecutiveIoctlRetries = 64;
-  // (Hunt v1.4.6, A2-R6-01/A2-R6-12.) Per-handle streaks, NOT process
+  
+// (Hunt v1.4.6, A2-R6-01/A2-R6-12.) Per-handle streaks, NOT process
   // totals: a fresh open starts at 0, and a streak only grows while THIS
   // handle keeps hitting the same dead end. The old C-04 sleep keyed off
   // the process-wide read total, so after 1024 EOF reads anywhere in the
