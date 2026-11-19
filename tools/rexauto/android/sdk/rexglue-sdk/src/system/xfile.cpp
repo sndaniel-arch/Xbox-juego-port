@@ -37,7 +37,13 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
-  file_->Destroy();
+  // (Hunt v1.4.6, A2-R6-10.) file_ is null for a default-constructed
+  // XFile whose Restore failed to re-open the file; Restore now returns
+  // nullptr in that case, but never let the destructor dereference a
+  // null file_ if one ever slips through.
+  if (file_) {
+    file_->Destroy();
+  }
 }
 
 uint64_t XFile::position() const {
@@ -236,11 +242,19 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     }
 
     uint32_t bytes_read = 0;
+    // (Hunt v1.4.6, A2-R6-02.) byte_offset -1 / -2 are the
+    // position-relative markers (ReadInternal maps them to position_);
+    // ANY other value, including an explicit 0, is an absolute offset.
+    // The old `byte_offset ? ... : -1` treated an explicit 0 as "current
+    // position", so a scatter at the start of the file read from wherever
+    // the cursor happened to be (typically EOF). Only NtReadFileScatter
+    // calls this, and it passes -1 when the guest gave no offset pointer,
+    // so 0 here always means "offset 0".
     result = ReadInternal(
         read_buffer, read_length,
-        byte_offset
-            ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total : byte_offset)
-            : -1,
+        (byte_offset == uint64_t(-1) || byte_offset == uint64_t(-2))
+            ? byte_offset
+            : byte_offset + read_total,
         &bytes_read, apc_context, false);
 
     if (result != X_STATUS_SUCCESS) {
@@ -248,7 +262,24 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     }
 
     read_total += bytes_read;
-    read_remain -= read_length;
+    // (Hunt v1.4.6, A2-R6-02.) Discount what was actually READ, not what
+    // was asked for: the old `read_remain -= read_length` ended the
+    // scatter early with SUCCESS and a short buffer whenever a segment
+    // read short (EOF / truncated hole), and with SUCCESS + 0 bytes it
+    // never advanced read_total at all while still consuming read_remain.
+    read_remain -= bytes_read;
+    if (bytes_read < read_length) {
+      // A short read means the source ran out at this offset: stop here
+      // instead of filling later segments from further offsets (or, with
+      // a 0-byte short read, looping forever on read_remain -= 0). A
+      // partial segment is still honest SUCCESS with the real count; a
+      // 0-byte segment is END_OF_FILE, so the caller terminates instead
+      // of retrying the same offset.
+      if (bytes_read == 0) {
+        result = X_STATUS_END_OF_FILE;
+      }
+      break;
+    }
   }
 
   if (out_bytes_read) {
@@ -378,7 +409,12 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
                                                    is_directory, false, &vfs_file, &action);
   if (XFAILED(res)) {
     REXSYS_ERROR("Failed to open XFile: error {:08X}", res);
-    return object_ref<XFile>(file);
+    // (Hunt v1.4.6, A2-R6-10.) Do NOT return the half-built object: its
+    // file_ is still nullptr, and the first use -- or its own destructor
+    // -- dereferences it. Same delete-and-nullptr pattern as the
+    // RestoreObject failure above and every other Restore in this tree.
+    delete file;
+    return nullptr;
   }
 
   file->file_ = vfs_file;
