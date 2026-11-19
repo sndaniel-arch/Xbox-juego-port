@@ -24,7 +24,6 @@
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
-
 namespace rex::graphics::vulkan {
 class VulkanCommandProcessor;
 
@@ -268,6 +267,7 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+
     // (Audit A1-R6-01.) BC -> ETC2 transcode progress: the next (loop
     // level, array slice) not yet uploaded. The ETC2 load uploads the
     // slices it transcoded in each submission and resumes here on the next
@@ -340,6 +340,7 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
 
     Usage usage_ = Usage::kUndefined;
+
     // (Audit A1-R6-01.) See the accessors above.
     bool etc2_progress_active_ = false;
     uint32_t etc2_next_loop_level_ = 0;
