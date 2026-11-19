@@ -168,6 +168,31 @@ class VulkanTextureCache final : public TextureCache {
   static bool IsTexturePlaceholder(const TextureKey& key);
   static void MarkTexturePlaceholder(const TextureKey& key);
   static void ClearTexturePlaceholder(const TextureKey& key);
+
+  // (Audit A-3.) CPU BC -> ETC2 transcode budget + failure cooldown
+  // state. The transcode runs on the graphics thread (same as
+  // RequestTextures), so these function-local statics need no lock,
+  // like PlaceholderTextureKeys() above. The budget is shared across
+  // all textures in one submission, stamped by submission index.
+  struct Etc2TranscodeBudget {
+    uint64_t submission = 0;
+    uint32_t blocks_used = 0;
+  };
+  static Etc2TranscodeBudget& Etc2Budget() {
+    static Etc2TranscodeBudget budget;
+    return budget;
+  }
+  struct Etc2TranscodeFailure {
+    uint32_t consecutive_failures = 0;
+    uint64_t last_failure_submission = 0;
+  };
+  static std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>&
+  Etc2FailedTextures() {
+    static std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>
+        failures;
+    return failures;
+  }
+  static void RecordEtc2TranscodeFailure(const TextureKey& key, uint64_t submission);
   static bool ReadGuestBcBlock(const SharedMemory& shared_memory,
                                const texture_util::TextureGuestLayout::Level& level_layout,
                                uint32_t guest_level_base, const TextureKey& key,
