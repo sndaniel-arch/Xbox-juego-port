@@ -644,6 +644,7 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+
   // (Audit A1-R6-02.) Scratch vectors reused by RequestTextures (one call
   // per draw on the command processor thread) instead of allocating two
   // vectors plus a pairs vector per draw. clear() at entry, never
