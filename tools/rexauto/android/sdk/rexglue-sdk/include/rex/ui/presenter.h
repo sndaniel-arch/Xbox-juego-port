@@ -899,21 +899,25 @@ class Presenter {
   // UI thread: writable, guest output thread: read-only.
   PaintMode paint_mode_ = PaintMode::kNone;
 
-  // These fields can be accessed _exclusively_ by either the UI thread or the
-  // guest output thread, depending on paint_mode_.
-  // If it's kGuestOutputThreadImmediately, they can be accessed _only_ by the
-  // guest output thread (though the UI thread can still read, but not modify,
-  // fields that are writable by the UI thread and readadable by both).
-  // Otherwise, they can be accessed _only_ by the UI thread.
-  // The connection state may be changed from the guest output thread, but only
-  // from kConnectedPaintable to kConnectedOutdated.
-  SurfacePaintConnectionState surface_paint_connection_state_ =
-      SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
+  // (Audit run #16, M-7.) These two fields decide whether the swapchain is
+  // recreated, and they are written from BOTH the UI thread (reconnection)
+  // and the paint threads (PaintAndPresent can run from more than one
+  // thread; the guest output thread marks the connection outdated). The
+  // old comment claimed exclusive access depending on paint_mode_, but the
+  // guest output thread may change the state to kConnectedOutdated while
+  // the UI thread reconnects, so a plain field was a data race: a
+  // concurrent write could revert the flag just before paint read it (a
+  // recreate lost or duplicated). Atomic, like the C-02 counters below.
+  // Loads/stores are one atomic op each; check-then-act sequences spanning
+  // two loads keep their previous meaning (the outcome is at worst a
+  // redundant, idempotent Outdated marking, as in J-17).
+  std::atomic<SurfacePaintConnectionState> surface_paint_connection_state_{
+      SurfacePaintConnectionState::kUnconnectedRetryAtStateChange};
   // If the surface connection was optimal at the last paint attempt, but now
   // has become suboptimal, need to try to reconnect. But only in this case - if
   // the connection has been suboptimal from the very beginning don't try to
   // reconnect every frame.
-  bool surface_paint_connection_was_optimal_at_successful_paint_ = false;
+  std::atomic<bool> surface_paint_connection_was_optimal_at_successful_paint_{false};
 
   // (Run #16, C-02.) Consecutive suboptimal presents since the connection
   // was (re)established, and whether the one forced recreate for this
