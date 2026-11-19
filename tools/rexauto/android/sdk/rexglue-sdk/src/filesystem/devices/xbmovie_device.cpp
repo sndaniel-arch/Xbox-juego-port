@@ -31,6 +31,15 @@ REXCVAR_DEFINE_BOOL(xbmovie_probe, false, "Filesystem",
                     "EOF, every access is logged). OFF by default: with it "
                     "off, video opens fail exactly as they do today.");
 
+// (Run #16, C-04.) Milliseconds to sleep on each XbMovie probe EOF read
+// after the first 1024 EOF reads (range 0-10, 0 = disabled). Caps a video
+// component looping on EOF reads at ~1000 reads/s instead of spinning
+// unbounded on the guest thread. A caller that reads EOF once and stops
+// never sees the sleep; the status stays EOF.
+REXCVAR_DEFINE_INT32(xbmovie_probe_eof_sleep_ms, 1, "Filesystem",
+                     "Sleep in ms on each XbMovie probe EOF read after "
+                     "1024 EOF reads (range 0-10, 0 = disabled).");
+
 namespace rex::filesystem {
 
 XbMovieDevice::XbMovieDevice(const std::string& mount_path)
