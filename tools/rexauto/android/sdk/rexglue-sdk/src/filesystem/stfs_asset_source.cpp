@@ -8,15 +8,16 @@
  */
 
 #include <rex/filesystem/stfs_asset.h>
+
 #include <cerrno>
 #include <cstring>
-
 #include <mutex>
 #include <utility>
 
 #if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
+
 #include <rex/logging.h>
 
 namespace rex::filesystem {
