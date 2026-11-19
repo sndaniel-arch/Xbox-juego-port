@@ -22,6 +22,7 @@
     <string name="err_wrong_game">Eso es <b>%1$s</b>. Esta app está hecha para <b>%2$s</b> (Title ID %3$s): elige la imagen del disco de ese juego.</string>
     <string name="err_xex_unreadable">No se pudo leer el encabezado de default.xex (archivo dañado o incompleto).</string>
     <string name="err_generic">La importación falló.</string>
+    <string name="err_full_missing_asset">Faltan los archivos del juego dentro de la app. Reinstala la app para volver a jugar.</string>
     <string name="err_no_xex_in_stfs">%1$s es un paquete de Xbox 360 pero no contiene default.xex (¿una partida guardada, un DLC o una actualización?).</string>
     <string name="err_god_needs_folder">%1$s es una imagen Games on Demand de varias partes. Usa <b>Elegir carpeta</b> y elige la carpeta que contiene este archivo y su carpeta «%1$s.data».</string>
     <string name="log_empty">(aún no hay registro)</string>
@@ -65,7 +66,7 @@
     <string name="preset_balanced">Equilibrado</string>
     <string name="preset_accuracy">Precisión (valores de escritorio)</string>
     <string name="gfx_fps_cap">Límite de fotogramas</string>
-    <string name="fps_off">Sin límite (frecuencia de pantalla)</string>
+    <string name="fps_off">60 FPS (vblank del juego)</string>
     <string name="fps_30">30 FPS (más fresco y estable)</string>
     <string name="fps_60">60 FPS</string>
 
