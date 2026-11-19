@@ -119,6 +119,50 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path) {
   return out;
 }
 
+// (Audit run #16, J-18.) The user's orientation choice lives in the
+// launcher's SharedPreferences ("graphics" prefs, key "orientation":
+// "landscape" | "portrait" | "auto", GraphicsSettings.java) -- the same
+// file MainActivity.applyOrientation() reads, with the same mapping:
+// landscape -> fixed landscape, portrait -> portrait, auto -> no hint
+// (SDL's empty hint + resizable window resolves to FULL_USER, i.e. follow
+// the device rotation, exactly what "auto" means). The old code hardcoded
+// "LandscapeLeft" here, so a user who chose portrait or auto still got a
+// landscape request from SDL on every window (re)creation -- the Java side
+// overrode it in setOrientationBis, but only after SDL had already asked.
+// Reading the prefs XML directly is the only channel available to native
+// code: orientation is exported neither to settings.txt nor to any
+// cvar/env. Any failure (no file yet, unparsable, unknown value) falls
+// back to "LandscapeLeft", i.e. today's behavior. SharedPreferences
+// writes atomically (temp file + rename), so a concurrent Java write can
+// only show the old or the new value, never a torn one.
+std::string ReadOrientationHint(const std::string& internal_dir) {
+  std::string base = internal_dir;
+  while (!base.empty() && base.back() == '/') base.pop_back();
+  const size_t slash = base.find_last_of('/');
+  if (slash == std::string::npos) return "LandscapeLeft";
+  // SDL_GetAndroidInternalStoragePath() is <app>/files; shared_prefs is
+  // its sibling.
+  const std::string prefs_path = base.substr(0, slash) + "/shared_prefs/graphics.xml";
+  std::ifstream in(prefs_path, std::ios::binary);
+  if (!in) return "LandscapeLeft";
+  std::string line;
+  while (std::getline(in, line)) {
+    // SharedPreferences XML, one entry per line:
+    // <string name="orientation">portrait</string>
+    const size_t key_pos = line.find("name=\"orientation\"");
+    if (key_pos == std::string::npos) continue;
+    const size_t value_begin = line.find('>', key_pos);
+    if (value_begin == std::string::npos) break;
+    const size_t value_end = line.find('<', value_begin + 1);
+    if (value_end == std::string::npos) break;
+    const std::string value = line.substr(value_begin + 1, value_end - value_begin - 1);
+    if (value == "portrait") return "Portrait";
+    if (value == "auto") return "";
+    return "LandscapeLeft";
+  }
+  return "LandscapeLeft";
+}
+
 std::string QueryNativeLibraryDir() {
   Dl_info info{};
   if (dladdr(reinterpret_cast<void*>(&QueryNativeLibraryDir), &info) && info.dli_fname) {
@@ -205,7 +249,7 @@ void CrashHandler(int sig, siginfo_t* info, void* uctx) {
   static volatile sig_atomic_t entered = 0;
   if (!entered) {
     entered = 1;
-    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd >= 0) {
       CrashWrite(fd, REX_APP_NAME " native crash\nsignal: ");
       const char* name = sig == SIGSEGV ? "SIGSEGV (access violation)" :
@@ -263,7 +307,12 @@ void InstallCrashReporter(const std::string& log_dir) {
       try { std::rethrow_exception(ex); }
       catch (const std::exception& e) {
         __android_log_print(ANDROID_LOG_ERROR, REX_APP_NAME, "uncaught exception: %s", e.what());
-        int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        // (Audit run #16, M-11.) O_APPEND, not O_TRUNC: std::abort() below
+        // raises SIGABRT, and CrashHandler appends the backtrace to this
+        // same file -- with O_TRUNC here AND there, the handler wiped the
+        // exception message, the one line that names the failure. crash.txt
+        // is removed at every fresh launch, so appends never mix runs.
+        int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
         if (fd >= 0) { CrashWrite(fd, "uncaught exception: "); CrashWrite(fd, e.what()); CrashWrite(fd, "\n"); close(fd); }
       } catch (...) {}
     }
@@ -614,11 +663,17 @@ int RunAndroidApp() {
   // resolves to SCREEN_ORIENTATION_FULL_USER — which follows the user's
   // rotation lock instead of forcing landscape, so the first surface is
   // born vertical and the title renders letterboxed into a short band.
-  // Setting the orientations hint here makes SDL request fixed LANDSCAPE
-  // instead, on every window (re)creation (incl. each
-  // SDL_SetWindowFullscreen). MainActivity.setOrientationBis applies the
-  // same choice on the Java side as a second layer.
-  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft");
+  // The orientations hint below makes SDL request the orientation the user
+  // chose in the graphics settings instead (landscape by default), on
+  // every window (re)creation (incl. each SDL_SetWindowFullscreen).
+  // MainActivity.setOrientationBis applies the same choice on the Java
+  // side as a second layer.
+  // (Audit run #16, J-18.) The hint itself is set after
+  // SDL_GetAndroidInternalStoragePath(), below: it reads the user's
+  // setting from the "graphics" SharedPreferences (ReadOrientationHint),
+  // which needs the internal dir. The hint only matters before the window
+  // is created (SDLWindowedAppContext::Initialize), so setting it there
+  // is still in time.
 
   // (Ronda 9, auditor E — R9-E3.) El fallback del external dir vive
   // aquí arriba, antes de SDL_InitSubSystem: el cuarto fallo limpio de
@@ -649,6 +704,17 @@ int RunAndroidApp() {
 
   const std::string game_root = ReadTrimmedFile(external_dir + "/" + kConfigFileName);
   const char* internal_c = SDL_GetAndroidInternalStoragePath();
+  // (Audit run #16, J-18.) Orientation hint from the user's graphics
+  // setting (ReadOrientationHint above): landscape by default (the v1.3
+  // fix -- an empty hint lets the first surface be born vertical), the
+  // user's portrait/auto choice otherwise. Empty means "auto": leave the
+  // hint unset so SDL falls back to FULL_USER, matching the Java side.
+  {
+    const std::string orientations_hint = ReadOrientationHint(internal_c ? internal_c : "");
+    if (!orientations_hint.empty()) {
+      SDL_SetHint(SDL_HINT_ORIENTATIONS, orientations_hint.c_str());
+    }
+  }
   // (Ronda 6, auditor E — R6-E3.) Resolve the log dir, wipe the stale
   // markers and install the crash reporter BEFORE loading the custom
   // driver: the old order did it after LoadCustomVulkanDriver, so a crash
@@ -770,10 +836,19 @@ int RunAndroidApp() {
   // while the cache warms up, but it stops the frame drops. Overridable
   // from settings.txt.
   args.emplace_back("--vulkan_async_skip_incomplete_frames=false");
-  // Only one pipeline-creation worker on phones: several workers saturate
-  // mobile drivers (up to crash/OOM); the cvar defaults to -1 (6 threads
-  // on this phone) and is set nowhere else. Overridable from settings.txt.
-  args.emplace_back("--vulkan_pipeline_creation_threads=1");
+  // (Audit run #16, M-8.) Two pipeline-creation workers: with one, every
+  // new-zone shader compiles serially while the game shows placeholders
+  // (the long black/placeholder phase in cold starts). The cvar defaults
+  // to -1 (6 threads on this phone: logical_processor_count * 3/4) and is
+  // set nowhere else; the old value 1 was a deliberate guard ("several
+  // workers saturate mobile drivers, up to crash/OOM"), so this raises it
+  // by one worker only -- each worker is pinned to the big cores (2x A76
+  // here) and compiles one pipeline at a time, so memory stays bounded by
+  // two in-flight pipelines. If the phone shows driver crashes or OOM
+  // during shader warm-up, set vulkan_pipeline_creation_threads=1 in
+  // settings.txt (it overrides this arg). Phone verification required:
+  // CI cannot tell whether 2 workers is safe on this driver.
+  args.emplace_back("--vulkan_pipeline_creation_threads=2");
   for (auto& a : ReadSettingsArgs(external_dir + "/" + kSettingsFileName)) {
     ALOGI("setting: %s", a.c_str());
     args.emplace_back(std::move(a));
