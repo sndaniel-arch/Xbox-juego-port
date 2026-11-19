@@ -75,6 +75,7 @@
  */
 
 #include <rex/filesystem/devices/xbmovie_file.h>
+#include <rex/filesystem/devices/xbmovie_device.h>
 
 #include <atomic>
 #include <cstdio>
