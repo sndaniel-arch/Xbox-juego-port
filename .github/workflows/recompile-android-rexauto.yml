@@ -176,6 +176,13 @@ jobs:
       # REXAUTO_SDK_PIN=0 porque el pin exige el binario xdzleo y este
       # repack no es ese binario (setup.py pin_enforced).
       REXGLUE_BUNDLE_URL: https://github.com/sndaniel-arch/Xbox-juego-port/releases/download/sdk-v0.10.1-repack/rexglue-sdk-0.10.1-win-amd64-raw.zip
+      # (A-2.) SHA-256 of that zip, verified 2026-11-19 by downloading the
+      # public asset (46,035,081 B). The "Verify ReXGlue SDK bundle SHA-256"
+      # step below fails the run on mismatch, and this value is part of the
+      # job-1 cache key, so a re-uploaded asset under the same URL cannot be
+      # served silently from cache. PENDING: publish the same hash in the
+      # release body (see proposals/a2-sdk-sha.md).
+      REXGLUE_BUNDLE_SHA256: c3fdf06b6e55271591b52ba6ab1fb5c1fd6de7f88032299117cac94e099bb241
       REXAUTO_SDK_PIN: "0"
     steps:
       - name: Validate inputs
@@ -183,16 +190,30 @@ jobs:
         run: |
           if ("${{ inputs.iso_url }}".Trim() -notmatch '^https?://') { Write-Host "::error::iso_url must start with http(s)://"; exit 1 }
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Checkout rexauto (pinned commit)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Player124413/rexauto
           ref: ${{ env.REXAUTO_REF }}
           path: rexauto
 
-      - uses: actions/setup-python@v5
+      - name: Overlay tracked ci_fetch.py (A-1)
+        shell: pwsh
+        run: |
+          # ci_fetch.py is upstream (Player124413/rexauto, NOT tracked there);
+          # our copy under tools/rexauto/tools/ is a delta on it, exactly like
+          # android_sdk.sh (job 2 overlay). It emits downloaded_file +
+          # downloaded_sha256 before unpacking, so the "Verify ISO SHA-256"
+          # step can check the real downloaded file instead of skipping with
+          # a warning when pick_container returns a directory. If this copy
+          # ever goes missing, the fetch step falls back to the upstream file
+          # and the verify step degrades to its old directory-skip behaviour.
+          Copy-Item tools/rexauto/tools/ci_fetch.py rexauto/tools/ci_fetch.py
+          if (-not (Select-String -Path rexauto/tools/ci_fetch.py -Pattern "downloaded_sha256" -Quiet)) { Write-Host "::error::tracked ci_fetch.py does not emit downloaded_sha256"; exit 1 }
+
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -206,7 +227,7 @@ jobs:
           # TypeError), and an unpinned --upgrade installs 6.x, which
           # REMOVED fuzzy (run #3 died on the same TypeError). Verified
           # against the real wheels: 6.5.1 has no fuzzy, 5.2.0 has it.
-          python -m pip install -q --upgrade pip pillow "gdown==5.2.0"
+          python -m pip install -q --upgrade pip "pillow==13.0.0" "gdown==5.2.0"
           python -c "import gdown; print('gdown version:', gdown.__version__)"
 
       - name: Toolchain
@@ -220,6 +241,25 @@ jobs:
             "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+          # (M-3.) Assert the toolchain that will actually compile: the
+          # windows-2022 image rolls monthly (VS servicing, LLVM bumps) while
+          # the label stays the same, and run #16 died on STL1000 (MSVC 14.52
+          # demanding Clang 22+) before compiling anything. Print both
+          # versions and fail fast on the known-bad combination instead of
+          # burning a 20-minute codegen first.
+          $clangExe = (Get-Command clang -ErrorAction SilentlyContinue).Source
+          if (-not $clangExe) { $clangExe = "$env:ProgramFiles\LLVM\bin\clang.exe" }
+          if (-not (Test-Path $clangExe)) { Write-Host "::error::clang not found (PATH nor $env:ProgramFiles\LLVM\bin\clang.exe)"; exit 1 }
+          $clangVer = (& $clangExe --version | Select-Object -First 1)
+          Write-Host "clang: $clangVer ($clangExe)"
+          $clangMajorMatch = [regex]::Match($clangVer, "clang version (\d+)")
+          if (-not $clangMajorMatch.Success) { Write-Host "::error::could not parse clang version from: $clangVer"; exit 1 }
+          $clangMajor = [int]$clangMajorMatch.Groups[1].Value
+          $msvcDir = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+          Write-Host "MSVC tools version: $msvcDir (VS install: $vs)"
+          $msvcParts = $msvcDir.Split(".")
+          $msvcBad = ([int]$msvcParts[0] -gt 14) -or (([int]$msvcParts[0] -eq 14) -and ([int]$msvcParts[1] -ge 52))
+          if ($msvcBad -and ($clangMajor -lt 22)) { Write-Host "::error::STL1000 combination: MSVC $msvcDir requires Clang 22+, but clang is $clangMajor ($clangVer). Pin an older windows-2022 image or install LLVM >= 22."; exit 1 }
 
       - name: Resolve pinned SDK URL
         id: sdk
@@ -229,19 +269,54 @@ jobs:
           $url = (python tools/ci_sdk.py url)
           "url=$url" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: sdk-cache
         with:
           path: rexauto/rexglue
-          key: rexglue-sdk-${{ hashFiles('rexauto/rexauto.py') }}-${{ steps.sdk.outputs.url }}
+          key: rexglue-sdk-${{ env.REXGLUE_BUNDLE_SHA256 }}-${{ hashFiles('rexauto/rexauto.py') }}-${{ steps.sdk.outputs.url }}
+
+      - name: Verify ReXGlue SDK bundle SHA-256
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          # (A-2.) The install step downloads the zip into a temp file and
+          # DELETES it (gui/setup.py), so the hash cannot be checked after
+          # install: download a verification copy here (46 MB, cache-miss
+          # runs only) and fail before codegen on mismatch. The install step
+          # still downloads its own copy afterwards; the double download is
+          # the price of not editing upstream setup.py.
+          $zip = "$env:RUNNER_TEMP\rexglue-sdk-verify.zip"
+          curl.exe --fail -L --retry 3 --retry-delay 10 -o "$zip" "${{ steps.sdk.outputs.url }}"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not download the SDK bundle for hash verification"; exit 1 }
+          $expected = "${{ env.REXGLUE_BUNDLE_SHA256 }}".Trim().ToUpper()
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash
+          Write-Host "expected: $expected"
+          Write-Host "actual:   $actual"
+          Remove-Item $zip -Force
+          if ($actual -ne $expected) { Write-Host "::error::SDK bundle SHA-256 mismatch: the release asset is not the audited sdk-v0.10.1-repack zip (re-uploaded, or wrong URL). Refusing to build with an unverified SDK."; exit 1 }
+          Write-Host "SDK bundle SHA-256 OK"
 
       - name: Install ReXGlue SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         working-directory: rexauto
+        timeout-minutes: 60
         env:
           REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
-        run: python tools/ci_sdk.py install
+        run: |
+          # (J-8.) gui/setup.py:install_rexglue does urlopen(..., timeout=60)
+          # with a single attempt; setup.py is upstream (NOT tracked), so the
+          # retry with backoff lives here. Only matters on cache-miss runs.
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            python tools/ci_sdk.py install
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -ge 3) { Write-Host "::error::SDK install failed after 3 attempts"; exit 1 }
+            Write-Host "::warning::SDK install attempt $attempt failed, retrying in 30s..."
+            Start-Sleep -Seconds 30
+          }
 
       - name: Verify SDK pin
         shell: pwsh
@@ -250,6 +325,7 @@ jobs:
 
       - name: Download game input
         id: fetch
+        timeout-minutes: 60
         shell: pwsh
         working-directory: rexauto
         run: python tools/ci_fetch.py "${{ inputs.iso_url }}" "${{ runner.temp }}\input"
@@ -259,16 +335,29 @@ jobs:
         shell: pwsh
         run: |
           $expected = "${{ inputs.iso_sha256 }}".Trim().ToUpper()
+          # (A-1.) The tracked ci_fetch.py (see "Overlay tracked ci_fetch.py")
+          # hashes the downloaded FILE before unpacking and exports it as
+          # downloaded_sha256, so the check below runs on the real input for
+          # EVERY input kind -- including the STFS-by-Drive case, where the
+          # old code only saw a directory. The hash is of the file as
+          # downloaded (an archive URL hashes the archive, not its contents).
+          $downloadedSha = "${{ steps.fetch.outputs.downloaded_sha256 }}"
+          if ($downloadedSha -ne "") {
+            Write-Host "expected: $expected"
+            Write-Host "actual (downloaded file ${{ steps.fetch.outputs.downloaded_file }}):   $downloadedSha"
+            if ($downloadedSha.ToUpper() -ne $expected) { Write-Host "::error::SHA-256 mismatch: the downloaded game input is not the expected one"; exit 1 }
+            Write-Host "iso_sha256 verified against the downloaded file"
+            exit 0
+          }
+          # Fallback (upstream ci_fetch.py, no downloaded_sha256 output):
           # (Ronda 4, G-F1.) pick_container returns a DIRECTORY for .xex /
           # .zip inputs (it renames to default.xex and returns the folder),
           # and Get-FileHash cannot hash a directory: PowerShell 7 errors
           # with "Access to the path ... is denied" and 5.1 returns nothing,
           # so .Hash is $null either way and the comparison below would fail
-          # with a false "SHA-256 mismatch" on a correct download. The
-          # downloaded FILE itself is not exported by ci_fetch.py (upstream),
-          # so there is nothing better to hash here: skip the check with a
-          # warning instead of failing the job. .iso / STFS inputs still
-          # return a file and are verified as before.
+          # with a false "SHA-256 mismatch" on a correct download. Skip the
+          # check with a warning instead of failing the job. .iso / STFS
+          # inputs still return a file and are verified as before.
           $container = "${{ steps.fetch.outputs.container }}"
           if (Test-Path $container -PathType Container) {
             Write-Host "::warning::iso_sha256 skipped: the game input is a directory ($container), not a single file -- Get-FileHash cannot hash it"
@@ -281,6 +370,7 @@ jobs:
 
       - name: Recompile (extract + init)
         shell: pwsh
+        timeout-minutes: 120
         working-directory: rexauto
         run: |
           # Phase 1 of the two-phase recompile: run rexauto only up to the
@@ -499,6 +589,7 @@ jobs:
 
       - name: Recompile (codegen + static heal + build check)
         shell: pwsh
+        timeout-minutes: 240
         working-directory: rexauto
         run: |
           # Phase 2: resume from setjmp with the injected manifest.
@@ -592,7 +683,7 @@ jobs:
           Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
           Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: port-src-${{ env.REX_PROJECT }}
@@ -604,7 +695,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-windows-${{ env.REX_PROJECT }}
           path: |
@@ -619,10 +710,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Checkout rexauto (pinned commit)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Player124413/rexauto
           ref: ${{ env.REXAUTO_REF }}
@@ -652,20 +743,34 @@ jobs:
           grep -q 'vulkan_async_skip_incomplete_frames", "false"' rexauto/android/app/src/main/java/com/rexauto/port/GraphicsSettings.java
 
       - name: Free disk space + swap (runners have ~14 GB SSD)
+        timeout-minutes: 20
         run: |
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
-          sudo fallocate -l 16G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          # (J-5.) 16G used to be fatal if free disk dipped below it. Show
+          # the disk first, fall back to 8G, and continue without swap (with
+          # a warning) if even that fails -- a missing swapfile must not kill
+          # the job before compiling.
+          df -h
+          if sudo fallocate -l 16G /swapfile 2>/dev/null; then
+            echo "swapfile 16G"
+          elif sudo rm -f /swapfile && sudo fallocate -l 8G /swapfile 2>/dev/null; then
+            echo "::warning::16G swapfile did not fit, using 8G fallback"
+          else
+            echo "::warning::could not allocate a swapfile, continuing without swap"
+          fi
+          if [ -f /swapfile ]; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
           docker image prune -af 2>/dev/null || true
           sudo apt-get clean
           df -h
           free -h
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: port-src-${{ env.REX_PROJECT }}
           path: ${{ runner.temp }}/in
@@ -682,17 +787,27 @@ jobs:
           sed -n '1,8p' autoports/${{ env.REX_PROJECT }}/port/generated/default/sources.cmake
 
       - name: Host toolchain
+        timeout-minutes: 30
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip
+          # (J-1.) A transient apt failure used to kill the whole job 2.
+          # Retry the update+install pair 3 times with 30 s between tries.
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip; then
+              echo "apt OK (attempt $i)"
+              break
+            fi
+            echo "::warning::apt attempt $i failed"
+            if [ "$i" = "3" ]; then echo "::error::apt-get failed after 3 attempts"; exit 1; fi
+            sleep 30
+          done
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Cache patched ReXGlue SDK
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         id: sdk-cache
         with:
           path: rexauto/android/sdk
@@ -721,6 +836,37 @@ jobs:
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_entry.cpp
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_file.cpp
 
+      - name: Guard tracked SDK files carry their patch hunks (M-5)
+        run: |
+          set -euo pipefail
+          # (M-5.) Patches and tracked SDK files are two sources of truth:
+          # android_sdk.sh rebuilds the SDK from patches only, and this
+          # re-overlay then overwrites 6 files with the tracked versions.
+          # Today the tracked files already contain the patch hunks (verified
+          # 2026-11-19: each marker below is an added line of its .patch AND
+          # is present exactly once in the tracked file), but nothing enforced
+          # it: if a tracked file were deleted or regenerated from a pristine
+          # tree, the build would silently lose the Mali / perf / DLC fixes.
+          # Each marker is a string only the patch adds (not upstream).
+          # xbmovie_device.cpp MUST stay tracked: a run with
+          # xbmovie_probe=true caches the SDK with the probe already flipped,
+          # and only the re-overlay restores the default false.
+          SDK=rexauto/android/sdk/rexglue-sdk
+          check() { # check <file> <marker> <patch>
+            if ! grep -q -F "$2" "$SDK/$1"; then
+              echo "::error::M-5 guard: $1 lost its $3 hunk (missing: $2) -- the tracked file no longer carries the patch; fix the tracked file or regenerate the patch from it, do not ship a silently older SDK"
+              exit 1
+            fi
+          }
+          check src/ui/vulkan/vulkan_device.cpp 'REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, false,' 'mali-vertex-stores'
+          check src/graphics/vulkan/command_processor.cpp 'REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)' 'mali-vertex-stores'
+          check src/core/memory_posix.cpp 'Cached /proc/self/maps snapshot for the exception fast path' 'android-perf'
+          check src/graphics/command_processor.cpp 'We spin briefly here waiting for new ones' 'android-perf'
+          check src/graphics/vulkan/texture_cache.cpp 'auto log_bc_fallback' 'android-perf'
+          check src/system/xam/content_manager.cpp 'Hunt 2 DLC, P1-3' 'dlc-extract-errors'
+          check src/filesystem/devices/xbmovie_device.cpp 'REXCVAR_DEFINE_BOOL(xbmovie_probe, false,' 'tracked-only (probe default; the flip step below depends on it)'
+          echo "M-5 guard OK: 6 patched files + xbmovie_device.cpp carry their hunks"
+
       - name: Enable xbmovie_probe for this run (if requested)
         if: inputs.xbmovie_probe
         run: |
@@ -742,10 +888,35 @@ jobs:
           grep -n 'REXCVAR_DEFINE_BOOL(xbmovie_probe' "$f"
           echo "xbmovie_probe default set to true for this run (input xbmovie_probe=true)"
 
+      - name: Cache Android CMake + NDK
+        uses: actions/cache@v6
+        with:
+          # (M-4.) cmake 3.31.1 + NDK 27.2.12479018 were re-downloaded from
+          # dl.google.com on every run. Fixed key: these versions are pinned
+          # in the sdkmanager step below, so the cache only ever holds them.
+          path: |
+            ${{ env.ANDROID_HOME }}/cmake
+            ${{ env.ANDROID_HOME }}/ndk
+          key: android-ndk-cmake-${{ runner.os }}-3.31.1-27.2.12479018
+
       - name: Android CMake 3.31.1
+        timeout-minutes: 30
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018" >/dev/null
+          # (M-4.) The old `>/dev/null` hid sdkmanager errors and there was
+          # no retry: a transient dl.google.com failure killed the run with
+          # no diagnosis. On a cache hit this is a fast no-op (already
+          # installed); on failure the log is shown and the install retried.
+          for i in 1 2 3; do
+            if "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018" > /tmp/sdkmanager.log 2>&1; then
+              echo "sdkmanager OK (attempt $i)"
+              break
+            fi
+            echo "::warning::sdkmanager attempt $i failed"
+            cat /tmp/sdkmanager.log
+            if [ "$i" = "3" ]; then echo "::error::sdkmanager failed after 3 attempts"; exit 1; fi
+            sleep 30
+          done
 
       - name: Stage assets (title DB, cover, launcher icon)
         run: |
@@ -754,13 +925,13 @@ jobs:
           cp rexauto/tools/xbox360_titles.json rexauto/android/app/src/main/assets/
           if [ -f "${{ runner.temp }}/in/cover.png" ]; then
             cp "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/assets/cover.png
-            python3 -m pip install -q pillow
+            python3 -m pip install -q "pillow==13.0.0"
             python3 rexauto/tools/android_icon.py "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/res
           else
             # (Ronda 4, G-F4.) A missing cover used to fall through silently
             # to the generic rexauto icon. Warn so the log says why.
             echo "::warning::cover.png missing in port-src artifact -- the APK will use the generic rexauto icon"
-            python3 -m pip install -q pillow
+            python3 -m pip install -q "pillow==13.0.0"
             python3 rexauto/tools/android_icon.py rexauto/gui/rexauto_icon.png rexauto/android/app/src/main/res
           fi
 
@@ -793,6 +964,10 @@ jobs:
               echo "CI_KEYSTORE_KEY_PASSWORD=$CI_KEYSTORE_KEY_PASSWORD"
               echo "CI_KEYSTORE_KEY_ALIAS=${CI_KEYSTORE_KEY_ALIAS:-childoflight<3}"
             } >> "$GITHUB_ENV"
+            # (J-6.) Smoke-check the keystore NOW, not ~20 min later at the
+            # Gradle signing step: -storepass is required or keytool prompts
+            # and hangs. Also confirms the heart alias is present.
+            keytool -list -keystore ci-release.jks -storepass "$CI_KEYSTORE_STORE_PASSWORD" -alias "${CI_KEYSTORE_KEY_ALIAS:-childoflight<3}" || { echo "::error::keystore smoke check failed: ci-release.jks is corrupt or does not contain alias '${CI_KEYSTORE_KEY_ALIAS:-childoflight<3}' -- check CI_KEYSTORE_BASE64 / CI_KEYSTORE_KEY_ALIAS"; exit 1; }
           else
             # (Ronda 3, auditor B, B-R3-1.) Sin CI_KEYSTORE_BASE64 NO se genera
             # un keystore fresco: la rama antigua lo generaba con contrasena
@@ -811,7 +986,22 @@ jobs:
             exit 1
           fi
 
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v6
+        with:
+          # (M-4.) Gradle 8.14 + AGP 8.7.3 + Kotlin + all Maven deps were
+          # re-downloaded on every run. Keyed on the wrapper + build scripts,
+          # so a Gradle/AGP change invalidates it. Restore-keys fall back to
+          # the newest cache for this OS.
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ runner.os }}-${{ hashFiles('rexauto/android/gradle/wrapper/gradle-wrapper.properties', 'rexauto/android/build.gradle.kts', 'rexauto/android/app/build.gradle.kts', 'rexauto/android/settings.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: Gradle assembleRelease
+        timeout-minutes: 120
         env:
           REX_TITLE: ${{ needs.recompile.outputs.title }}
           REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
@@ -876,7 +1066,13 @@ jobs:
           # corazon (apksigner --print-certs sobre las APK v1.1-v1.4.1; ver
           # docs/REXAUTo.md §6). OJO: 8ea1eb60... es el SHA-256 del ARCHIVO
           # .jks, no del certificado: nunca usarlo aqui.
-          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          # (J-4.) Was `ls .../*/apksigner | sort -V | tail -1` (newest
+          # installed, today 37.0.0): if verify --print-certs ever changes
+          # format, the grep below breaks in a false red. Pin to the AGP
+          # build-tools (8.7.3, compileSdk 35 -> 35.0.0) and fail clearly if
+          # it is not there instead of silently using another version.
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then echo "::error::apksigner not found at $APKSIGNER (AGP 8.7.3 build-tools 35.0.0) -- check the Android SDK on the runner"; exit 1; fi
           "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/verify.txt
           EXPECTED_CERT_SHA256="3768a83d38837f424138c1570f77e111bd1777ff6df049d476e562a46bb189ab"
           ACTUAL_CERT_SHA256="$(grep -a "certificate SHA-256 digest" /tmp/verify.txt | head -1 | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
@@ -897,7 +1093,7 @@ jobs:
             echo "Install the APK and open it — the game starts directly (no home screen, no Play button since v1.3). Graphics, GPU driver and logs live in the in-game menu (gear on the virtual gamepad)."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.REX_PROJECT }}-android-apk
           path: ${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk
@@ -932,7 +1128,7 @@ jobs:
 
       - name: Upload project sources
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: source-${{ env.REX_PROJECT }}
           path: ${{ runner.temp }}/source-${{ env.REX_PROJECT }}
@@ -941,7 +1137,7 @@ jobs:
 
       - name: Upload native build logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-android-${{ env.REX_PROJECT }}
           path: |
