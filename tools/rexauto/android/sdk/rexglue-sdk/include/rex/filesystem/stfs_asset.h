@@ -44,9 +44,19 @@ struct StfsAssetSource {
 // Stores a dup() of `fd` plus the asset slice [base_offset,
 // base_offset + length). Replaces any previously stored source (closing
 // its fd). Must be called before the runtime is created.
-void SetStfsAssetSource(int fd, uint64_t base_offset, uint64_t length);
+// (Hunt v1.4.6, A2-R6-07.) Returns false -- and logs the errno -- when
+// the fd cannot be stored (invalid fd, or dup() failed with the fd table
+// full). The previously stored source, if any, is left untouched, so a
+// failed re-delivery never clobbers a good source.
+bool SetStfsAssetSource(int fd, uint64_t base_offset, uint64_t length);
 
 bool HasStfsAssetSource();
+
+// True once SetStfsAssetSource has been called at all, even if that call
+// failed: lets Runtime::SetupVfs tell "an asset was handed over but could
+// not be stored" (hard error: the game cannot start) apart from "no asset
+// was ever handed over" (historical host-path fallback).
+bool StfsAssetSourceAttempted();
 
 // Transfers ownership of the stored source to the caller and clears it.
 // Returns an invalid source when none was registered.
