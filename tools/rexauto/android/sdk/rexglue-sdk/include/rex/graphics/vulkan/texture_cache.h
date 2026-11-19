@@ -25,6 +25,7 @@
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
 namespace rex::graphics::vulkan {
+
 class VulkanCommandProcessor;
 
 class VulkanTextureCache final : public TextureCache {
