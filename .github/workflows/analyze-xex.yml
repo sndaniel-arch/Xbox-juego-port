@@ -49,8 +49,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
+      # (J-10, 2026-11-19.) OBSOLETE workflow that is still dispatchable: the
+      # header comment says Phase 0 is done and stock XenonAnalyse detects 0
+      # jump tables, so a green run here would be misleading. Fail at once
+      # with a clear message instead of deleting the file (the history and
+      # the notes in the header are still useful if Phase 0 is ever redone).
+      - name: OBSOLETE - do not run
+        run: |
+          echo "::error::This workflow is OBSOLETE (see the header comment): Phase 0 is done, stock XenonAnalyse detects 0 jump tables on this XEX, and a green run here would be misleading. Delete this file or restore it deliberately (pin the commit, apply the 13 patches in patches/XenonRecomp/, use tools/find_jumptables.py) before dispatching."
+          exit 1
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -161,7 +171,7 @@ jobs:
 
       - name: Upload analysis artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: col-xex-analysis
           path: analysis/
