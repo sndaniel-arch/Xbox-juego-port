@@ -483,12 +483,32 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert_true(*frontbuffer_ptr == frontbuffer_virtual_address);
   uint32_t frontbuffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(frontbuffer_virtual_address);
+  // (Run #16, C-05.) The last valid front buffer, kept across calls: when
+  // the game hands us an invalid front buffer for one frame, re-presenting
+  // the previous valid one keeps the screen alive (a repeated frame)
+  // instead of dropping the swap entirely, which the player sees as a
+  // black flash. Function-static on purpose: VdSwap_entry is a free
+  // function with no instance to hang state on, and VdSwap is only ever
+  // called from the guest's video thread. UINT32_MAX means "no valid
+  // frame yet" - before the first valid swap we still return as before.
+  static uint32_t last_valid_frontbuffer_physical_address = UINT32_MAX;
   assert_true(frontbuffer_physical_address != UINT32_MAX);
   if (frontbuffer_physical_address == UINT32_MAX) {
     // Xenia-specific safety check.
-    REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
-                  frontbuffer_virtual_address);
-    return;
+    if (last_valid_frontbuffer_physical_address != UINT32_MAX) {
+      REXKRNL_WARN(
+          "VdSwap: invalid front buffer virtual address 0x{:08X}; "
+          "re-presenting last valid front buffer 0x{:08X}",
+          frontbuffer_virtual_address, last_valid_frontbuffer_physical_address);
+      frontbuffer_physical_address = last_valid_frontbuffer_physical_address;
+    } else {
+      REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X} "
+                    "(no valid front buffer yet)",
+                    frontbuffer_virtual_address);
+      return;
+    }
+  } else {
+    last_valid_frontbuffer_physical_address = frontbuffer_physical_address;
   }
   gpu_fetch.base_address = frontbuffer_physical_address >> 12;
 
@@ -510,6 +530,28 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                  uint32_t((gpu_fetch.dword_3 >> 1) & 0xFFF),
                  gpu_fetch.dword_0, gpu_fetch.dword_1, gpu_fetch.dword_2,
                  gpu_fetch.dword_3, gpu_fetch.dword_4, gpu_fetch.dword_5);
+    // (Run #16, C-05.) The asserts below are no-ops in Release, so a swap
+    // in an unexpected format/color_space/size left no trace in the phone
+    // log - the 576-line title cut was invisible for the same reason. Log
+    // the mismatch here, throttled to a new swap signature like the line
+    // above, without changing behavior.
+    if (texture_format != rex::graphics::xenos::TextureFormat::k_8_8_8_8 &&
+        texture_format !=
+            rex::graphics::xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16) {
+      REXKRNL_WARN("VdSwap: unexpected texture format {} (expected 8_8_8_8 "
+                   "or 2_10_10_10_AS_16_16_16_16)",
+                   uint32_t(texture_format));
+    }
+    if (color_space != 0) {
+      REXKRNL_WARN("VdSwap: unexpected color_space {} (expected 0 = RGB)",
+                   uint32_t(color_space));
+    }
+    if (*width != 1 + gpu_fetch.size_2d.width ||
+        *height != 1 + gpu_fetch.size_2d.height) {
+      REXKRNL_WARN("VdSwap: swap size {}x{} does not match fetch size {}x{}",
+                   uint32_t(*width), uint32_t(*height),
+                   1 + gpu_fetch.size_2d.width, 1 + gpu_fetch.size_2d.height);
+    }
   }
 
   assert_true(texture_format == rex::graphics::xenos::TextureFormat::k_8_8_8_8 ||
