@@ -400,7 +400,7 @@ void Presenter::SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_su
     assert_true(paint_mode_ == PaintMode::kNone);
     surface_ = new_surface;
     UpdateSurfaceMonitorFromUIThread(true);
-    assert_true(surface_paint_connection_state_ ==
+    assert_true(surface_paint_connection_state_.load() ==
                 SurfacePaintConnectionState::kUnconnectedRetryAtStateChange);
     bool request_repaint;
     UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
@@ -502,11 +502,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     }
     // Try to recover from the connection becoming outdated in the previous
     // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    if (surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedOutdated) {
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
     }
     // If still paintable or recovered successfully, paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+    if (surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedPaintable) {
       // The paint mode might have been set to kNone when the connection was
       // marked as outdated last time. Or, if wasn't reconnecting, there was
       // some other incorrect situation that caused the paint mode to be set to
@@ -521,7 +521,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       WaitForUITickFromUIThread();
 
       paint_result = PaintAndPresent(draw_ui);
-      if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+      if (surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
         // windowing system has some time to prepare what may be required to
@@ -533,7 +533,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     // guaranteed to have access to have ownership of painting as it's taken
     // here only conditionally, thus can't know whether the connection is
     // actually in a paintable state).
-    if (surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable) {
+    if (surface_paint_connection_state_.load() != SurfacePaintConnectionState::kConnectedPaintable) {
       SetPaintModeFromUIThread(PaintMode::kNone);
     }
   }
@@ -674,9 +674,9 @@ bool Presenter::RefreshGuestOutput(
         break;
       case PaintMode::kGuestOutputThreadImmediately:
         // Both painting and window paint requesting are accessible.
-        if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+        if (surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
-          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+          if (surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
         }
@@ -1388,10 +1388,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
 
 void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnectionState new_state) {
   assert_false(IsConnectedSurfacePaintConnectionState(new_state));
-  if (IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_)) {
+  if (IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_.load())) {
     DisconnectPaintingFromSurfaceFromUIThreadImpl();
   }
-  surface_paint_connection_state_ = new_state;
+  surface_paint_connection_state_.store(new_state);
   surface_paint_connection_has_implicit_vsync_ = false;
   surface_width_in_paint_connection_ = 0;
   surface_height_in_paint_connection_ = 0;
@@ -1414,7 +1414,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   // If the connection state is kUnconnectedSurfaceReportedUnusable, the
   // implementation has reported that the surface is not usable by the presenter
   // at all, and it's pointless to retry connecting to it.
-  if (surface_paint_connection_state_ !=
+  if (surface_paint_connection_state_.load() !=
       SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable) {
     uint32_t surface_width = 0, surface_height = 0;
     bool surface_area_available = surface_->GetSize(surface_width, surface_height);
@@ -1424,11 +1424,11 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
       DisconnectPaintingFromSurfaceFromUIThread(
           SurfacePaintConnectionState::kUnconnectedRetryAtStateChange);
     } else {
-      bool is_reconnect = IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_);
+      bool is_reconnect = IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_.load());
       bool is_vsync_implicit = false;
       SurfacePaintConnectResult connect_result = ConnectOrReconnectPaintingToSurfaceFromUIThread(
           *surface_, surface_width, surface_height,
-          surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable,
+          surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedPaintable,
           is_vsync_implicit);
       switch (connect_result) {
         case SurfacePaintConnectResult::kSuccess:
@@ -1438,12 +1438,12 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           // Fallthrough to common success handling.
         case SurfacePaintConnectResult::kSuccessUnchanged:
           // Don't know yet what the first result was (success or suboptimal).
-          surface_paint_connection_was_optimal_at_successful_paint_ = false;
+          surface_paint_connection_was_optimal_at_successful_paint_.store(false);
           // (Run #16, C-02.) New connection, new budget of consecutive
           // suboptimal presents and a new forced recreate.
           consecutive_suboptimal_presents_.store(0);
           forced_suboptimal_recreate_done_.store(false);
-          surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedPaintable;
+          surface_paint_connection_state_.store(SurfacePaintConnectionState::kConnectedPaintable);
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
@@ -1452,12 +1452,12 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           }
           break;
         case SurfacePaintConnectResult::kFailure:
-          surface_paint_connection_state_ =
-              SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
+          surface_paint_connection_state_.store(
+              SurfacePaintConnectionState::kUnconnectedRetryAtStateChange);
           break;
         case SurfacePaintConnectResult::kFailureSurfaceUnusable:
-          surface_paint_connection_state_ =
-              SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable;
+          surface_paint_connection_state_.store(
+              SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable);
           break;
       }
     }
@@ -1465,7 +1465,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
 
   if (update_paint_mode_to_desired) {
     SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(
-        surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable));
+        surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedPaintable));
   }
 }
 
@@ -1558,11 +1558,11 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
-  assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  assert_true(surface_paint_connection_state_.load() == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
   switch (result) {
     case PaintResult::kPresented:
-      surface_paint_connection_was_optimal_at_successful_paint_ = true;
+      surface_paint_connection_was_optimal_at_successful_paint_.store(true);
       // (Run #16, C-02.) An optimal present breaks the suboptimal streak.
       consecutive_suboptimal_presents_.store(0);
       break;
@@ -1578,8 +1578,8 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       // the connection to become outdated if it has been suboptimal from the
       // very beginning.
       if (REXCVAR_GET(presenter_recreate_on_suboptimal) &&
-          surface_paint_connection_was_optimal_at_successful_paint_) {
-        surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
+          surface_paint_connection_was_optimal_at_successful_paint_.load()) {
+        surface_paint_connection_state_.store(SurfacePaintConnectionState::kConnectedOutdated);
         const uint32_t recreate_n = ++suboptimal_recreate_count;
         REXLOG_INFO(
             "Presenter: suboptimal present #{} triggered swapchain recreate "
@@ -1601,8 +1601,8 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
         if (after_n > 0 && !forced_suboptimal_recreate_done_.load() &&
             streak >= static_cast<uint32_t>(after_n)) {
           forced_suboptimal_recreate_done_.store(true);
-          surface_paint_connection_state_ =
-              SurfacePaintConnectionState::kConnectedOutdated;
+          surface_paint_connection_state_.store(
+              SurfacePaintConnectionState::kConnectedOutdated);
           REXLOG_INFO(
               "Presenter: {} consecutive suboptimal presents without an "
               "optimal one; forcing one swapchain recreate (set "
@@ -1618,7 +1618,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       break;
     }
     case PaintResult::kNotPresentedConnectionOutdated:
-      surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
+      surface_paint_connection_state_.store(SurfacePaintConnectionState::kConnectedOutdated);
       break;
     default:
       // Another issue not directly related to the surface connection.
