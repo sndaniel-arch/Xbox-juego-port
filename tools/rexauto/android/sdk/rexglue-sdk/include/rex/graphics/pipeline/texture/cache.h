@@ -644,6 +644,15 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  // (Audit A1-R6-02.) Scratch vectors reused by RequestTextures (one call
+  // per draw on the command processor thread) instead of allocating two
+  // vectors plus a pairs vector per draw. clear() at entry, never
+  // shrink_to_fit: capacity is reused across draws. Not reentrant:
+  // RequestTextures never recurses -- the load paths it calls do not call
+  // it back -- and it only runs on the command processor thread.
+  std::vector<PendingTextureLoad> pending_texture_loads_scratch_;
+  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges_scratch_;
+  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs_scratch_;
 };
 
 }  // namespace rex::graphics
