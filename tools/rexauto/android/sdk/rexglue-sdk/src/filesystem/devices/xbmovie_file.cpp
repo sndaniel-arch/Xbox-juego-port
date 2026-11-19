@@ -171,7 +171,17 @@ X_STATUS XbMovieFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   // (this probe never returns data), and the cvar defaults to 1 ms,
   // 0 = disabled.
   if (read_count > kProbeLogEveryN) {
-    const int32_t sleep_ms = REXCVAR_GET(xbmovie_probe_eof_sleep_ms);
+    // (Audit J-14.) REXCVAR_DEFINE_INT32 has no min/max: a typo in
+    // settings.txt (e.g. 1000) would sleep 1 s per EOF read and freeze
+    // the intro. Clamp to [0, 10] ms here; 0 stays disabled. Manual
+    // clamp, no new include (std::clamp would need <algorithm>).
+    int32_t sleep_ms = REXCVAR_GET(xbmovie_probe_eof_sleep_ms);
+    if (sleep_ms < 0) {
+      sleep_ms = 0;
+    }
+    if (sleep_ms > 10) {
+      sleep_ms = 10;
+    }
     if (sleep_ms > 0) {
       rex::thread::Sleep(std::chrono::milliseconds(sleep_ms));
     }
