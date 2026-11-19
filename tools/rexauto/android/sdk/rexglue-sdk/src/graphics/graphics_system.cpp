@@ -12,12 +12,14 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -159,11 +161,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         // mode reports. Titles pace themselves on vblank, so this is a real
         // frame-rate cap that also halves GPU work -- the difference between
         // a phone throttling after five minutes and holding a steady 30.
+        // Kept for the periodic re-read below: the env var does not change
+        // at runtime, so it is read once.
+        double fps_cap_hz = 0.0;
         if (const char* cap = std::getenv("REX_FPS_CAP")) {
           double cap_hz = std::atof(cap);
           if (cap_hz >= 10.0 && cap_hz < refresh_rate_hz) {
             REXLOG_INFO("vblank rate capped at {} Hz (REX_FPS_CAP)", cap_hz);
             refresh_rate_hz = cap_hz;
+            fps_cap_hz = cap_hz;
           }
         }
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
@@ -171,8 +177,39 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t last_mode_check_time = last_frame_time;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          // (Audit run #16, M-10.) The video mode was read once when this
+          // thread started; a mode change afterwards never reached the
+          // vblank rate. Cvars are mutable at runtime (settings overlay /
+          // console), and the guest may ask for another mode later, so
+          // re-read once per guest-second and rebuild the interval when
+          // the effective rate moved. The guest interrupt handler itself
+          // stays synchronous (MarkVblank -> DispatchInterruptCallback ->
+          // ExecuteInterrupt, which has no timeout): making it async is
+          // pending -- the command processor blocks waiting for interrupt
+          // code to run, so an async handler needs an ordering analysis
+          // first. See evidence.
+          if (guest_tick_frequency > 0 &&
+              current_time - last_mode_check_time >= guest_tick_frequency) {
+            last_mode_check_time = current_time;
+            system::X_VIDEO_MODE current_mode;
+            kernel::xboxkrnl::VdQueryVideoMode(&current_mode);
+            double new_rate_hz = std::max(1.0, double(float(current_mode.refresh_rate)));
+            if (fps_cap_hz > 0.0 && fps_cap_hz < new_rate_hz) {
+              new_rate_hz = fps_cap_hz;
+            }
+            if (new_rate_hz != refresh_rate_hz) {
+              REXLOG_INFO("vblank rate changed: {} Hz -> {} Hz (video mode {}x{})",
+                          refresh_rate_hz, new_rate_hz,
+                          uint32_t(current_mode.display_width),
+                          uint32_t(current_mode.display_height));
+              refresh_rate_hz = new_rate_hz;
+              vsync_interval_ticks = std::max(
+                  uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+            }
+          }
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
@@ -290,9 +327,41 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
-    default:
-      REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+    default: {
+      // (Audit run #16, M-6.) A WARN here flushed to disk on EVERY unknown
+      // write, in the guest thread (flush_level = warn). Log each distinct
+      // register once; later writes to it cost only a set lookup, and the
+      // log call happens outside the lock so a flush never blocks another
+      // guest thread. The set is capped so a guest spraying the register
+      // space cannot grow it without bound. (ReadRegister already logs
+      // unknown reads at DEBUG, which is dropped at the Release default
+      // level; a throttled WARN keeps the signal visible in the phone log.)
+      static std::mutex unknown_register_warn_mutex;
+      static std::unordered_set<uint32_t> unknown_registers_warned;
+      static std::atomic<bool> unknown_register_warn_cap_logged{false};
+      constexpr uint32_t kMaxUnknownRegistersWarned = 256;
+      bool warn_now = false;
+      bool warn_cap_now = false;
+      {
+        std::lock_guard<std::mutex> lock(unknown_register_warn_mutex);
+        if (unknown_registers_warned.count(r) == 0) {
+          if (unknown_registers_warned.size() < kMaxUnknownRegistersWarned) {
+            unknown_registers_warned.insert(r);
+            warn_now = true;
+          } else if (!unknown_register_warn_cap_logged.exchange(true)) {
+            warn_cap_now = true;
+          }
+        }
+      }
+      if (warn_now) {
+        REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+      } else if (warn_cap_now) {
+        REXGPU_WARN("Unknown GPU register writes: stopped logging new registers "
+                    "after {} distinct ones",
+                    kMaxUnknownRegistersWarned);
+      }
       break;
+    }
   }
 
   assert_true(r < RegisterFile::kRegisterCount);
