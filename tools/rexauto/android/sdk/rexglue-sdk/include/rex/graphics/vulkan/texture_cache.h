@@ -22,9 +22,10 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/ui/vulkan/upload_buffer_pool.h>
+
 
 namespace rex::graphics::vulkan {
-
 class VulkanCommandProcessor;
 
 class VulkanTextureCache final : public TextureCache {
@@ -158,48 +159,55 @@ class VulkanTextureCache final : public TextureCache {
   // they must be members of VulkanTextureCache (which inherits it), not
   // free functions in an anonymous namespace — free functions cannot name
   // the type at all, which broke the run #12 build. All callers are
-  // members, so call sites are unchanged. The placeholder set lives behind
-  // an inline accessor (function-local static) so no out-of-class
-  // definition of a static data member is needed.
-  static std::unordered_set<TextureKey, TextureKey::Hasher>& PlaceholderTextureKeys() {
-    static std::unordered_set<TextureKey, TextureKey::Hasher> keys;
-    return keys;
-  }
-  static bool IsTexturePlaceholder(const TextureKey& key);
-  static void MarkTexturePlaceholder(const TextureKey& key);
-  static void ClearTexturePlaceholder(const TextureKey& key);
+  // members, so call sites are unchanged. The placeholder set is an
+  // instance member, not a function-local static (audit A1-R6-03): a new
+  // cache on re-init / title change must not inherit the previous
+  // instance's placeholders, like the R5-C2 eviction counters in the base
+  // TextureCache.
+  std::unordered_set<TextureKey, TextureKey::Hasher> placeholder_texture_keys_;
+  bool IsTexturePlaceholder(const TextureKey& key);
+  void MarkTexturePlaceholder(const TextureKey& key);
+  void ClearTexturePlaceholder(const TextureKey& key);
 
   // (Audit A-3.) CPU BC -> ETC2 transcode budget + failure cooldown
-  // state. The transcode runs on the graphics thread (same as
-  // RequestTextures), so these function-local statics need no lock,
-  // like PlaceholderTextureKeys() above. The budget is shared across
-  // all textures in one submission, stamped by submission index.
+  // state. Instance members on purpose (audit A1-R6-03): the transcode
+  // runs on the graphics thread (same as RequestTextures), so no lock is
+  // needed, and a new VulkanTextureCache on re-init / title change must
+  // not inherit the previous instance's budget stamp, failure cooldowns
+  // or placeholders. The budget is shared across all textures in one
+  // submission, stamped by submission index.
   struct Etc2TranscodeBudget {
     uint64_t submission = 0;
     uint32_t blocks_used = 0;
   };
-  static Etc2TranscodeBudget& Etc2Budget() {
-    static Etc2TranscodeBudget budget;
-    return budget;
-  }
+  Etc2TranscodeBudget etc2_budget_;
   struct Etc2TranscodeFailure {
     uint32_t consecutive_failures = 0;
     uint64_t last_failure_submission = 0;
   };
-  static std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>&
-  Etc2FailedTextures() {
-    static std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>
-        failures;
-    return failures;
-  }
-  static void RecordEtc2TranscodeFailure(const TextureKey& key, uint64_t submission);
+  std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>
+      etc2_failed_textures_;
+  void RecordEtc2TranscodeFailure(const TextureKey& key, uint64_t submission);
+  // (Run #11, F3, point 6.) CPU staging for BC -> ETC2 transcoded uploads.
+  // Instance member (audit A1-R6-03), destroyed with the cache: the pool
+  // is bound to this cache's device, so a new cache on re-init must not
+  // reuse the previous instance's pool. Pages are 16 MiB: one page holds a
+  // whole 4096x4096 ETC2 RGBA level. Pages are reclaimed in
+  // BeginSubmission().
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> etc2_upload_pool_;
+  // (Audit A1-R6-04.) Memo for Dxt1TextureHasOneBitAlpha. Instance member
+  // (audit A1-R6-03, same class as the A-3 statics above; this one is the
+  // run15 B-M3 memo): it dies with the cache, so a title change cannot
+  // inherit stale alpha decisions. Mutable: the scan is consulted from the
+  // const GetHostFormatPair().
+  mutable std::unordered_map<TextureKey, bool, TextureKey::Hasher> dxt1_alpha_memo_;
   static bool ReadGuestBcBlock(const SharedMemory& shared_memory,
                                const texture_util::TextureGuestLayout::Level& level_layout,
                                uint32_t guest_level_base, const TextureKey& key,
                                bool is_3d_tiling, uint32_t bx, uint32_t by, uint32_t bz,
                                uint32_t slice, uint8_t* block_out, uint32_t bytes_per_block);
-  static bool Dxt1TextureHasOneBitAlpha(const SharedMemory& shared_memory, const TextureKey& key,
-                                        const texture_util::TextureGuestLayout& guest_layout);
+  bool Dxt1TextureHasOneBitAlpha(const SharedMemory& shared_memory, const TextureKey& key,
+                                 const texture_util::TextureGuestLayout& guest_layout) const;
 
   enum LoadDescriptorSetIndex {
     kLoadDescriptorSetIndexDestination,
@@ -260,6 +268,25 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+    // (Audit A1-R6-01.) BC -> ETC2 transcode progress: the next (loop
+    // level, array slice) not yet uploaded. The ETC2 load uploads the
+    // slices it transcoded in each submission and resumes here on the next
+    // one, so a texture larger than the per-submission budget completes
+    // over several submissions instead of re-burning its level 0 every
+    // time. Lives on the texture, so it dies with it and never leaks
+    // across textures. It is only ever set while the texture is outdated
+    // and only cleared when the load completes, so a re-upload after the
+    // guest data changes (which requires a prior completed load, and
+    // clears this) never skips levels.
+    bool etc2_progress_active() const { return etc2_progress_active_; }
+    uint32_t etc2_next_loop_level() const { return etc2_next_loop_level_; }
+    uint32_t etc2_next_slice() const { return etc2_next_slice_; }
+    void SetEtc2Progress(uint32_t loop_level, uint32_t slice) {
+      etc2_progress_active_ = true;
+      etc2_next_loop_level_ = loop_level;
+      etc2_next_slice_ = slice;
+    }
+    void ClearEtc2Progress() { etc2_progress_active_ = false; }
 
    private:
     union ViewKey {
@@ -313,6 +340,10 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
 
     Usage usage_ = Usage::kUndefined;
+    // (Audit A1-R6-01.) See the accessors above.
+    bool etc2_progress_active_ = false;
+    uint32_t etc2_next_loop_level_ = 0;
+    uint32_t etc2_next_slice_ = 0;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
