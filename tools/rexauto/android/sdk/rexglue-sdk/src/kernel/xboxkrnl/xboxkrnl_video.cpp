@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <string>
 
 #include <rex/cvar.h>
@@ -83,22 +84,64 @@ void WarnNoGpuEmulation(const char* export_name, std::atomic<bool>& warned) {
     REXKRNL_WARN("{}: no GPU emulation loaded (gpu_plugin not set); call ignored", export_name);
   }
 }
+
+// (Audit run #16, J-16.) Last valid front buffer + the geometry it was
+// presented with. File-scope: VdSwap_entry is a free function with no
+// instance to hang state on. Guarded by a mutex, not a plain function-static:
+// VdSwap_entry has no host-side callers (the guest reaches it through the
+// export table), so "only ever called from the guest's video thread" is not
+// provable from host code. address == UINT32_MAX means "no valid frame yet".
+struct LastValidFrontBuffer {
+  uint32_t address = UINT32_MAX;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t color_space = 0;
+};
+LastValidFrontBuffer last_valid_frontbuffer;
+std::mutex last_valid_frontbuffer_mutex;
+
+// A front buffer saved from a previous engine generation / title session must
+// never be re-presented. Called on engine (re-)init/shutdown and on kernel
+// module registration (once per title load).
+void ResetLastValidFrontBuffer() {
+  std::lock_guard<std::mutex> lock(last_valid_frontbuffer_mutex);
+  last_valid_frontbuffer = LastValidFrontBuffer{};
+}
 }  // namespace
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// (Audit run #16, A-6.) Three Vd* stubs return a VALUE, not NTSTATUS, so a
+// bare REX_STUB lies worse than 0: it leaves r3 = the first argument (a guest
+// pointer, 0x82...), which reads as TRUE for a BOOL query. The return
+// category follows the name, with the in-file precedent that Vd*
+// getters return u32 values (VdIsHSIOTrainingSucceeded returns a BOOL,
+// VdGetGraphicsAsicID a value): VdGetClosedCaptionReadyStatus is a BOOL
+// ("not ready"), VdReadDVERegisterUlong reads a ULONG register,
+// VdReadWriteHSIOCalibrationFlag returns the flag value. 0 is the
+// conservative answer for all three. The remaining query stubs
+// (VdQueryVideoCapabilities, VdGetDisplayDiscoveryData, VdReadEEDIDBlock,
+// VdEnumerateVideoModes, VdGetDisplayModeOverride, VdQueryRealVideoMode,
+// VdGet3dVideoFormat, VdGetWSS2Data, VdGetOption, VdStartDisplayDiscovery,
+// VdRegister*Notification, VdQuerySystemCommandBuffer, VdSetOption,
+// VdSet3dVideoFormat, VdSetWSS2Data) stay bare REX_STUB: their signatures
+// are declared nowhere in this SDK and no XDK/Xenia source stating the
+// return category (NTSTATUS vs pointer vs void) was reachable, so guessing
+// a return value could flip a caller onto a path with an unfilled
+// out-param. Pending signature verification; see evidence.
 REX_EXPORT_STUB(__imp__VdBlockUntilGUIIdle);
 REX_EXPORT_STUB(__imp__VdDisplayFatalError);
 REX_EXPORT_STUB(__imp__VdEnableClosedCaption);
 REX_EXPORT_STUB(__imp__VdEnableDisablePowerSavingMode);
 REX_EXPORT_STUB(__imp__VdGenerateGPUCSCCoefficients);
-REX_EXPORT_STUB(__imp__VdGetClosedCaptionReadyStatus);
+REX_EXPORT_STUB_RETURN(__imp__VdGetClosedCaptionReadyStatus, 0);
 REX_EXPORT_STUB(__imp__VdGetDisplayModeOverride);
 REX_EXPORT_STUB(__imp__VdInitializeScaler);
 REX_EXPORT_STUB(__imp__VdQuerySystemCommandBuffer);
-REX_EXPORT_STUB(__imp__VdReadDVERegisterUlong);
-REX_EXPORT_STUB(__imp__VdReadWriteHSIOCalibrationFlag);
+REX_EXPORT_STUB_RETURN(__imp__VdReadDVERegisterUlong, 0);
+REX_EXPORT_STUB_RETURN(__imp__VdReadWriteHSIOCalibrationFlag, 0);
 REX_EXPORT_STUB(__imp__VdRegisterGraphicsNotification);
 REX_EXPORT_STUB(__imp__VdRegisterXamGraphicsNotification);
 REX_EXPORT_STUB(__imp__VdSendClosedCaptionData);
@@ -300,6 +343,9 @@ u32 VdSetDisplayModeOverride_entry(u32 unk0, u32 unk1, f64 refresh_rate, u32 unk
 
 u32 VdInitializeEngines_entry(u32 unk0, u32 callback, mapped_void arg, mapped_u32 pfp_ptr,
                               mapped_u32 me_ptr) {
+  // (Audit run #16, J-16.) Engine (re-)init: any front buffer saved from a
+  // previous engine generation is stale, never re-present it.
+  ResetLastValidFrontBuffer();
   // r3 = 0x4F810000
   // r4 = function ptr (cleanup callback?)
   // r5 = function arg
@@ -309,6 +355,9 @@ u32 VdInitializeEngines_entry(u32 unk0, u32 callback, mapped_void arg, mapped_u3
 }
 
 void VdShutdownEngines_entry() {
+  // (Audit run #16, J-16.) Engine shutdown: the saved front buffer is stale
+  // from here on, never re-present it.
+  ResetLastValidFrontBuffer();
   // Ignored for now.
   // Games seem to call an Initialize/Shutdown pair to query info, then
   // re-initialize.
@@ -483,37 +532,60 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert_true(*frontbuffer_ptr == frontbuffer_virtual_address);
   uint32_t frontbuffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(frontbuffer_virtual_address);
-  // (Run #16, C-05.) The last valid front buffer, kept across calls: when
-  // the game hands us an invalid front buffer for one frame, re-presenting
-  // the previous valid one keeps the screen alive (a repeated frame)
-  // instead of dropping the swap entirely, which the player sees as a
-  // black flash. Function-static on purpose: VdSwap_entry is a free
-  // function with no instance to hang state on, and VdSwap is only ever
-  // called from the guest's video thread. UINT32_MAX means "no valid
-  // frame yet" - before the first valid swap we still return as before.
-  static uint32_t last_valid_frontbuffer_physical_address = UINT32_MAX;
-  assert_true(frontbuffer_physical_address != UINT32_MAX);
-  if (frontbuffer_physical_address == UINT32_MAX) {
-    // Xenia-specific safety check.
-    if (last_valid_frontbuffer_physical_address != UINT32_MAX) {
-      REXKRNL_WARN(
-          "VdSwap: invalid front buffer virtual address 0x{:08X}; "
-          "re-presenting last valid front buffer 0x{:08X}",
-          frontbuffer_virtual_address, last_valid_frontbuffer_physical_address);
-      frontbuffer_physical_address = last_valid_frontbuffer_physical_address;
-    } else {
-      REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X} "
-                    "(no valid front buffer yet)",
-                    frontbuffer_virtual_address);
-      return;
-    }
-  } else {
-    last_valid_frontbuffer_physical_address = frontbuffer_physical_address;
-  }
-  gpu_fetch.base_address = frontbuffer_physical_address >> 12;
-
+  // (Run #16, C-05; audit J-16.) The last valid front buffer, kept across
+  // calls: when the game hands us an invalid front buffer for one frame,
+  // re-presenting the previous valid one keeps the screen alive (a repeated
+  // frame) instead of dropping the swap entirely, which the player sees as a
+  // black flash. The snapshot also carries the geometry the saved frame was
+  // presented with: the swap packet below is built from the CURRENT call's
+  // width/height/format, so re-presenting an old frame under a different
+  // geometry would show the old image misinterpreted (stretched garbage)
+  // instead of black. If the geometry differs, drop the swap (the pre-C-05
+  // behavior) instead of substituting. Reset by ResetLastValidFrontBuffer()
+  // on engine (re-)init/shutdown and on kernel module registration (once per
+  // title load), so a frame from a previous session is never re-presented.
   auto texture_format = rex::graphics::xenos::TextureFormat(texture_format_ptr.value());
   auto color_space = *color_space_ptr;
+  assert_true(frontbuffer_physical_address != UINT32_MAX);
+  {
+    std::lock_guard<std::mutex> lock(last_valid_frontbuffer_mutex);
+    if (frontbuffer_physical_address == UINT32_MAX) {
+      // Xenia-specific safety check.
+      if (last_valid_frontbuffer.address != UINT32_MAX &&
+          last_valid_frontbuffer.width == uint32_t(*width) &&
+          last_valid_frontbuffer.height == uint32_t(*height) &&
+          last_valid_frontbuffer.format == uint32_t(texture_format) &&
+          last_valid_frontbuffer.color_space == uint32_t(color_space)) {
+        REXKRNL_WARN(
+            "VdSwap: invalid front buffer virtual address 0x{:08X}; "
+            "re-presenting last valid front buffer 0x{:08X}",
+            frontbuffer_virtual_address, last_valid_frontbuffer.address);
+        frontbuffer_physical_address = last_valid_frontbuffer.address;
+      } else {
+        if (last_valid_frontbuffer.address != UINT32_MAX) {
+          REXKRNL_WARN(
+              "VdSwap: invalid front buffer virtual address 0x{:08X}; saved "
+              "frame is {}x{} format {} color_space {}, current swap is {}x{} "
+              "format {} color_space {} - geometry differs, dropping the swap "
+              "instead of re-presenting",
+              frontbuffer_virtual_address, last_valid_frontbuffer.width,
+              last_valid_frontbuffer.height, last_valid_frontbuffer.format,
+              last_valid_frontbuffer.color_space, uint32_t(*width), uint32_t(*height),
+              uint32_t(texture_format), uint32_t(color_space));
+        } else {
+          REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X} "
+                        "(no valid front buffer yet)",
+                        frontbuffer_virtual_address);
+        }
+        return;
+      }
+    } else {
+      last_valid_frontbuffer = {frontbuffer_physical_address, uint32_t(*width),
+                                uint32_t(*height), uint32_t(texture_format),
+                                uint32_t(color_space)};
+    }
+  }
+  gpu_fetch.base_address = frontbuffer_physical_address >> 12;
 
   // Diagnostic logging for video artifact investigation - log unique swaps
   static uint32_t last_logged_key = 0;
@@ -595,6 +667,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
                           KernelState* kernel_state) {
+  // (Audit run #16, J-16.) Kernel module (re-)registration runs once per
+  // title load: no front buffer from a previous session may survive it.
+  ResetLastValidFrontBuffer();
   auto memory = kernel_state->memory();
 
   // VdGlobalDevice (4b)
