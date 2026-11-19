@@ -60,6 +60,16 @@
  *   running read/write totals are logged every 1024 calls (see
  *   ReadSync/WriteSync below), so the phone log shows the spin and its
  *   rate.
+ *   (Run #16, C-04.) The observability worked - the phone log shows the
+ *   component CAN loop on EOF reads - but observability alone does not
+ *   stop the spin from stealing the guest thread, so a bounded sleep was
+ *   added on the EOF path only, after 1024 total EOF reads, gated by the
+ *   xbmovie_probe_eof_sleep_ms cvar (default 1 ms, 0 = disabled). A
+ *   caller that reads EOF once and stops never reaches 1024 reads and
+ *   never sees the sleep; a caller looping on EOF is capped at ~1000
+ *   reads/s instead of spinning unbounded. This probe never returns data,
+ *   so no real read is stalled, and the status stays EOF - no new
+ *   protocol semantics are invented.
  * Do NOT build a decoder on top of these semantics until the traced
  * protocol says what a read/write really carries.
  */
@@ -69,8 +79,10 @@
 #include <atomic>
 #include <cstdio>
 
+#include <rex/cvar.h>
 #include <rex/filesystem/devices/xbmovie_entry.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 namespace rex::filesystem {
 
@@ -151,6 +163,18 @@ X_STATUS XbMovieFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     // X_STATUS_END_OF_FILE instead of SUCCESS + 0.
     REXFS_WARN("XbMovieDevice: ReadSync total reads={} (len={} offset={}) -> EOF", read_count,
                buffer.size(), byte_offset);
+  }
+
+  // (Run #16, C-04.) Bounded backoff for a caller looping on EOF reads:
+  // after 1024 total EOF reads, sleep a little on every further EOF read
+  // so the spin cannot steal the guest thread. Only the EOF path sleeps
+  // (this probe never returns data), and the cvar defaults to 1 ms,
+  // 0 = disabled.
+  if (read_count > kProbeLogEveryN) {
+    const int32_t sleep_ms = REXCVAR_GET(xbmovie_probe_eof_sleep_ms);
+    if (sleep_ms > 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(sleep_ms));
+    }
   }
 
   // EOF: end of movie. See the TODO(PROTOCOL) note at the top of this file.
