@@ -85,8 +85,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                bool blocking) override;
 
   bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  void Pause() override;
+  void Resume() override;
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
@@ -125,7 +125,10 @@ class GraphicsSystem : public system::IGraphicsSystem {
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;
 
-  bool paused_ = false;
+  // (Hunt v1.4.6, A4-R6-01.) atomic: Pause()/Resume() are now called from
+  // the Android UI thread (JNI) while the vblank worker reads this flag.
+  // Same pattern as XmaDecoder::paused_ in the audio subsystem.
+  std::atomic<bool> paused_ = false;
 
  private:
   std::unique_ptr<::rex::ui::Presenter> presenter_;
