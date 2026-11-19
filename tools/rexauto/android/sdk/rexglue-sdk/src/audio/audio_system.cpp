@@ -253,7 +253,16 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   auto global_lock = global_critical_region_.Acquire();
 
   auto index = FindFreeClient();
-  assert_true(index >= 0);
+  // (Run #16, C-01.) With all 8 clients busy FindFreeClient returns -1;
+  // assert_true is a no-op in Release, so the code below would index
+  // clients_[-1] - out of bounds. Fail cleanly instead: the caller
+  // (xboxkrnl_audio.cpp) propagates the failure to the guest, which can
+  // retry or take the no-audio path.
+  if (index < 0) {
+    REXAPU_WARN("AudioSystem::RegisterClient: all {} clients busy",
+                kMaximumClientCount);
+    return X_STATUS_INSUFFICIENT_RESOURCES;
+  }
   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
                queued_frames_);
 
@@ -291,8 +300,14 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   }
 
   auto global_lock = global_critical_region_.Acquire();
-  assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  // (Run #16, C-01.) The asserts are no-ops in Release; an out-of-range
+  // or free client index would dereference garbage. Validate and drop
+  // the frame instead.
+  if (index >= kMaximumClientCount || !clients_[index].in_use ||
+      clients_[index].driver == NULL) {
+    REXAPU_WARN("AudioSystem::SubmitFrame: invalid client index={}", index);
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
@@ -300,7 +315,13 @@ void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 
   auto global_lock = global_critical_region_.Acquire();
-  assert_true(index < kMaximumClientCount);
+  // (Run #16, C-01.) Same as SubmitFrame: the assert is a no-op in
+  // Release, so validate before touching the client.
+  if (index >= kMaximumClientCount || !clients_[index].in_use) {
+    REXAPU_WARN("AudioSystem::UnregisterClient: invalid client index={}",
+                index);
+    return;
+  }
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
   clients_[index] = {nullptr, 0, 0, 0, false};
