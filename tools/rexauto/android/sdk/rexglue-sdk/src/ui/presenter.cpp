@@ -47,6 +47,25 @@ REXCVAR_DEFINE_BOOL(presenter_recreate_on_suboptimal, true, "UI/Presenter",
                     "Rayman-strict: recreate only on OUT_OF_DATE or "
                     "SURFACE_LOST.");
 
+// (Run #16, C-02.) On Android the very first present is already
+// suboptimal (surface transform / extent mismatch), so the flag above
+// never sees an optimal present and the swapchain is never recreated:
+// the phone log shows 600->1200 suboptimal presents with 0 recreates.
+// This cvar forces ONE recreate after N consecutive suboptimal presents
+// (default 60, about 1 s at 60 Hz), which lets the driver pick a
+// matching surface on the second try. After a forced recreate the
+// presents either become optimal (the old path takes over) or stay
+// suboptimal, in which case re-recreating would not help, so the forced
+// recreate happens at most once per connection. 0 = disabled (old
+// behavior).
+REXCVAR_DEFINE_INT32(presenter_recreate_after_suboptimal_presents, 60,
+                     "UI/Presenter",
+                     "Recreate the swapchain after this many consecutive "
+                     "suboptimal presents when it was never optimal (range "
+                     "0-6000, 0 = disabled). One forced recreate per "
+                     "connection, then the old optimal/suboptimal path "
+                     "takes over.");
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
@@ -1420,6 +1439,10 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
         case SurfacePaintConnectResult::kSuccessUnchanged:
           // Don't know yet what the first result was (success or suboptimal).
           surface_paint_connection_was_optimal_at_successful_paint_ = false;
+          // (Run #16, C-02.) New connection, new budget of consecutive
+          // suboptimal presents and a new forced recreate.
+          consecutive_suboptimal_presents_.store(0);
+          forced_suboptimal_recreate_done_.store(false);
           surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedPaintable;
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
@@ -1540,6 +1563,8 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
+      // (Run #16, C-02.) An optimal present breaks the suboptimal streak.
+      consecutive_suboptimal_presents_.store(0);
       break;
     case PaintResult::kPresentedSuboptimal: {
       // (Batch 1 — swapchain audit.) Diagnostic counters so a suboptimal /
@@ -1561,11 +1586,34 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
             "#{} (set presenter_recreate_on_suboptimal=false to test "
             "Rayman-strict mode)",
             suboptimal_n, recreate_n);
-      } else if (suboptimal_n % 600 == 0) {
-        REXLOG_INFO(
-            "Presenter: {} suboptimal presents so far, {} recreates "
-            "triggered by them",
-            suboptimal_n, suboptimal_recreate_count.load());
+      } else {
+        // (Run #16, C-02.) Suboptimal from the very beginning: the
+        // optimal->suboptimal path above never fires, because there was
+        // no optimal present to fall from (on Android the first present
+        // is already suboptimal). After N consecutive suboptimal
+        // presents, force ONE recreate so the driver can pick a matching
+        // surface on the second try. If the presents stay suboptimal
+        // afterwards, a second recreate would not help, so this happens
+        // at most once per connection. 0 disables it (old behavior).
+        const int32_t after_n =
+            REXCVAR_GET(presenter_recreate_after_suboptimal_presents);
+        const uint32_t streak = ++consecutive_suboptimal_presents_;
+        if (after_n > 0 && !forced_suboptimal_recreate_done_.load() &&
+            streak >= static_cast<uint32_t>(after_n)) {
+          forced_suboptimal_recreate_done_.store(true);
+          surface_paint_connection_state_ =
+              SurfacePaintConnectionState::kConnectedOutdated;
+          REXLOG_INFO(
+              "Presenter: {} consecutive suboptimal presents without an "
+              "optimal one; forcing one swapchain recreate (set "
+              "presenter_recreate_after_suboptimal_presents=0 to disable)",
+              streak);
+        } else if (suboptimal_n % 600 == 0) {
+          REXLOG_INFO(
+              "Presenter: {} suboptimal presents so far, {} recreates "
+              "triggered by them",
+              suboptimal_n, suboptimal_recreate_count.load());
+        }
       }
       break;
     }
