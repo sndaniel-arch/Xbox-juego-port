@@ -149,6 +149,14 @@ REX_EXPORT(__imp__XMsgCancelIORequest, rex::kernel::xam::XMsgCancelIORequest_ent
 REX_EXPORT(__imp__XMsgCompleteIORequest, rex::kernel::xam::XMsgCompleteIORequest_entry)
 REX_EXPORT(__imp__XamGetOverlappedResult, rex::kernel::xam::XamGetOverlappedResult_entry)
 
-REX_EXPORT_STUB(__imp__XMsgAcquireAsyncMessageFromOverlapped);
-REX_EXPORT_STUB(__imp__XMsgProcessRequest);
-REX_EXPORT_STUB(__imp__XMsgReleaseAsyncMessageToOverlapped);
+// (Audit run #16, A-6.) These three return an error, never success and never
+// IO_PENDING: a bare REX_STUB leaves r3 = the app id (< 0x80000000), which
+// XSUCCEEDED reads as success, and the caller would then read an overlapped
+// that was never filled. X_ERROR_NOT_FOUND (xtypes.h) is the honest answer:
+// no message queue exists for them. 0 would be the same success lie; an
+// IO_PENDING that never completes would hang whoever waits on it.
+// XMsgCancelIORequest / XMsgCompleteIORequest above are implemented, not
+// touched.
+REX_EXPORT_STUB_RETURN(__imp__XMsgAcquireAsyncMessageFromOverlapped, X_ERROR_NOT_FOUND);
+REX_EXPORT_STUB_RETURN(__imp__XMsgProcessRequest, X_ERROR_NOT_FOUND);
+REX_EXPORT_STUB_RETURN(__imp__XMsgReleaseAsyncMessageToOverlapped, X_ERROR_NOT_FOUND);
