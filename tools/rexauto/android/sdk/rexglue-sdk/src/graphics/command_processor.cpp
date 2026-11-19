@@ -159,11 +159,34 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  // (Audit BL-1.) pending_fns_ is written here (any thread) and drained in
+  // WorkerThreadMain: guard the empty()+push with pending_fns_mutex_. The
+  // inline fast path must NOT run under the lock: fn() is arbitrary code
+  // and could call CallInThread again (deadlock). Decide under the lock,
+  // run outside it.
+  bool run_inline = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+      run_inline = true;
+    } else {
+      pending_fns_.push(std::move(fn));
+    }
+  }
+  if (run_inline) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
+    // Wake the worker promptly: without this a queued fn waits for the
+    // worker's 5 ms event timeout (see the wait loop in WorkerThreadMain).
+    // write_ptr_index_event_ is created in the constructor, so it is
+    // non-null whenever CallInThread can run.
+    write_ptr_index_event_->Set();
   }
+}
+
+bool CommandProcessor::PendingFnsEmpty() {
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  return pending_fns_.empty();
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -205,10 +228,20 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
+    // (Audit BL-1.) Drain the queue to a local queue under the lock, then
+    // run the functions without holding it: a queued fn may itself call
+    // CallInThread (e.g. Pause's fence), which would deadlock on the lock.
+    {
+      std::queue<std::function<void()>> fns;
+      {
+        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+        fns.swap(pending_fns_);
+      }
+      while (!fns.empty()) {
+        auto fn = std::move(fns.front());
+        fns.pop();
+        fn();
+      }
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
@@ -235,10 +268,11 @@ void CommandProcessor::WorkerThreadMain() {
           // Commands") and NEVER receives a user APC: every QueueUserCallback
           // producer (NtQueueApcThread, XThread::EnqueueApc/UnlockApc,
           // KernelState::TerminateTitle) targets guest XThreads only. The
-          // event is Set() by UpdateWritePointer and by Shutdown, so wake-ups
-          // are identical; pending_fns_ are drained at the top of the loop
-          // either way (worst case a queued fn waits the 5 ms timeout, as
-          // today).
+          // event is Set() by UpdateWritePointer, by Shutdown, and by
+          // CallInThread when it queues a fn, so wake-ups are identical;
+          // pending_fns_ are drained at the top of the loop either way (a
+          // queued fn wakes the worker promptly; the 5 ms timeout is only
+          // the fallback).
           rex::thread::Wait(write_ptr_index_event_.get(), false,
                             std::chrono::milliseconds(wait_time_ms));
         }
@@ -246,10 +280,10 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && PendingFnsEmpty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || !PendingFnsEmpty()) {
         continue;
       }
     }
