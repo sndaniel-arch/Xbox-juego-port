@@ -19,8 +19,9 @@ index 0b45c0d..4548766 100644
 +    }
 +    REXGPU_WARN(
 +        "Vulkan vertexPipelineStoresAndAtomics is not supported by the device; "
-+        "vertex-shader memory export falls back to compute shaders, and draws "
-+        "that use vertex memexport will fail individually");
++        "there is no compute-shader fallback for vertex-shader memory "
++        "export in the Vulkan path, and draws that use vertex memexport "
++        "will fail individually");
    }
    if (!device_properties.geometryShader) {
      if (REXCVAR_GET(vulkan_require_geometry_shader)) {
@@ -38,9 +39,9 @@ index 8197bb4..9907bc7 100644
 +REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, false, "UI/Vulkan",
 +                    "Require vertexPipelineStoresAndAtomics for Vulkan GPU emulation; when "
 +                    "false (default), devices without it (e.g. Mali-G57) still boot and "
-+                    "vertex-shader memory export falls back to compute shaders, while "
-+                    "draws that actually use vertex memexport fail individually instead "
-+                    "of the whole device")
++                    "there is no compute-shader fallback for vertex-shader memory "
++                    "export in the Vulkan path; draws that actually use vertex "
++                    "memexport fail individually instead of the whole device")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 -// Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
 -// default both to false on macOS so the device can still be selected.
@@ -78,14 +79,18 @@ index 8197bb4..9907bc7 100644
        return nullptr;
      }
 +    if (!supported_features.vertexPipelineStoresAndAtomics) {
-+      // Mali (and other mobile GPUs) lack vertex pipeline stores/atomics, but
-+      // the GPU emulation already has a fallback: vertex shaders that need
-+      // memory export are translated to compute shaders (see
-+      // command_processor.cpp and spirv_translator.h). Only draws that
-+      // actually use vertex-shader memexport fail, not the whole device.
++      // Mali (and other mobile GPUs) lack vertex pipeline stores/atomics.
++      // There is no compute-shader fallback for vertex memexport in the
++      // Vulkan path: the SPIR-V translator can translate a vertex shader
++      // as compute (see spirv_translator.h, IsSpirvComputeShader), but
++      // nothing dispatches it for a draw - IssueDraw discards draws that
++      // use vertex memexport individually, so their visible output and
++      // their exported data are both lost. Only draws that actually use
++      // vertex-shader memexport fail, not the whole device.
 +      REXLOG_WARN(
 +          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics; "
-+          "continuing with the compute-shader memexport fallback "
++          "continuing without a memexport fallback; draws that use "
++          "vertex memexport will fail individually "
 +          "(vulkan_require_vertex_pipeline_stores_and_atomics=false)",
 +          properties.deviceName);
 +    }
