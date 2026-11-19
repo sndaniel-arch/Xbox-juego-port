@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -64,7 +65,11 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     const auto audit = rex::graphics::spirv_patch::Audit(
         reinterpret_cast<const uint32_t*>(translated_binary().data()),
         translated_binary().size() / sizeof(uint32_t));
-    static bool logged_first_audit = false;
+    // (Audit run #16, J-19.) Atomic: GetOrCreateShaderModule runs on the
+    // pipeline creation threads, so two of them could race on the plain
+    // static. The check-then-set below can still log the first audit twice
+    // (benign, log-only); the atomic only removes the data race.
+    static std::atomic<bool> logged_first_audit{false};
     const bool noteworthy =
         audit.valid && (audit.max_descriptor_set > 3 ||
                         audit.uses_descriptor_indexing ||
@@ -73,8 +78,8 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
       REXLOG_WARN(
           "SpirvPatch: translated SPIR-V binary failed the audit (not a "
           "valid module); creating it unchanged");
-    } else if (!logged_first_audit || noteworthy) {
-      logged_first_audit = true;
+    } else if (!logged_first_audit.load() || noteworthy) {
+      logged_first_audit.store(true);
       REXLOG_INFO(
           "SpirvPatch: shader module SPIR-V {}.{} uses descriptor sets "
           "0..{}, {} bindings, runtime array: {}, NonUniform: {}, "
