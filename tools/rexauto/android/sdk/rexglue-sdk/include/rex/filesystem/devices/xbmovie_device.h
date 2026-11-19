@@ -36,6 +36,7 @@
 // 'FLAGS_xbmovie_probe_storage_'" (run #4) and would have left the declared
 // rex::filesystem:: accessor without a definition at link.
 REXCVAR_DECLARE(bool, xbmovie_probe);
+REXCVAR_DECLARE(int32_t, xbmovie_probe_eof_sleep_ms);
 
 namespace rex::filesystem {
 
