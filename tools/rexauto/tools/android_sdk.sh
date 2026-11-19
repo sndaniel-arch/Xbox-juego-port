@@ -31,10 +31,21 @@ AT_DIR="$(dirname "$SDK_DIR")/libadrenotools"
 AT_REV="8fae8ce254dfc1344527e05301e43f37dea2df80"
 LNB_REV="aa3975893d83ef1bc84c321ec60c65fbf1287887"
 if [ ! -f "$AT_DIR/CMakeLists.txt" ]; then
-  git clone https://github.com/bylaws/libadrenotools.git "$AT_DIR"
-  git -C "$AT_DIR" checkout -q "$AT_REV"
-  git clone https://github.com/bylaws/liblinkernsbypass.git "$AT_DIR/lib/linkernsbypass"
-  git -C "$AT_DIR/lib/linkernsbypass" checkout -q "$LNB_REV"
+  # (J-9.) Shallow-fetch the PINNED commits only: a plain `git clone
+  # --depth 1` + `checkout $REV` would work today (both revs are HEAD,
+  # verified 2026-11-19) but break on the next upstream commit, when the
+  # pinned SHA is no longer the tip. `fetch --depth 1 origin <sha>`
+  # downloads exactly that commit (GitHub allows fetching arbitrary SHAs).
+  # Fallback if fetch-by-SHA ever fails: drop `--depth 1` (full clone).
+  git init -q "$AT_DIR"
+  git -C "$AT_DIR" remote add origin https://github.com/bylaws/libadrenotools.git
+  git -C "$AT_DIR" fetch -q --depth 1 origin "$AT_REV"
+  git -C "$AT_DIR" checkout -q FETCH_HEAD
+  mkdir -p "$AT_DIR/lib"
+  git init -q "$AT_DIR/lib/linkernsbypass"
+  git -C "$AT_DIR/lib/linkernsbypass" remote add origin https://github.com/bylaws/liblinkernsbypass.git
+  git -C "$AT_DIR/lib/linkernsbypass" fetch -q --depth 1 origin "$LNB_REV"
+  git -C "$AT_DIR/lib/linkernsbypass" checkout -q FETCH_HEAD
   echo "[android_sdk] libadrenotools -> $AT_DIR"
 fi
 
