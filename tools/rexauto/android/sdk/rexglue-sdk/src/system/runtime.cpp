@@ -338,7 +338,15 @@ bool Runtime::SetupVfs() {
 
   if (!game_mounted) {
     if (game_data_root_.empty()) {
-      if (stfs_attempted) {
+      // (Hunt v1.4.6, A2-R6-07.) stfs_attempted covers "source delivered
+      // and mount failed". StfsAssetSourceAttempted() also covers "source
+      // delivery itself failed" (dup() failed in SetStfsAssetSource):
+      // either way an asset-backed game was intended and nothing is
+      // mounted, so this is a hard error, not the historical "no root
+      // specified, skipping VFS setup" success. (android_main already
+      // aborts on a failed delivery; this is the defense in depth for
+      // any other caller that reaches SetupVfs without a stored source.)
+      if (stfs_attempted || rex::filesystem::StfsAssetSourceAttempted()) {
         // The bundled STFS asset was supposed to be the game and its mount
         // failed: report it here instead of "succeeding" with nothing
         // mounted and failing later at LoadXexImage with a generic error.
