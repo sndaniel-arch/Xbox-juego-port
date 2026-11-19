@@ -1,6 +1,7 @@
 package com.rexauto.port;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
@@ -121,9 +122,32 @@ public class SetupActivity extends Activity {
             finish();
             return;
         }
-        // Normal/dev build, or a full build whose asset is missing or for
-        // the wrong title (broken build): fall back to the manual picker.
+        // M-17 (auditoria run #16): en FULL el picker NO existe como opcion
+        // — un port oficial no importa el juego. Si el asset empaquetado
+        // falta, esta corrupto o es de otro titulo, la APK esta rota y lo
+        // unico que el jugador puede hacer es reinstalar. En builds
+        // normal/dev, el picker sigue siendo la pantalla de primera vez.
+        if (BuildConfig.FULL) {
+            showBundledAssetMissingError();
+            return;
+        }
+        // Normal/dev build: fall back to the manual picker.
         buildFirstRunScreen();
+    }
+
+    /**
+     * M-17: FULL build whose bundled asset is unusable (missing, corrupt
+     * or wrong title). Never offer the manual import picker: an official
+     * port has no import flow. The dialog stays up until the user
+     * dismisses it; either way the activity finishes — there is nothing
+     * else this screen can do for a broken FULL build.
+     */
+    private void showBundledAssetMissingError() {
+        new AlertDialog.Builder(this)
+                .setMessage(R.string.err_full_missing_asset)
+                .setPositiveButton(android.R.string.ok, (d, w) -> finish())
+                .setOnCancelListener(d -> finish())
+                .show();
     }
 
     /**
@@ -133,14 +157,16 @@ public class SetupActivity extends Activity {
      * usable STFS package for this title, write the {@code asset:game.stfs}
      * marker into game_root.txt, and launch the game. Returns false when
      * there is no usable bundled asset — the caller falls back to the
-     * manual import screen.
+     * manual import screen (dev builds) or shows the reinstall error
+     * (FULL builds, M-17).
      */
     private boolean launchBundledAsset() {
         if (!StfsAsset.verifyUsable(getAssets(), BuildConfig.TITLE_ID)) return false;
         // The asset is fine on disk, but if its fd never reached native
         // code (the PortApp handover failed) the game cannot start from
-        // it: fall back to the picker instead of launching into a certain
-        // native failure (see GameFiles.hasValidGameRoot).
+        // it: return false instead of launching into a certain native
+        // failure (see GameFiles.hasValidGameRoot). The caller decides
+        // what false means: picker on dev, reinstall error on FULL (M-17).
         if (!StfsAsset.isHandedOver()) return false;
         try (PrintWriter w = new PrintWriter(new FileWriter(GameFiles.configFile(this), false))) {
             w.println(GameFiles.ASSET_PREFIX + StfsAsset.ASSET_NAME);
