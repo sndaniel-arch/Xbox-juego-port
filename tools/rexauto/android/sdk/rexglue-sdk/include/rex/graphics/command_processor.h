@@ -275,7 +275,7 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
 
-    // (Hunt v1.4.6, A4-R6-01.) atomic: Pause()/Resume() are now called from
+  // (Hunt v1.4.6, A4-R6-01.) atomic: Pause()/Resume() are now called from
   // the Android UI thread (via GraphicsSystem::Pause) while the command
   // processor worker reads this flag. Same pattern as
   // XmaDecoder::paused_ in the audio subsystem.
