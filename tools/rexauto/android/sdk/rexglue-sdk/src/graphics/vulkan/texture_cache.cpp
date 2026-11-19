@@ -123,6 +123,20 @@ const VkClearColorValue kInvalidTextureFetchFallbackColor = {{0.0f, 0.0f, 0.0f, 
 std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> g_etc2_upload_pool;
 constexpr VkDeviceSize kEtc2UploadPoolPageSize = VkDeviceSize(16) * 1024 * 1024;
 
+// (Audit A-3.) CPU BC -> ETC2 transcode budget + failure cooldown. The
+// transcode runs synchronously on the graphics thread inside
+// LoadTextureDataFromResidentMemoryImpl, so one 1024x1024 BC texture
+// (~65k blocks, decode + re-encode per block) can stall a whole frame.
+// 4096 blocks ~= one 256x256 texture: enough that a frame still makes
+// progress, small enough that the stall stays a fraction of a frame at
+// 60 fps (block counts, not measured timings -- see the evidence file).
+// A texture that fails to transcode 3 times in a row is served the 1x1
+// placeholder for 60 submissions (~1 s at 60 fps, same cooldown as the
+// R8-C1 pipeline retry) instead of retrying every frame.
+constexpr uint32_t kEtc2MaxBlocksPerSubmission = 4096;
+constexpr uint32_t kEtc2MaxConsecutiveFailures = 3;
+constexpr uint64_t kEtc2FailureCooldownSubmissions = 60;
+
 }  // namespace
 
 // (Run #12 fix for run #11, F3 points 6-7.) The helpers below used to live
@@ -155,6 +169,33 @@ void VulkanTextureCache::MarkTexturePlaceholder(const TextureKey& key) {
 
 void VulkanTextureCache::ClearTexturePlaceholder(const TextureKey& key) {
   PlaceholderTextureKeys().erase(key);
+}
+
+void VulkanTextureCache::RecordEtc2TranscodeFailure(const TextureKey& key,
+                                                    uint64_t submission) {
+  // (Audit A-3b.) A transcode failure is transient (staging allocation
+  // or a guest block with no data), so it retries next frame -- but a
+  // texture that fails every frame burns CPU in the transcode loop
+  // forever and never renders. After kEtc2MaxConsecutiveFailures
+  // failures in a row it is served the 1x1 placeholder for
+  // kEtc2FailureCooldownSubmissions, like MarkTexturePlaceholder above
+  // but for repeated transient failures instead of a deterministic
+  // missing loader. The cooldown is stamped here; the gate in
+  // LoadTextureDataFromResidentMemoryImpl erases the entry when the
+  // cooldown expires, and the success path erases it too.
+  Etc2TranscodeFailure& state = Etc2FailedTextures()[key];
+  ++state.consecutive_failures;
+  state.last_failure_submission = submission;
+  if (state.consecutive_failures >= kEtc2MaxConsecutiveFailures &&
+      PlaceholderTextureKeys().insert(key).second) {
+    REXGPU_WARN(
+        "VulkanTextureCache: Texture {}x{} {} (base at 0x{:08X}) failed to "
+        "transcode {} times in a row; serving the 1x1 placeholder image for "
+        "{} submissions",
+        key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name,
+        key.base_page << 12, state.consecutive_failures,
+        kEtc2FailureCooldownSubmissions);
+  }
 }
 
 // Reads one BC block (8 bytes for BC1, 16 for BC3) of a texture level from
@@ -1459,6 +1500,21 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     const uint64_t submission_current = command_processor_.GetCurrentSubmission();
 
+    // (Audit A-3b.) Failure cooldown: a texture that failed to transcode
+    // kEtc2MaxConsecutiveFailures times in a row stays on the 1x1
+    // placeholder and does no work until the cooldown expires. The
+    // unsigned subtraction also handles a submission-counter reset (the
+    // difference wraps huge, so the entry is erased and the texture
+    // retries immediately instead of cooling down forever).
+    auto failed_it = Etc2FailedTextures().find(texture_key);
+    if (failed_it != Etc2FailedTextures().end()) {
+      if (submission_current - failed_it->second.last_failure_submission <=
+          kEtc2FailureCooldownSubmissions) {
+        return false;
+      }
+      Etc2FailedTextures().erase(failed_it);
+    }
+
     // Transcode one loop level (or packed tail) per array slice into the
     // staging pool, remembering where each upload landed for the copy below.
     struct Etc2LevelUpload {
@@ -1496,6 +1552,30 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       VkDeviceSize slice_size =
           VkDeviceSize(etc2_bytes_per_block) * x_blocks * y_blocks * level_depth;
       for (uint32_t slice = 0; slice < array_size; ++slice) {
+        // (Audit A-3a.) Per-submission transcode budget: the decode +
+        // re-encode below runs synchronously on the graphics thread, so
+        // an unbounded number of blocks in one submission stalls the
+        // frame. At most kEtc2MaxBlocksPerSubmission blocks per submission
+        // across all textures (the counter is shared, stamped by
+        // submission, and reset when the submission changes). The
+        // `blocks_used > 0` guard guarantees progress: at least one slice
+        // is transcoded per submission, so a single slice larger than the
+        // budget cannot livelock the texture. A budget deferral is NOT a
+        // failure: it is not recorded, and the texture simply retries
+        // next submission (the slices already transcoded in this call
+        // are abandoned with the staging, like the existing failure
+        // paths).
+        const uint32_t slice_blocks = x_blocks * y_blocks * level_depth;
+        Etc2TranscodeBudget& etc2_budget = Etc2Budget();
+        if (etc2_budget.submission != submission_current) {
+          etc2_budget.submission = submission_current;
+          etc2_budget.blocks_used = 0;
+        }
+        if (etc2_budget.blocks_used > 0 &&
+            etc2_budget.blocks_used + slice_blocks > kEtc2MaxBlocksPerSubmission) {
+          return false;
+        }
+        etc2_budget.blocks_used += slice_blocks;
         // One Request per (level, slice): a single level slice is at most
         // 16 MiB (4096x4096 ETC2 RGBA), which is exactly one pool page.
         // Bigger than that cannot be staged in one piece and is retried on
@@ -1506,6 +1586,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         uint8_t* upload_mapping = g_etc2_upload_pool->Request(
             submission_current, size_t(slice_size), size_t(16), upload_buffer, upload_offset);
         if (!upload_mapping) {
+          // (Audit A-3b.) Staging allocation failure: transient, but
+          // count it -- a texture that fails every frame is served the
+          // 1x1 placeholder after N failures instead of retrying forever.
+          RecordEtc2TranscodeFailure(texture_key, submission_current);
           return false;
         }
         for (uint32_t bz = 0; bz < level_depth; ++bz) {
@@ -1515,6 +1599,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
               if (!ReadGuestBcBlock(guest_shared_memory, level_guest_layout, guest_level_base,
                                     texture_key, is_3d_tiling, bx, by, bz, slice, guest_block,
                                     guest_bytes_per_block)) {
+                // (Audit A-3b.) Guest block with no data: transient, but
+                // count it -- see the staging failure above.
+                RecordEtc2TranscodeFailure(texture_key, submission_current);
                 return false;
               }
               etc2::Rgba pixels[16];
@@ -1625,6 +1712,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     flush_copy_regions();
 
+    // (Audit A-3b.) Transcode succeeded: forget any earlier failures for
+    // this key so a later failure starts counting from zero again.
+    Etc2FailedTextures().erase(texture_key);
     ClearTexturePlaceholder(texture_key);
     return true;
   }
