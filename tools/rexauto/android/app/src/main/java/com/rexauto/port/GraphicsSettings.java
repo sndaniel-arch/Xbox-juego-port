@@ -279,7 +279,7 @@ public final class GraphicsSettings {
             }
         }
         try (PrintWriter w = new PrintWriter(new FileWriter(f, false))) {
-            w.println("# written by the rexauto Android launcher - one cvar per line");
+            w.println("# Child of Light — settings - one cvar per line");
             for (Map.Entry<String, String> e : cvars.entrySet()) {
                 w.println(e.getKey() + "=" + e.getValue());
             }
