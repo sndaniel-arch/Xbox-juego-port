@@ -73,6 +73,15 @@ class IGraphicsSystem {
   // runs the pin on the worker thread itself, inside the plugin.
   virtual void pin_command_processor_thread(uint64_t mask) { (void)mask; }
 
+  // Pause/Resume guest GPU work (command processor + vblank). Default
+  // no-op: the Android port calls these from MainActivity.onPause/onResume
+  // via JNI (hunt v1.4.6, A4-R6-01); the concrete GraphicsSystem overrides
+  // them. Pausing also stops the vblank worker dispatching interrupts
+  // (graphics_system.cpp) instead of letting it run against a suspended
+  // command processor.
+  virtual void Pause() {}
+  virtual void Resume() {}
+
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
     (void)callback;
