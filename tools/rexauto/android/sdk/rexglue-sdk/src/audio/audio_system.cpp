@@ -149,8 +149,6 @@ void AudioSystem::WorkerThreadMain() {
       continue;
     }
 
-    // Number of clients pumped
-    bool pumped = false;
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
@@ -175,18 +173,17 @@ void AudioSystem::WorkerThreadMain() {
       } else {
         REXAPU_DEBUG("AudioWorker: semaphore signaled for client {} but callback is 0", index);
       }
-
-      pumped = true;
     }
 
     if (!worker_running_) {
       break;
     }
 
-    if (!pumped) {
-      SCOPE_profile_cpu_i("apu", "Sleep");
-      rex::thread::Sleep(std::chrono::milliseconds(500));
-    }
+    // (Audit run #16, M-9.) No extra sleep when idle: the WaitAny above
+    // already waits up to 500 ms and wakes immediately on a semaphore, so
+    // the old Sleep(500) here only added up to 500 ms of wake latency on
+    // the idle -> active transition (the first audio after silence) while
+    // saving one condvar wait per second. The loop now re-waits at once.
   }
   worker_running_ = false;
 
@@ -227,6 +224,15 @@ void AudioSystem::Shutdown() {
     bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
                                      rex::thread::WaitResult::kSuccess;
     if (!exited) {
+      // (Audit run #16, M-9.) Terminate(0) stays, deliberately: the orderly
+      // path above (shutdown_event_ + a bounded 500 ms wait) already runs
+      // first, and this only fires when the worker is stuck inside a guest
+      // callback blocked on guest objects -- in that case there is no
+      // orderly way out, and removing the Terminate would turn a bounded
+      // forced kill into a shutdown hang (or a reset() of a still-running
+      // thread). Pending a real fix for stuck guest callbacks, not for
+      // this round. The 500 ms idle sleep in WorkerThreadMain was the
+      // part that could go: it only added wake latency.
       REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
                   kWorkerShutdownTimeout.count());
       worker_thread_->Terminate(0);
