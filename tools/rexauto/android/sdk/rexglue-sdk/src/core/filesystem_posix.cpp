@@ -232,7 +232,7 @@ class PosixFileHandle : public FileHandle {
       *out_bytes_read = total;
     }
     return true;
-    
+  }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     // (Hunt v1.4.6, A2-R6-09.) Same loop as Read: EINTR retries, short
@@ -262,7 +262,7 @@ class PosixFileHandle : public FileHandle {
       *out_bytes_written = total;
     }
     return true;
-    
+  }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
 
