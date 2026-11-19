@@ -1088,7 +1088,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // (Second sweep, V-02.) `wait` is a raw guest uint32_t from the
+          // WAIT_REG_MEM packet: uncapped, wait/0x100 ms sleeps up to
+          // ~4.6 h (wait == 0xFFFFFFFF) before the condition is re-polled,
+          // wedging the whole command processor even after the condition
+          // becomes true -- nothing wakes this sleep early, and
+          // PrepareForWait/ReturnFromWait are no-ops. The sleep is only a
+          // poll-interval throttle, so cap it: the condition is simply
+          // re-checked sooner, which can only make the CP more
+          // responsive. 16 ms is one frame at 60 fps.
+          constexpr uint32_t kMaxWaitSleepMs = 16;
+          rex::thread::Sleep(std::chrono::milliseconds(
+              std::min(wait / 0x100, kMaxWaitSleepMs)));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
