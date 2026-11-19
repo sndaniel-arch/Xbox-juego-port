@@ -827,26 +827,62 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
     }
   }
 
+  // (Audit A-5.) Complete the call on every exit below, like the xbmovie
+  // branch above (R7-D3): write the caller's IO_STATUS_BLOCK, signal its
+  // event and queue its APC. The disk branches used to return bare, so a
+  // caller waiting on any of the three would hang (or read a STALE iosb
+  // status left over from a previous call and believe the IOCTL
+  // succeeded). `information` is the bytes written to the output buffer
+  // on success, 0 on error.
+  auto complete_io = [&](X_STATUS status, uint32_t information) {
+    if (io_status_block) {
+      auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
+      if (iosb) {
+        iosb->status = status;
+        iosb->information = information;
+      }
+    }
+    if (event_handle) {
+      auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+      if (ev) {
+        ev->Set(0, false);
+      }
+    }
+    if ((apc_routine & ~1u) && apc_context) {
+      auto thread = XThread::GetCurrentThread();
+      if (thread) {
+        thread->EnqueueApc(apc_routine & ~1u, apc_context, io_status_block, 0);
+      }
+    }
+  };
+
+  uint32_t bytes_written = 0;
   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
     if (output_buffer_len < 0x8) {
       assert_always();
+      complete_io(X_STATUS_BUFFER_TOO_SMALL, 0);
       return X_STATUS_BUFFER_TOO_SMALL;
     }
     memory::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
     memory::store_and_swap<uint32_t>(output_buffer + 4, 512);
+    bytes_written = 0x8;
   } else if (io_control_code == X_IOCTL_DISK_GET_PARTITION_INFO) {
     if (output_buffer_len < 0x10) {
       assert_always();
+      complete_io(X_STATUS_BUFFER_TOO_SMALL, 0);
       return X_STATUS_BUFFER_TOO_SMALL;
     }
     memory::store_and_swap<uint64_t>(output_buffer, 0);
     memory::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
+    bytes_written = 0x10;
   } else {
     REXKRNL_DEBUG("NtDeviceIoControlFile(0x{:X}) - unhandled IOCTL!", uint32_t(io_control_code));
     assert_always();
+    complete_io(X_STATUS_INVALID_PARAMETER, 0);
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  complete_io(X_STATUS_SUCCESS, bytes_written);
   return X_STATUS_SUCCESS;
 }
 
@@ -927,17 +963,25 @@ REX_EXPORT(__imp__IoSynchronousDeviceIoControlRequest,
 REX_EXPORT(__imp__StfsCreateDevice, rex::kernel::xboxkrnl::StfsCreateDevice_entry)
 REX_EXPORT(__imp__StfsControlDevice, rex::kernel::xboxkrnl::StfsControlDevice_entry)
 
+// (Audit A-6.) Stub return values: a bare REX_STUB leaves r3 = arg0
+// (a guest pointer, 0x82...), which as NTSTATUS has the high bit set
+// (failure) and as a pointer is a bogus address. NTSTATUS routines
+// return X_STATUS_NOT_IMPLEMENTED (honest failure, no lie-success);
+// pointer routines return 0 (NULL). VOID routines keep the bare stub:
+// their r3 is ignored by the caller. Left pending (signature not
+// verified): IoInvalidDeviceRequest, IoAcquireCancelSpinLock,
+// IoReleaseCancelSpinLock, SataCdRomRecordReset.
 REX_EXPORT_STUB(__imp__IoAcquireDeviceObjectLock);
-REX_EXPORT_STUB(__imp__IoAllocateIrp);
-REX_EXPORT_STUB(__imp__IoBuildAsynchronousFsdRequest);
-REX_EXPORT_STUB(__imp__IoBuildDeviceIoControlRequest);
-REX_EXPORT_STUB(__imp__IoBuildSynchronousFsdRequest);
-REX_EXPORT_STUB(__imp__IoCallDriver);
-REX_EXPORT_STUB(__imp__IoCheckShareAccess);
+REX_EXPORT_STUB_RETURN(__imp__IoAllocateIrp, 0);
+REX_EXPORT_STUB_RETURN(__imp__IoBuildAsynchronousFsdRequest, 0);
+REX_EXPORT_STUB_RETURN(__imp__IoBuildDeviceIoControlRequest, 0);
+REX_EXPORT_STUB_RETURN(__imp__IoBuildSynchronousFsdRequest, 0);
+REX_EXPORT_STUB_RETURN(__imp__IoCallDriver, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__IoCheckShareAccess, X_STATUS_NOT_IMPLEMENTED);
 REX_EXPORT_STUB(__imp__IoCompleteRequest);
-REX_EXPORT_STUB(__imp__IoCreateFile);
+REX_EXPORT_STUB_RETURN(__imp__IoCreateFile, X_STATUS_NOT_IMPLEMENTED);
 REX_EXPORT_STUB(__imp__IoDeleteDevice);
-REX_EXPORT_STUB(__imp__IoDismountVolume);
+REX_EXPORT_STUB_RETURN(__imp__IoDismountVolume, X_STATUS_NOT_IMPLEMENTED);
 REX_EXPORT_STUB(__imp__IoFreeIrp);
 REX_EXPORT_STUB(__imp__IoInitializeIrp);
 REX_EXPORT_STUB(__imp__IoInvalidDeviceRequest);
@@ -949,14 +993,14 @@ REX_EXPORT_STUB(__imp__IoSetShareAccess);
 REX_EXPORT_STUB(__imp__IoStartNextPacket);
 REX_EXPORT_STUB(__imp__IoStartNextPacketByKey);
 REX_EXPORT_STUB(__imp__IoStartPacket);
-REX_EXPORT_STUB(__imp__IoSynchronousFsdRequest);
-REX_EXPORT_STUB(__imp__NtDeleteFile);
-REX_EXPORT_STUB(__imp__NtSetSystemTime);
-REX_EXPORT_STUB(__imp__NtWriteFileGather);
+REX_EXPORT_STUB_RETURN(__imp__IoSynchronousFsdRequest, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__NtDeleteFile, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__NtSetSystemTime, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__NtWriteFileGather, X_STATUS_NOT_IMPLEMENTED);
 REX_EXPORT_STUB(__imp__IoAcquireCancelSpinLock);
 REX_EXPORT_STUB(__imp__IoReleaseCancelSpinLock);
-REX_EXPORT_STUB(__imp__NtCancelIoFile);
-REX_EXPORT_STUB(__imp__NtCancelIoFileEx);
-REX_EXPORT_STUB(__imp__SvodCreateDevice);
+REX_EXPORT_STUB_RETURN(__imp__NtCancelIoFile, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__NtCancelIoFileEx, X_STATUS_NOT_IMPLEMENTED);
+REX_EXPORT_STUB_RETURN(__imp__SvodCreateDevice, X_STATUS_NOT_IMPLEMENTED);
 
 REX_EXPORT_STUB(__imp__SataCdRomRecordReset);
