@@ -10,6 +10,7 @@
  */
 
 #include <assert.h>
+#include <cerrno>
 #include <stdio.h>
 #include <string.h>
 
@@ -202,24 +203,66 @@ class PosixFileHandle : public FileHandle {
   }
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
-    ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    if (out < 0) {
+    // (Hunt v1.4.6, A2-R6-03/A2-R6-09.) Loop until the buffer is full or
+    // EOF: a single pread() can return short, and EINTR is transient, not
+    // EOF -- the old code returned false on EINTR, which HostPathFile
+    // mapped to END_OF_FILE. A null out_bytes_read is safe.
+    if (out_bytes_read) {
       *out_bytes_read = 0;
-      return false;
     }
-    *out_bytes_read = static_cast<size_t>(out);
+    size_t total = 0;
+    auto* out = static_cast<uint8_t*>(buffer);
+    while (total < buffer_length) {
+      ssize_t got = pread(handle_, out + total, buffer_length - total, file_offset + total);
+      if (got < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (out_bytes_read) {
+          *out_bytes_read = total;
+        }
+        return false;
+      }
+      if (got == 0) {
+        break;  // EOF.
+      }
+      total += static_cast<size_t>(got);
+    }
+    if (out_bytes_read) {
+      *out_bytes_read = total;
+    }
     return true;
-  }
+    
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
-    ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    if (out < 0) {
+    // (Hunt v1.4.6, A2-R6-09.) Same loop as Read: EINTR retries, short
+    // pwrite()s are completed, null out_bytes_written is safe.
+    if (out_bytes_written) {
       *out_bytes_written = 0;
-      return false;
     }
-    *out_bytes_written = static_cast<size_t>(out);
+    size_t total = 0;
+    auto* in = static_cast<const uint8_t*>(buffer);
+    while (total < buffer_length) {
+      ssize_t got = pwrite(handle_, in + total, buffer_length - total, file_offset + total);
+      if (got < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (out_bytes_written) {
+          *out_bytes_written = total;
+        }
+        return false;
+      }
+      if (got == 0) {
+        break;  // No progress; report the partial write, not a spin.
+      }
+      total += static_cast<size_t>(got);
+    }
+    if (out_bytes_written) {
+      *out_bytes_written = total;
+    }
     return true;
-  }
+    
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
 
