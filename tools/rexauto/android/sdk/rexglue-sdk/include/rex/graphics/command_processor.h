@@ -275,7 +275,11 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
 
-  bool paused_ = false;
+    // (Hunt v1.4.6, A4-R6-01.) atomic: Pause()/Resume() are now called from
+  // the Android UI thread (via GraphicsSystem::Pause) while the command
+  // processor worker reads this flag. Same pattern as
+  // XmaDecoder::paused_ in the audio subsystem.
+  std::atomic<bool> paused_ = false;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.
