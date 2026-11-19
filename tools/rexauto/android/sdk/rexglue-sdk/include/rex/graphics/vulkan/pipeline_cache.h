@@ -551,7 +551,24 @@ class VulkanPipelineCache {
   // retry stamp, so plain (non-atomic) members.
   uint64_t synchronous_retry_budget_submission_ = 0;
   uint32_t synchronous_retries_this_submission_ = 0;
-  // <Submission index, pipeline>.
+  // <Submission index, pipeline>. The index is the submission after which
+  // the pipeline may be destroyed (ProcessDeferredPipelineDestructions
+  // destroys when index <= completed submission; the queue is sorted by
+  // index).
+  // (Audit BL-2.) Entries are stamped by the command-processor thread,
+  // not by the creation worker: EnsurePipelineCreated enqueues with
+  // kDeferredDestroyUnstamped and EndSubmission stamps it with
+  // GetCurrentSubmission() on first sight. GetCurrentSubmission() reads
+  // submission_completed_ (plain uint64_t) + submissions_in_flight_fences_
+  // .size() (plain vector), both mutated only by the CP thread, so the
+  // worker cannot call it (a torn/low stamp destroys a pipeline the GPU
+  // still uses; an out-of-order stamp leaks entries). Stamping in
+  // TryGetPipelineCreationArgumentsForDescription would be too early:
+  // the old placeholder keeps rendering in later submissions until the
+  // real pipeline is installed, so only a stamp taken at/after the
+  // install is safe. The CP-side stamp is taken later still, which only
+  // delays the destroy by at most one submission.
+  static constexpr uint64_t kDeferredDestroyUnstamped = UINT64_MAX;
   std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_lock_;
 
