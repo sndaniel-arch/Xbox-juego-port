@@ -915,6 +915,14 @@ class Presenter {
   // reconnect every frame.
   bool surface_paint_connection_was_optimal_at_successful_paint_ = false;
 
+  // (Run #16, C-02.) Consecutive suboptimal presents since the connection
+  // was (re)established, and whether the one forced recreate for this
+  // connection already happened. See
+  // presenter_recreate_after_suboptimal_presents. Atomic: PaintAndPresent
+  // can run from more than one thread.
+  std::atomic<uint32_t> consecutive_suboptimal_presents_{0};
+  std::atomic<bool> forced_suboptimal_recreate_done_{false};
+
   // Modifiable only by the UI thread (therefore can be accessed by the UI
   // thread regardless of the paint mode) while (re)connecting painting to the
   // surface.
