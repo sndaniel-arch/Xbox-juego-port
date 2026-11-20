@@ -9,8 +9,10 @@ import android.os.Build;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
@@ -81,11 +83,17 @@ public final class GpuDriver {
      * Mali GPU (PanVK target). Heuristic on Build fields: MediaTek Helio /
      * Dimensity (mt67xx/mt68xx/mt69xx), Exynos, Tensor and Kirin SoCs all
      * ship Mali GPUs, but none of their Build strings contains "mali", so
-     * the SoC families are matched instead. A Mali SoC outside this list is
-     * a false negative — the driver dialog stays reachable anyway, because
-     * {@link #supportsCustomDriver} only excludes GPUs positively known
-     * NOT to work (PowerVR/Apple); the loader falls back to the system
-     * driver when a custom .so fails to load, so showing the option is safe.
+     * the SoC families are matched instead. (Hunt v1.4.6 ronda 3,
+     * A4-R3-06 — the single fix for the duplicate A1-R3-06.) The old list
+     * missed Mali on Unisoc (ums512/ums9230), Rockchip (rk3588/rk3566)
+     * and Amlogic (s905/sm1/g12/sc2), and on API < 31 Build.SOC_MODEL is
+     * unavailable so only HARDWARE/BOARD carry the SoC codename — the
+     * families below are matched on those fields too. A Mali SoC outside
+     * this list is still a false negative — the driver dialog stays
+     * reachable anyway, because {@link #supportsCustomDriver} only
+     * excludes GPUs positively known NOT to work (PowerVR/Apple); the
+     * loader falls back to the system driver when a custom .so fails to
+     * load, so showing the option is safe.
      * toLowerCase(Locale.ROOT): same Turkish-locale reason as isAdreno().
      */
     public static boolean isMali() {
@@ -95,6 +103,10 @@ public final class GpuDriver {
         if (hw.contains("mt67") || hw.contains("mt68") || hw.contains("mt69")) return true; // MediaTek Helio/Dimensity
         if (hw.contains("exynos") || hw.contains("tensor") || hw.contains("gs20") || hw.contains("gs10")) return true;
         if (hw.contains("kirin") || hw.contains("hi36")) return true;
+        if (hw.contains("ums") || hw.contains("unisoc")) return true; // Unisoc (ums512, ums9230)
+        if (hw.contains("rk35") || hw.contains("rockchip")) return true; // Rockchip (rk3588, rk3566)
+        if (hw.contains("s905") || hw.contains("sm1") || hw.contains("g12") || hw.contains("sc2")
+                || hw.contains("amlogic")) return true; // Amlogic (s905, sm1, g12, sc2 families)
         return false;
     }
 
@@ -180,8 +192,35 @@ public final class GpuDriver {
     public File root() { return new File(ctx.getFilesDir(), "gpu_driver"); }
     private File configFile() { return new File(root(), "driver.txt"); }
 
-    /** Selected driver slug, or null for the system driver. */
-    public String selected() { return prefs.getString("selected", null); }
+    /** Selected driver slug, or null for the system driver.
+     * (Hunt v1.4.6 ronda 3, A4-R3-10.) The native loader reads ONLY
+     * driver.txt, so a stale driver.txt with a null pref (process died
+     * between the file write and the pref write in select(slug), or the
+     * pref was cleared/lost) used to keep loading the custom driver
+     * while this returned null. Fall back to the slug in driver.txt:
+     * the file is the durable half of the selection, and the launch-time
+     * switch-off guards consult selected() — with the fallback they now
+     * see the stale selection and clear it. A corrupt/empty file still
+     * returns null; driverConfigExists() covers that case for the guards.
+     */
+public String selected() {
+        String slug = prefs.getString("selected", null);
+    if (slug != null) return slug;
+    File f = configFile();
+    if (!f.isFile()) return null;
+    try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line = r.readLine();
+        if (line == null) return null;
+        int slash = line.indexOf('/');
+        String s = (slash >= 0 ? line.substring(0, slash) : line).trim();
+        return s.isEmpty() ? null : s;
+    } catch (Exception e) {
+            return null;
+    }
+}
+
+    /** True when the native config file exists, even if its slug is unreadable. */
+    public boolean driverConfigExists() { return configFile().exists(); }
 
     public List<Info> installed() {
         List<Info> out = new ArrayList<>();
