@@ -218,7 +218,7 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
   assert_true(one == 1);
   switch (option_id) {
     case 1:
-        // (Hunt v1.4.6, ronda 2, A3-R2-03.) *buffer_size is read and
+      // (Hunt v1.4.6, ronda 2, A3-R2-03.) *buffer_size is read and
       // written and buffer_ptr is memcpied below with no null check
       // (same class as R6-06); a NULL out-param used to touch guest
       // address 0.
@@ -542,7 +542,7 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-// (Hunt v1.4.6, ronda 2, A3-R2-02.) LookupObject returns nullptr
+    // (Hunt v1.4.6, ronda 2, A3-R2-02.) LookupObject returns nullptr
     // for an invalid/closed handle and assert_not_null is a no-op in
     // Release; ev->Set on null used to SIGSEGV the host.
     if (!ev) {
@@ -571,7 +571,7 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-// (Hunt v1.4.6, ronda 2, A3-R2-02.) Same as NetDll_XNetDnsLookup
+    // (Hunt v1.4.6, ronda 2, A3-R2-02.) Same as NetDll_XNetDnsLookup
     // above: a null event used to SIGSEGV the host on ev->Set.
     if (!ev) {
       return X_ERROR_INVALID_HANDLE;
@@ -797,16 +797,16 @@ struct host_set {
     // and UpdateFrom() dereference every stored socket.
     const uint32_t fd_count = std::min((uint32_t)guest_set->fd_count, uint32_t(64));
     uint32_t stored = 0;
-    for (uint32_t i = 0; i < fd_count; ++i) { 
-        auto socket_handle = static_cast<X_HANDLE>(guest_set->fd_array[i]);
+    for (uint32_t i = 0; i < fd_count; ++i) {
+      auto socket_handle = static_cast<X_HANDLE>(guest_set->fd_array[i]);
       if (socket_handle == -1) {
         break;
       }
       // Convert from Xenia -> native
       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
-if (!socket) {
-  continue;
-}
+      if (!socket) {
+        continue;
+      }
       this->sockets[stored++] = socket;
     }
     this->count = stored;
