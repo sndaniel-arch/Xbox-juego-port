@@ -123,7 +123,7 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
   for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
-    // (Hunt v1.4.6, A2-R3-16). The directory_entry member also throws
+    // (Hunt v1.4.6, A2-R3-16.) The directory_entry member also throws
     // without an error_code; use a fresh one per entry, never the
     // iterator's ec.
     std::error_code entry_ec;
@@ -275,7 +275,7 @@ void InitLogging(const LogConfig& config) {
   if (config.log_file) {
     resolved_path = config.log_file;
   } else if (!config.app_name.empty()) {
-        // (Hunt v1.4.6, A2-R3-16). Non-throwing current_path(): on error
+    // (Hunt v1.4.6, A2-R3-16.) Non-throwing current_path(): on error
     // fall back to a relative "logs" directory instead of terminating.
     std::error_code cwd_ec;
     auto cwd = std::filesystem::current_path(cwd_ec);
