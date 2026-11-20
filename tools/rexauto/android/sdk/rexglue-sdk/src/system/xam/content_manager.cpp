@@ -51,9 +51,22 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   auto fs = kernel_state_->file_system();
   auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
                                                                   /*allow_share_delete=*/true);
-  device->Initialize();
+      // (Hunt v1.4.6, A2-R3-15.) The return value used to be ignored, unlike
+      // Runtime::SetupVfs and InstallContent, which both check it:
+      // Initialize() leaves root_entry_ null when the path does not exist
+      // and the device is read-only, and HostPathDevice::ResolvePath then
+      // dereferences it. Do not register a device that failed to initialize
+      // (read_only is false today so it effectively always succeeds, but one
+      // flag flip or one failed create_directories away from a registered
+      // device with a null root). The destructor's unregisters are safe on
+      // an unregistered device/symlink (both return false when not found).
+      if (!device->Initialize()) {
+      REXLOG_ERROR("ContentPackage: failed to initialize device for '{}'", package_path_.string());
+      return;
+    }
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+      device_registered_ = true;
 }
 
 ContentPackage::~ContentPackage() {
@@ -63,7 +76,8 @@ ContentPackage::~ContentPackage() {
 }
 
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
-  if (!std::filesystem::exists(header_path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(header_path, ec)) {
     return;
   }
 
@@ -72,8 +86,11 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
     return;
   }
 
-  auto file_size = std::filesystem::file_size(header_path);
-  if (file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
+  // (Hunt v1.4.6, A2-R3-16.) Non-throwing file_size(): on error treat
+  // the header as unreadable instead of terminating the process.
+  std::error_code size_ec;
+  auto file_size = std::filesystem::file_size(header_path, size_ec);
+  if (size_ec || file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
     fclose(file);
     return;
   }
@@ -203,17 +220,25 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
 
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  std::error_code ec;
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!std::filesystem::exists(package_path, ec)) {
     return nullptr;
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+  // (Hunt v1.4.6, A2-R3-15.) The device may have failed to initialize
+  // (see the ctor): do not hand out a phantom package whose device was
+  // never registered. Callers fail honestly instead.
+  if (!package->is_open()) {
+    return nullptr;
+  }
   return package;
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  std::error_code ec;
+return std::filesystem::exists(path, ec);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
@@ -230,8 +255,10 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
 
-  if (!std::filesystem::exists(parent_path)) {
-    if (!std::filesystem::create_directories(parent_path)) {
+  std::error_code ec_r316_3;
+  if (!std::filesystem::exists(parent_path, ec_r316_3)) {
+    std::error_code ec;
+    if (!std::filesystem::create_directories(parent_path, ec)) {
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -297,10 +324,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
 X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid,
                                                uint32_t title_id, XContentType content_type,
                                                XCONTENT_AGGREGATE_DATA& data) const {
+  std::error_code ec;
   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
-  if (!std::filesystem::exists(header_file_path)) {
+  if (!std::filesystem::exists(header_file_path, ec)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -309,8 +337,10 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  auto file_size = std::filesystem::file_size(header_file_path);
-  if (file_size < header_size) {
+  // (Hunt v1.4.6, A2-R3-16.) Non-throwing file_size(), as above.
+  std::error_code size_ec;
+  auto file_size = std::filesystem::file_size(header_file_path, size_ec);
+  if (size_ec || file_size < header_size) {
     fclose(file);
     return X_ERROR_FILE_NOT_FOUND;
   }
@@ -336,15 +366,23 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     }
   }
 
+  std::error_code ec_r316_2;
   auto package_path = ResolvePackagePath(xuid, data);
-  if (std::filesystem::exists(package_path)) {
+  if (std::filesystem::exists(package_path, ec_r316_2)) {
     return X_ERROR_ALREADY_EXISTS;
-  }
-  if (!std::filesystem::create_directories(package_path)) {
+    }
+std::error_code ec;
+  if (!std::filesystem::create_directories(package_path, ec)) {
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
-  assert_not_null(package);
+  // (Hunt v1.4.6, A2-R3-15.) ResolvePackage returns nullptr when the
+  // package device failed to initialize; the old assert_not_null is a
+  // no-op in Release and package.release() on a null unique_ptr would
+  // have inserted a null package into open_packages_.
+  if (!package) {
+    return X_ERROR_ACCESS_DENIED;
+  }
 
   {
     auto global_lock = global_critical_region_.Acquire();
@@ -366,12 +404,16 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     }
   }
 
+  std::error_code ec;
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!std::filesystem::exists(package_path, ec)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
   auto package = ResolvePackage(root_name, xuid, data);
-  assert_not_null(package);
+  // (Hunt v1.4.6, A2-R3-15.) Same nullptr guard as CreateContent above.
+  if (!package) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
   content_license = package->GetPackageLicense();
@@ -403,10 +445,11 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
 
 X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t>* buffer) {
+  std::error_code ec;
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
   auto thumb_path = package_path / kThumbnailFileName;
-  if (std::filesystem::exists(thumb_path)) {
+  if (std::filesystem::exists(thumb_path, ec)) {
     // R4-F1: OpenFile is plain fopen and returns nullptr on failure, and
     // this used to dereference it unchecked (fseek(nullptr) -> SIGSEGV).
     // Reachable from the game via XamContentGetThumbnail_entry, e.g. if
@@ -452,10 +495,12 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 
 X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t> buffer) {
+  std::error_code ec_r316_1;
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
-  std::filesystem::create_directories(package_path);
-  if (std::filesystem::exists(package_path)) {
+std::error_code ec;
+  std::filesystem::create_directories(package_path, ec);
+  if (std::filesystem::exists(package_path, ec_r316_1)) {
     auto thumb_path = package_path / kThumbnailFileName;
     // R4-F1: same unchecked-OpenFile hole as GetContentThumbnail (fopen
     // returns nullptr; fwrite(nullptr) crashes), reachable from the game
@@ -741,7 +786,8 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
 }
 
 X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
-  if (!std::filesystem::exists(package_path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(package_path, ec)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -832,8 +878,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
   }
 
   // Create destination directory
-  std::error_code ec;
-  std::filesystem::create_directories(install_path, ec);
+    std::filesystem::create_directories(install_path, ec);
   if (ec) {
     return X_ERROR_ACCESS_DENIED;
   }
