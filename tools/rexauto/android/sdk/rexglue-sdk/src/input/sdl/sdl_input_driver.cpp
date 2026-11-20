@@ -455,8 +455,8 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   // ADD was ever observed, so the guard is defense in depth.)
   if (GetControllerIndexFromInstanceID(event.gdevice.which)) {
     REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored duplicate ADD for instance {}.",
-                    static_cast<int>(event.gdevice.which));
-        return;
+                static_cast<int>(event.gdevice.which));
+    return;
   }
   const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
@@ -465,7 +465,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     // the open vanished with no log line at all. Log the real SDL error
     // with the instance id; SDL will not re-send ADD for this pad.
     REXLOG_ERROR("SDL OnControllerDeviceAdded: SDL_OpenGamepad({}) failed: {}",
-                     static_cast<int>(event.gdevice.which), SDL_GetError());
+                 static_cast<int>(event.gdevice.which), SDL_GetError());
     return;
   }
   REXLOG_INFO(
@@ -569,10 +569,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
           X_INPUT_GAMEPAD_DPAD_RIGHT,
           // There are additional buttons only available on some controllers.
           // (Hunt v1.4.6 ronda 3, A4-R3-13.) The old table mapped these to
-  // face buttons / Guide, so an Xbox Elite paddle fired Y/B/X/A in
-  // game and a PS touchpad click fired Guide. 0 is no XInput bit:
-  // pressing one now does nothing, like the unknown-button path
-  // below, instead of pressing a button the player never touched.
+          // face buttons / Guide, so an Xbox Elite paddle fired Y/B/X/A in
+          // game and a PS touchpad click fired Guide. 0 is no XInput bit:
+          // pressing one now does nothing, like the unknown-button path
+          // below, instead of pressing a button the player never touched.
           // Misc:
           0,
           // Xbox Elite paddles:
