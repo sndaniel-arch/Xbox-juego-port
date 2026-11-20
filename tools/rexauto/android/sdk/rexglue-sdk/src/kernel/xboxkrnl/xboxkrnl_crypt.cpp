@@ -650,8 +650,13 @@ u32 XeKeysHmacShaUsingKey_entry(mapped_void obscured_key, mapped_void inp_1, u32
 }
 
 u32 XeKeysConsolePrivateKeySign_entry(mapped_void hash, mapped_void signature) {
+  // (Hunt v1.4.6, ronda 2, A3-R2-04.) Was 0 (success) without ever
+  // writing the out-param signature: a caller that used the "signature"
+  // read uninitialized guest memory. The console private key is not
+  // available to the emulator, so signing cannot be implemented --
+  // fail honestly (same class as R6-05) instead of lying success.
   REXKRNL_DEBUG("XeKeysConsolePrivateKeySign - stub");
-  return 0;  // Success
+  return X_STATUS_NOT_IMPLEMENTED;
 }
 
 u32 XeKeysConsoleSignatureVerification_entry(mapped_void hash, mapped_void signature,
