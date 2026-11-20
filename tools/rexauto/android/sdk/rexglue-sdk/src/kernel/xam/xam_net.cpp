@@ -218,6 +218,13 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
   assert_true(one == 1);
   switch (option_id) {
     case 1:
+        // (Hunt v1.4.6, ronda 2, A3-R2-03.) *buffer_size is read and
+      // written and buffer_ptr is memcpied below with no null check
+      // (same class as R6-06); a NULL out-param used to touch guest
+      // address 0.
+      if (!buffer_size || !buffer_ptr) {
+        return 0x2726;  // WSAEINVAL
+      }
       if (*buffer_size < sizeof(XNetStartupParams)) {
         *buffer_size = sizeof(XNetStartupParams);
         return 0x2738;  // WSAEMSGSIZE
@@ -231,6 +238,12 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
 }
 
 u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
+  // (Hunt v1.4.6, ronda 2 second sweep, LOW-4.) Null guest pointer: same
+  // R6-06 class as the GetOpt guard above — return WSAEFAULT instead of
+  // faulting the host on the memset.
+  if (!buffer_ptr) {
+    return 0x271E;  // WSAEFAULT
+  }
   // For now, constant values.
   // This makes replicating things easier.
   std::memset(buffer_ptr, 0xBB, length);
@@ -436,6 +449,12 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  // (Hunt v1.4.6, ronda 2 second sweep, LOW-4.) Null guest pointer: same
+  // R6-06 class as the GetOpt guard — return NONE (the graceful "no address"
+  // status) instead of faulting the host on the dereference.
+  if (!addr_ptr) {
+    return XnAddrStatus::XNET_GET_XNADDR_NONE;
+  }
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -460,6 +479,10 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  // (Hunt v1.4.6, ronda 2 second sweep, LOW-4.) See XNetGetTitleXnAddr above.
+  if (!addr_ptr) {
+    return XnAddrStatus::XNET_GET_XNADDR_NONE;
+  }
   addr_ptr.Zero();
 
   // XNET_GET_XNADDR_NONE causes caller to gracefully return.
@@ -519,7 +542,12 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-    assert_not_null(ev);
+// (Hunt v1.4.6, ronda 2, A3-R2-02.) LookupObject returns nullptr
+    // for an invalid/closed handle and assert_not_null is a no-op in
+    // Release; ev->Set on null used to SIGSEGV the host.
+    if (!ev) {
+      return X_ERROR_INVALID_HANDLE;
+    }
     ev->Set(0, false);
   }
   return 0;
@@ -543,7 +571,11 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-    assert_not_null(ev);
+// (Hunt v1.4.6, ronda 2, A3-R2-02.) Same as NetDll_XNetDnsLookup
+    // above: a null event used to SIGSEGV the host on ev->Set.
+    if (!ev) {
+      return X_ERROR_INVALID_HANDLE;
+    }
     ev->Set(0, false);
   }
   return 0;
@@ -756,19 +788,28 @@ struct host_set {
   object_ref<XSocket> sockets[64];
 
   void Load(const x_fd_set* guest_set) {
-    assert_true(guest_set->fd_count < 64);
-    this->count = guest_set->fd_count;
-    for (uint32_t i = 0; i < this->count; ++i) {
-      auto socket_handle = static_cast<X_HANDLE>(guest_set->fd_array[i]);
+    // (Hunt v1.4.6, ronda 2, A3-R2-01.) fd_count is guest-controlled
+    // and assert_true is a no-op in Release, so the old uncapped
+    // assignment let a count > 64 overflow sockets[64] on the host
+    // stack. Clamp to the array size (same pattern as
+    // NetDll___WSAFDIsSet below); an invalid/closed handle resolves
+    // to a null socket, which is skipped instead of stored -- Store()
+    // and UpdateFrom() dereference every stored socket.
+    const uint32_t fd_count = std::min((uint32_t)guest_set->fd_count, uint32_t(64));
+    uint32_t stored = 0;
+    for (uint32_t i = 0; i < fd_count; ++i) { 
+        auto socket_handle = static_cast<X_HANDLE>(guest_set->fd_array[i]);
       if (socket_handle == -1) {
-        this->count = i;
         break;
       }
       // Convert from Xenia -> native
       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
-      assert_not_null(socket);
-      this->sockets[i] = socket;
+if (!socket) {
+  continue;
+}
+      this->sockets[stored++] = socket;
     }
+    this->count = stored;
   }
 
   void Store(x_fd_set* guest_set) {
