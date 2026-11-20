@@ -1534,9 +1534,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     auto failed_it = etc2_failed_textures_.find(texture_key);
     if (failed_it != etc2_failed_textures_.end()) {
       const bool on_cooldown =
-        failed_it->second.consecutive_failures >= kEtc2MaxConsecutiveFailures &&
-      submission_current - failed_it->second.last_failure_submission <=
-          kEtc2FailureCooldownSubmissions;
+          failed_it->second.consecutive_failures >= kEtc2MaxConsecutiveFailures &&
+          submission_current - failed_it->second.last_failure_submission <=
+              kEtc2FailureCooldownSubmissions;
       if (on_cooldown) {
         return false;
       }
@@ -1621,35 +1621,35 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       for (uint32_t slice = (loop_level == resume_loop_level ? resume_slice : 0);
            slice < array_size; ++slice) {
         // (Hunt v1.4.6 round 2, A1-R2-02.) A slice that does not fit in
-             // one staging page can never be staged: for 3D textures a single
-             // slice spans the whole depth (level_depth > 1), so e.g. a
-             // 512x512x128 ETC2 RGBA level is 32 MiB against a 16 MiB page,
-             // and Request() below would return nullptr on every attempt.
-             // That failure is deterministic, not transient: serve the 1x1
-             // placeholder directly instead of spending three failure records
-             // and a cooldown on retries that can never succeed. The check
-             // runs before the budget below so an unstageable slice does not
-             // consume this submission's transcode budget, and it breaks
-             // (rather than returning) so slices already transcoded in this
-             // call are still uploaded below. 2D/cube/array slices stay
-             // within a page (level_depth == 1, at most 4096x4096 = 16 MiB).
-             if (slice_size > kEtc2UploadPoolPageSize) {
-               // Log once per texture (like MarkTexturePlaceholder below):
-               // a permanently oversized texture retries every submission,
-               // and a WARN per retry would flush to disk every frame.
-               if (!IsTexturePlaceholder(texture_key)) {
-                 REXGPU_WARN(
-                   "VulkanTextureCache: Texture {}x{} {} level {} slice ({}x{}x{}) is {} MiB, "
-                 "larger than the 16 MiB staging page; serving the 1x1 placeholder image",
-                 width, height, FormatInfo::Get(guest_format)->name, loop_level, level_width,
-                 level_height, level_depth, slice_size / (1024 * 1024));
-               }
-               vulkan_texture.SetEtc2Progress(loop_level, slice);
-               MarkTexturePlaceholder(texture_key);
-               etc2_load_complete = false;
-               break;
-             }
-                 // (Audit A-3a, fixed by A1-R6-01.) Per-submission transcode
+        // one staging page can never be staged: for 3D textures a single
+        // slice spans the whole depth (level_depth > 1), so e.g. a
+        // 512x512x128 ETC2 RGBA level is 32 MiB against a 16 MiB page,
+        // and Request() below would return nullptr on every attempt.
+        // That failure is deterministic, not transient: serve the 1x1
+        // placeholder directly instead of spending three failure records
+        // and a cooldown on retries that can never succeed. The check
+        // runs before the budget below so an unstageable slice does not
+        // consume this submission's transcode budget, and it breaks
+        // (rather than returning) so slices already transcoded in this
+        // call are still uploaded below. 2D/cube/array slices stay
+        // within a page (level_depth == 1, at most 4096x4096 = 16 MiB).
+        if (slice_size > kEtc2UploadPoolPageSize) {
+          // Log once per texture (like MarkTexturePlaceholder below):
+          // a permanently oversized texture retries every submission,
+          // and a WARN per retry would flush to disk every frame.
+          if (!IsTexturePlaceholder(texture_key)) {
+            REXGPU_WARN(
+                "VulkanTextureCache: Texture {}x{} {} level {} slice ({}x{}x{}) is {} MiB, "
+                "larger than the 16 MiB staging page; serving the 1x1 placeholder image",
+                width, height, FormatInfo::Get(guest_format)->name, loop_level, level_width,
+                level_height, level_depth, slice_size / (1024 * 1024));
+          }
+          vulkan_texture.SetEtc2Progress(loop_level, slice);
+          MarkTexturePlaceholder(texture_key);
+          etc2_load_complete = false;
+          break;
+        }
+        // (Audit A-3a, fixed by A1-R6-01.) Per-submission transcode
         // budget: the decode + re-encode below runs synchronously on the
         // graphics thread, so an unbounded number of blocks in one
         // submission stalls the frame. At most
@@ -1675,12 +1675,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         }
         etc2_budget_.blocks_used += slice_blocks;
         // One Request per (level, slice): a single level slice is at most
-             // one pool page for 2D/cube/array (4096x4096 ETC2 RGBA,
-             // level_depth == 1). A 3D slice can be larger -- it spans the
-             // whole depth -- and is caught by the oversized check above, so
-             // reaching this Request means the slice fits. A nullptr here is
-             // a transient staging failure, retried on the next frame like a
-             // scratch buffer allocation failure.
+        // one pool page for 2D/cube/array (4096x4096 ETC2 RGBA,
+        // level_depth == 1). A 3D slice can be larger -- it spans the
+        // whole depth -- and is caught by the oversized check above, so
+        // reaching this Request means the slice fits. A nullptr here is
+        // a transient staging failure, retried on the next frame like a
+        // scratch buffer allocation failure.
         VkBuffer upload_buffer = VK_NULL_HANDLE;
         VkDeviceSize upload_offset = 0;
         uint8_t* upload_mapping = etc2_upload_pool_->Request(
