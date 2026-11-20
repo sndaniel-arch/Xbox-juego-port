@@ -364,7 +364,17 @@ public final class GraphicsSettings {
                 preserved.clear();
             }
         }
-        try (PrintWriter w = new PrintWriter(new FileWriter(f, false))) {
+        // (Hunt v1.4.6 ronda 2, A4-R2-02.) Write to settings.txt.tmp and
+        // rename over settings.txt, exactly as GpuDriver.select() does for
+        // driver.txt: the old code truncated the live file first and then
+        // wrote line by line, so a kill/crash mid-write left a torn
+        // settings.txt (e.g. license_mask lost -> DLCs off for a session).
+        // The rename is atomic on the same directory, so the live file is
+        // either the old complete one or the new complete one. No fsync:
+        // select() does not do one either.
+        File tmp = new File(parent != null ? parent : f.getAbsoluteFile().getParentFile(),
+                f.getName() + ".tmp");
+        try (PrintWriter w = new PrintWriter(new FileWriter(tmp, false))) {
             w.println("# Child of Light — settings - one cvar per line");
             for (Map.Entry<String, String> e : cvars.entrySet()) {
                 w.println(e.getKey() + "=" + e.getValue());
@@ -377,7 +387,17 @@ public final class GraphicsSettings {
             // E/S: sin checkError() un settings.txt truncado o vacio (disco
             // lleno, almacenamiento retirado) parecia escrito y el arranque
             // siguiente corria con los defaults del SDK sin avisar.
-            if (w.checkError()) throw new IOException("write " + f);
+            if (w.checkError()) throw new IOException("write " + tmp);
+        } catch (IOException e) {
+            // (Round 2 second sweep, LOW-3.) Don't leave a stale .tmp behind
+            // on the failure path: nothing reads *.tmp, but delete it here
+            // like the rename failure below does.
+            tmp.delete();
+            throw e;
+        }
+        if (!tmp.renameTo(f)) {
+            tmp.delete();
+            throw new IOException("write " + f);
         }
     }
 }
