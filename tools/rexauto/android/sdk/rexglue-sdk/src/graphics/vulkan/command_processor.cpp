@@ -3552,8 +3552,14 @@ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::Acquire
   scratch_buffer_ = new_scratch_buffer;
   scratch_buffer_size_ = size;
   // Not used yet, no need for a barrier.
-  scratch_buffer_last_stage_mask_ = initial_access_mask;
-  scratch_buffer_last_access_mask_ = initial_stage_mask;
+  // (Hunt v1.4.6 round 3, A1-R3-02.) These were crossed (stage <- access,
+  // access <- stage); the reuse path above assigns them straight, and the
+  // ScratchBufferAcquisition destructor writes the correct masks back on
+  // every load, which is why the typo was latent -- but a future reader of
+  // these members mid-acquisition would have built a barrier with a stage
+  // mask in the access slot and vice versa.
+  scratch_buffer_last_stage_mask_ = initial_stage_mask;
+  scratch_buffer_last_access_mask_ = initial_access_mask;
   scratch_buffer_last_usage_submission_ = submission_current;
   scratch_buffer_used_ = true;
   return ScratchBufferAcquisition(*this, new_scratch_buffer, initial_stage_mask,
@@ -4588,6 +4594,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      vulkan_device->properties();
 
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
@@ -4697,6 +4705,25 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     if (!scaled_length) {
       return true;
     }
+    // (Hunt v1.4.6 round 3, V-02 second sweep — same maxStorageBufferRange
+    // class as A1-R3-01.) The descriptor below must cover [scaled_start,
+    // scaled_start + scaled_length); a single range over the whole
+    // scaled resolve buffer (512 MiB x scale area) would exceed
+    // maxStorageBufferRange (128 MiB minimum). Refuse deterministically
+    // instead, like the other bail-outs in this function (readback just
+    // isn't updated this frame).
+    if (scaled_length > device_properties.maxStorageBufferRange) {
+      static bool downscale_range_oversize_logged = false;
+      if (!downscale_range_oversize_logged) {
+        downscale_range_oversize_logged = true;
+        REXGPU_WARN(
+            "VulkanCommandProcessor: Scaled resolve range ({} MiB) exceeds "
+            "maxStorageBufferRange ({} MiB); skipping readback downscale",
+            scaled_length >> 20,
+            uint64_t(device_properties.maxStorageBufferRange) >> 20);
+      }
+      return true;
+    }
 
     VkBuffer scaled_resolve_buffer = texture_cache_->scaled_resolve_buffer();
     if (scaled_resolve_buffer == VK_NULL_HANDLE || scaled_start > uint64_t(UINT32_MAX)) {
@@ -4744,9 +4771,18 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     VkDescriptorBufferInfo buffer_infos[2] = {};
+    // (Hunt v1.4.6 round 3, V-02 second sweep.) The source descriptor used
+    // to be offset 0 / VK_WHOLE_SIZE over the whole scaled resolve buffer
+    // (512 MiB x scale area) — invalid usage past maxStorageBufferRange
+    // (128 MiB minimum). Bound it to the [scaled_start, scaled_start +
+    // scaled_length) range GetScaledResolveRange computed above (and
+    // validated against maxStorageBufferRange there too). The shader
+    // indexes the source buffer from source_offset_bytes, so that
+    // constant moves to 0 with the descriptor base — otherwise the base
+    // would be counted twice (resolve_downscale.cs.glsl:80-82).
     buffer_infos[0].buffer = scaled_resolve_buffer;
-    buffer_infos[0].offset = 0;
-    buffer_infos[0].range = VK_WHOLE_SIZE;
+    buffer_infos[0].offset = scaled_start;
+    buffer_infos[0].range = scaled_length;
     buffer_infos[1].buffer = resolve_downscale_buffer_;
     buffer_infos[1].offset = 0;
     buffer_infos[1].range = written_length;
@@ -4785,7 +4821,12 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     constants.scale_y = texture_cache_->draw_resolution_scale_y();
     constants.pixel_size_log2 = pixel_size_log2;
     constants.tile_count = tile_count;
-    constants.source_offset_bytes = uint32_t(scaled_start);
+    // (Hunt v1.4.6 round 3, V-02 second sweep.) 0, not scaled_start: the
+    // source descriptor base moved to scaled_start above, and the shader
+    // adds source_offset_bytes to its descriptor-relative index
+    // (resolve_downscale.cs.glsl:80-82) — keeping scaled_start here would
+    // count the base twice.
+    constants.source_offset_bytes = 0;
     constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u
