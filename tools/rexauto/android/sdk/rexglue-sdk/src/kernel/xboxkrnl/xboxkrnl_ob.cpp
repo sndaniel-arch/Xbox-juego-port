@@ -155,10 +155,15 @@ u32 ObReferenceObjectByHandle_entry(u32 handle, u32 object_type_ptr, mapped_u32 
 
   // Caller takes the reference.
   // It's released in ObDereferenceObject.
-  object->RetainHandle();
-  if (out_object_ptr.guest_address()) {
-    *out_object_ptr = native_ptr;
+  // (Hunt v1.4.6, ronda 3, A3-R3-14.) Checked before RetainHandle: a
+  // NULL out_object_ptr used to retain the handle and then skip the
+  // write, leaking the reference on a call that still returned
+  // SUCCESS. Same order the sibling entries already document.
+  if (!out_object_ptr.guest_address()) {
+    return X_STATUS_INVALID_PARAMETER;
   }
+  object->RetainHandle();
+  *out_object_ptr = native_ptr;
   REXKRNL_IMPORT_RESULT("ObReferenceObjectByHandle", "0x0 obj={:#x}", native_ptr);
   return X_STATUS_SUCCESS;
 }
@@ -247,6 +252,13 @@ u32 NtClose_entry(u32 handle) {
 }
 
 u32 NtQueryEvent_entry(u32 handle, mapped_u32 out_struc) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-11.) The handle lookup below is
+  // guarded but out_struc was not: a NULL out-pointer wrote the event
+  // type/state through a null host pointer.
+  if (!out_struc) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
