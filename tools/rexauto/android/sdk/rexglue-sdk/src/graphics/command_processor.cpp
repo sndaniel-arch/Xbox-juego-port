@@ -159,7 +159,7 @@ void CommandProcessor::Shutdown() {
   // `if (paused_) Resume();` before waiting for its worker.
   if (paused_) {
     Resume();
-    }
+  }
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
 }
