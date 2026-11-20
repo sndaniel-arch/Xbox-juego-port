@@ -149,6 +149,15 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                       be<uint32_t>* setting_ids, uint32_t unk,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-22.) xuids and setting_ids were the
+  // two pointers in this function without a guard (buffer_size_ptr
+  // and buffer both have one below): xuid_count > 0 with NULL xuids
+  // dereferenced xuids[0] at the assert below, and setting_ids[i] is
+  // read in three loops. The assert_not_null on xuids is a no-op in
+  // Release.
+  if ((xuid_count && !xuids) || !setting_ids) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   if (!xuid_count) {
     assert_null(xuids);
   } else {
