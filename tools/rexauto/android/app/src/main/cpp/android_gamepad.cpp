@@ -89,7 +89,7 @@ bool AttachLocked() {
   desc.axis_mask = kAxisMask;
   desc.vendor_id = kVendorId;
   desc.product_id = kProductId;
-  desc.name = "Dante's Inferno Touch Pad";
+  desc.name = "Child of Light Touch Pad";
 
   g_instance = SDL_AttachVirtualJoystick(&desc);
   if (!g_instance) {
