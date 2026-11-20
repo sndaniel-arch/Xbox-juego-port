@@ -109,7 +109,6 @@ auto best = symlinks_.cend();
     return false;
   }
   target = best->second;
-
   return true;
 }
 
