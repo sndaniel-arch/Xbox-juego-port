@@ -55,7 +55,13 @@ public class MainActivity extends SDLActivity {
         if (!new GraphicsSettings(this).experimentalGpuDriver()) {
             try {
                 GpuDriver gd = new GpuDriver(this);
-                if (gd.selected() != null) gd.select(null);
+                // (Hunt v1.4.6 ronda 3, A4-R3-10.) Also clear when only
+                // driver.txt survives (selected() now falls back to the
+                // file, and driverConfigExists() covers a corrupt file
+                // whose slug cannot be read): the old selected()-only
+                // guard skipped the clear and the custom driver kept
+                // loading while the switch claimed it was off.
+                if (gd.selected() != null || gd.driverConfigExists()) gd.select(null);
             } catch (Exception e) {
                 // (Hunt v1.4.6, sweep of R-A-M1.) select(null) throws when
                 // the driver.txt delete fails; swallowing it left the
@@ -212,11 +218,37 @@ public class MainActivity extends SDLActivity {
         if (!mHasMultiWindow) pauseEmulation();
         super.onPause();
     }
+    /**
+     * (Hunt v1.4.6 ronda 3, A4-R3-03.) Focus loss pauses the SDL thread
+     * but NOT the guest: opening any in-game dialog (gear menu, graphics
+     * / logs / driver) froze rendering while the simulation kept
+     * advancing behind it. Mirror the onPause/onResume split on focus
+     * change, only when not multi-window — the same split SDLActivity's
+     * own onWindowFocusChanged uses for its native pause. Emulation goes
+     * first (as in onPause/onResume below), then SDL's own handling, so
+     * the guest stops before the SDL thread parks and resumes before it
+     * unparks. Pause/resume are idempotent natively, so a focus change
+     * arriving together with onPause/onResume (Home, incoming call,
+     * screen-off) is a harmless second call, and a focus change before
+     * the runtime exists is a no-op.
+     */
+@Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        if (!mHasMultiWindow) {
+            if (hasFocus) resumeEmulation(); else pauseEmulation();
+        }
+        super.onWindowFocusChanged(hasFocus);
+    }
 
     @Override
     protected void onResume() {
-        super.onResume();
+        // (Hunt v1.4.6 ronda 3, A4-R3-09.) The old order resumed the SDL
+        // thread (super.onResume) before the emulation, the reverse of
+        // onPause: the guest CPU threads ran a window while the CP was
+        // still suspended and vblank interrupts resumed. Resume the
+        // emulation first, mirroring onPause.
         if (!mHasMultiWindow) resumeEmulation();
+        super.onResume();
     }
 
     @Override
@@ -227,8 +259,10 @@ public class MainActivity extends SDLActivity {
 
     @Override
     protected void onStart() {
-        super.onStart();
+        // (A4-R3-09, multi-window half.) Same reversal as onResume: the
+        // emulation resumes before the SDL thread, mirroring onStop.
         if (mHasMultiWindow) resumeEmulation();
+        super.onStart();
     }
 
     /**
