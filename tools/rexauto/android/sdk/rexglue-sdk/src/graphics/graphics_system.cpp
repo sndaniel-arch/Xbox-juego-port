@@ -185,12 +185,20 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           // vblank rate. Cvars are mutable at runtime (settings overlay /
           // console), and the guest may ask for another mode later, so
           // re-read once per guest-second and rebuild the interval when
-          // the effective rate moved. The guest interrupt handler itself
+          // the effective rate moved.
+          //
+          // (Hunt v1.4.6, R-C-11.) The guest interrupt handler itself
           // stays synchronous (MarkVblank -> DispatchInterruptCallback ->
           // ExecuteInterrupt, which has no timeout): making it async is
           // pending -- the command processor blocks waiting for interrupt
           // code to run, so an async handler needs an ordering analysis
-          // first. See evidence.
+          // first. What this batch does bound the damage instead:
+          // (a) while paused (A4-R6-01: app backgrounded, command
+          // processor suspended) no vblank is dispatched at all and the
+          // backlog is dropped, not banked for resume; (b) if the
+          // handler was starved for any other reason, at most 2 stale
+          // vblanks fire per iteration and the rest are dropped instead
+          // of a burst that re-enters the guest N times in a row.
           if (guest_tick_frequency > 0 &&
               current_time - last_mode_check_time >= guest_tick_frequency) {
             last_mode_check_time = current_time;
@@ -212,9 +220,20 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
-            MarkVblank();
-            last_frame_time += interval_ticks;
+          if (paused_) {
+            // Paused: drop the backlog (see comment above) instead of
+            // firing it as a burst on resume.
+            last_frame_time = current_time;
+          } else {
+            // Cap the catch-up burst at 2 stale vblanks per iteration.
+            uint64_t missed = (current_time - last_frame_time) / interval_ticks;
+            if (missed > 2) {
+              last_frame_time = current_time - 2 * interval_ticks;
+            }
+            while (current_time - last_frame_time >= interval_ticks) {
+              MarkVblank();
+              last_frame_time += interval_ticks;
+            }
           }
           // When time scalar > 1 (fast-forward), yield instead of sleeping
           // to allow vblanks to fire as fast as the guest clock advances.
