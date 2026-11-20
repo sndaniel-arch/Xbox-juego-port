@@ -35,13 +35,12 @@ publica APKs ni builds**: no hay releases ni artefactos con el juego.
 
 En el hardware de pruebas (Helio G99 + Mali-G57 MC2), el proyecto hermano
 Zandatsu documenta que el renderer nativo Vulkan **pierde el dispositivo
-a los ~4 s** de abrir (causa desconocida). El launcher NO aplica ningún
-perfil Mali-G57 por detección: usa defaults globales pensados para Mali
-(preset Performance por defecto; sin `vertexPipelineStoresAndAtomics`;
-interruptor experimental para los requisitos de fragment stores). Lo de
-"sin `shaderInt64`" es ausencia por omisión en el código propio, no un
-ajuste. El
-plugin de GPU emulada (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige
+a los ~4 s** de abrir (causa desconocida). Por eso el launcher lleva un
+perfil Mali-G57: la detección de GPU elige el .so del driver (PanVK en
+Mali) y los ajustes apagan las consultas de oclusión y el MSAA 2× nativo
+en Mali. Vulkan 1.1, 4 descriptor sets y sin `shaderInt64` son
+restricciones del traductor/driver, no interruptores del launcher (ver
+`docs/RENDIMIENTO.md`). El plugin de GPU emulada (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige
 al arrancar: si el dispositivo Vulkan se pierde, el runtime aborta con
 `FatalError` — no hay cambio automático a otro backend en caliente. Se
 valida solo en el teléfono real.
