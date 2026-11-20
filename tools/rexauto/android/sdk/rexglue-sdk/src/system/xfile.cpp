@@ -385,8 +385,33 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
     rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
     const rex::memory::BaseHeap* buffer_end_heap =
         memory()->LookupHeap(buffer_guest_high_address);
-    if (!buffer_start_heap || !buffer_end_heap ||
-     
+        if (!buffer_start_heap || !buffer_end_heap ||
+        (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
+            (buffer_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
+        (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical &&
+         buffer_start_heap != buffer_end_heap)) {
+      result = X_STATUS_ACCESS_VIOLATION;
+    } else {
+      rex::memory::PhysicalHeap* buffer_physical_heap =
+          buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
+              ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
+              : nullptr;
+      if (buffer_physical_heap && buffer_physical_heap->QueryRangeAccess(
+                                      buffer_guest_address, buffer_guest_high_address) !=
+                                                                            memory::PageAccess::kReadWrite) {
+        result = X_STATUS_ACCESS_VIOLATION;
+      } else {
+        result = file_->WriteSync(
+            std::span<const uint8_t>(
+                buffer_physical_heap
+                    ? memory()->TranslatePhysical(
+                          buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+                    : memory()->TranslateVirtual(buffer_guest_address),
+                buffer_length),
+            size_t(byte_offset), &bytes_written);
+      }
+    }
+  }
   if (XSUCCEEDED(result)) {
     // (Hunt v1.4.6, A2-R2-02.) Mirror ReadInternal (R5-D2): position_ must
     // track the offset actually written, including an explicit one: the
