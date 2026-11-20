@@ -110,7 +110,14 @@ public final class GpuDriver {
         return !isKnownUnsupportedGpu();
     }
 
-    /** Driver family from the library name: "panvk", "turnip", or "unknown". */
+    /**
+     * Driver family from the library name: "panvk", "turnip", or "unknown".
+     * Library-name-only: it cannot tell the GameHub PanVK pack apart from
+     * real Turnip — that zip names its library libvulkan_freedreno.so
+     * (vulkan_device.cpp, R6-E1) — so isPanvk() below must not rely on
+     * this alone. Kept as the library-name signal for pickLibrary-style
+     * matching; the family decision lives in isPanvk(Info).
+     */
     public static String familyOfLibrary(String library) {
         if (library == null) return "unknown";
         String l = library.toLowerCase(Locale.ROOT);
@@ -124,9 +131,42 @@ public final class GpuDriver {
         return "unknown";
     }
 
-    /** True when this installed driver is a PanVK (Mesa/Mali) build. */
+    private static boolean containsPanvk(String s) {
+        if (s == null) return false;
+        String l = s.toLowerCase(Locale.ROOT);
+        return l.contains("panfrost") || l.contains("panvk");
+    }
+
+    /**
+     * True when this installed driver is a PanVK (Mesa/Mali) build.
+     * (Hunt v1.4.6 ronda 2, A4-R2-01.) The library name alone is NOT
+     * enough: the GameHub PanVK zip names its library
+     * libvulkan_freedreno.so, so familyOfLibrary() says "turnip" for a
+     * pack that really is PanVK, the R-A-M6 relax never fired, and the
+     * game could not boot on it (vulkan_device.cpp returns nullptr
+     * without fragmentStoresAndAtomics). There is no driverID to consult
+     * here — settings.txt is written before launch, and the driverID is
+     * only known natively after device creation — so the classifier uses
+     * the signals that ARE present at classification time, in the
+     * Info the zip's meta.json already carries:
+     *  1. a panvk/panfrost library name (as before);
+     *  2. a panvk/panfrost meta name, vendor or description;
+     *  3. a freedreno/turnip library name on a Mali GPU: Turnip is
+     *     Adreno-only, so a freedreno-named pack on Mali is the GameHub
+     *     PanVK pack (same ambiguity the native R6-E1 check already
+     *     accepts for those names). A genuine Turnip pack mis-installed
+     *     on Mali is harmless here: its .so cannot load on Mali, the
+     *     hook falls back to the system driver, which HAS the feature.
+     * "mesa" alone is deliberately NOT a signal: Mesa ships both
+     * Turnip and PanVK.
+     */
     public static boolean isPanvk(Info info) {
-        return info != null && "panvk".equals(familyOfLibrary(info.library));
+        if (info == null) return false;
+        if ("panvk".equals(familyOfLibrary(info.library))) return true;
+        if (containsPanvk(info.name) || containsPanvk(info.vendor)
+                || containsPanvk(info.description)) return true;
+        if ("turnip".equals(familyOfLibrary(info.library)) && isMali()) return true;
+        return false;
     }
 
     /** Display name of the selected driver, or the slug when its meta is gone. */
