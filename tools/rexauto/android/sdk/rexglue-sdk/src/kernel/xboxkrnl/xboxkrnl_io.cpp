@@ -166,7 +166,12 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       object_attrs->root_directory != 0) {
     auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
-    assert_not_null(root_file);
+    // (Hunt v1.4.6, ronda 2, A3-R2-02.) LookupObject returns nullptr
+    // for an invalid/closed handle and assert_not_null is a no-op in
+    // Release; root_file->type() on null used to SIGSEGV the host.
+    if (!root_file) {
+      return X_STATUS_INVALID_HANDLE;
+    }
     assert_true(root_file->type() == XObject::Type::File);
 
     root_entry = root_file->entry();
@@ -624,7 +629,11 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
   if (obj_attribs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       obj_attribs->root_directory != 0) {
     root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(obj_attribs->root_directory);
-    assert_not_null(root_file);
+    // (Hunt v1.4.6, ronda 2, A3-R2-02.) Same as NtCreateFile above:
+    // a null root_file used to SIGSEGV the host on ->type().
+    if (!root_file) {
+      return X_STATUS_INVALID_HANDLE;
+    }
     assert_true(root_file->type() == XObject::Type::File);
     assert_always();
   }
@@ -877,14 +886,17 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
         backoff_ms = movie->IoctlBackoffMs();
         streak = movie->ConsecutiveIoctlCount();
       }
-      if (streak <= 8 || streak % 16 == 0 || terminate) {
+      // (Round 2 second sweep, LOW-2.) Log the termination exactly once:
+      // 64 % 16 == 0, so a bare `streak == 64` term would repeat at 80, 96,
+      // ... — gate the throttled cadence on !terminate instead.
+      if ((streak <= 8 || streak % 16 == 0) && !terminate || streak == 64) {
         REXKRNL_WARN(
             "NtDeviceIoControlFile(xbmovie): ioctl={:#x} in_len={} out_len={} streak={}{}",
             io_control_code, input_buffer_len, output_buffer_len, streak,
             terminate ? " -> END_OF_FILE (start retry limit reached, movie ended)" : "");
       }
       X_STATUS status = terminate ? X_STATUS_END_OF_FILE : X_STATUS_NOT_IMPLEMENTED;
-      if (backoff_ms > 0 && !terminate) {
+      if (backoff_ms > 0) {
         rex::thread::Sleep(std::chrono::milliseconds(backoff_ms));
       }
       complete_io(status, 0);
