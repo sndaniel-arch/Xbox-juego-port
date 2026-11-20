@@ -14,6 +14,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -95,14 +96,23 @@ class XbMovieFile : public File {
   // from NtReadFile after XFile::Read returns) run with NO XFile lock
   // held, while WriteSync / SetLength reset the same counters under
   // file_lock_. Two guest threads on one handle -- one doing IOCTLs, one
-  // writing -- would otherwise race on plain members. The check-then-act
-  // in RecordUnimplementedIoctl stays approximate across threads (same as
-  // before, just no longer UB); the consequence of a lost update is a
-  // streak off by one, i.e. a backoff of a few ms. The process-wide
-  // counters in xbmovie_file.cpp are already atomic; these match them.
-  std::atomic<uint32_t> last_ioctl_code_ = 0;
+  // writing -- would otherwise race on plain members.
+  //
+  // (Hunt v1.4.6, A2-R2-04.) The atomics alone did NOT make
+  // RecordUnimplementedIoctl atomic: its check-then-act (reset on a new
+  // code, then increment) could interleave across threads, letting a
+  // mixed-code streak reach 64. The pair is now guarded by
+  // ioctl_streak_mutex_ inside that function; the readers
+  // (IoctlBackoffMs / ConsecutiveIoctlCount) stay plain atomic loads.
+  // The process-wide counters in xbmovie_file.cpp are already atomic;
+  // these match them.
+   std::atomic<uint32_t> last_ioctl_code_ = 0;
   std::atomic<uint32_t> consecutive_ioctl_count_ = 0;
   std::atomic<uint32_t> consecutive_eof_reads_ = 0;
+  // (Hunt v1.4.6, A2-R2-04.) Guards last_ioctl_code_ +
+  // consecutive_ioctl_count_ as one pair inside RecordUnimplementedIoctl;
+  // only that function takes it.
+  std::mutex ioctl_streak_mutex_;
 };
 
 }  // namespace rex::filesystem
