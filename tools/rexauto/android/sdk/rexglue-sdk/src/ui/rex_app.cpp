@@ -171,6 +171,7 @@ bool ReXApp::SetupEnvironment() {
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
                          cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+    std::error_code ec_r316_2;
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -181,7 +182,7 @@ bool ReXApp::SetupEnvironment() {
   resolved_defaults_ = std::move(path_config);
 
   // Load config FIRST so log cvars have final values
-  if (std::filesystem::exists(config_path_))
+  if (std::filesystem::exists(config_path_, ec_r316_2))
     rex::cvar::LoadConfig(config_path_);
 
   // Late-phase logging
@@ -196,7 +197,9 @@ bool ReXApp::SetupEnvironment() {
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
+
   }
+  std::error_code ec;
 
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
@@ -206,7 +209,7 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
-  if (std::filesystem::exists(config_path_))
+  if (std::filesystem::exists(config_path_, ec))
     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
 
   REXLOG_DEBUG("{} starting", GetName());
@@ -242,7 +245,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!paths.game_data_root.empty() && !std::filesystem::is_directory(paths.game_data_root)) {
+  std::error_code ec_r316_1;
+  if (!paths.game_data_root.empty() && !std::filesystem::is_directory(paths.game_data_root, ec_r316_1)) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -311,9 +315,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       tail.remove_prefix(kDDevice.size());
     }
     std::string host_tail{tail};
+    std::error_code ec;
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
+    if (!std::filesystem::is_regular_file(xex_host, ec)) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
