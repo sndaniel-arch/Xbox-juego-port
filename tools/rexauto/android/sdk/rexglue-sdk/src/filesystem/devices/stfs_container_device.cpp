@@ -97,7 +97,7 @@ bool StfsContainerDevice::Initialize() {
   } else {
     std::error_code ec_r316_1;
     // Resolve a valid STFS file if a directory is given.
-if (std::filesystem::is_directory(host_path_, ec_r316_1) && !ResolveFromFolder(host_path_)) {
+    if (std::filesystem::is_directory(host_path_, ec_r316_1) && !ResolveFromFolder(host_path_)) {
       REXFS_ERROR("Could not resolve an STFS container given path {}",
                   rex::path_to_utf8(host_path_));
       return false;
