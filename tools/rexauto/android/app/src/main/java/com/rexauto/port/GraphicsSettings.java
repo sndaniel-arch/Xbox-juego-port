@@ -39,7 +39,7 @@ public final class GraphicsSettings {
     public boolean vsync() { return prefs.getBoolean("vsync", true); }
     public void setVsync(boolean v) { prefs.edit().putBoolean("vsync", v).apply(); }
 
-    /** bilinear (cheap) | cas (sharpen) | fsr (upscale) */
+    /** bilinear only: CAS/FSR need FidelityFX, which the Android build does not enable (A4-R3-05). */
     public String presentEffect() { return prefs.getString("present_effect", "bilinear"); }
     public void setPresentEffect(String v) { prefs.edit().putString("present_effect", v).apply(); }
 
@@ -239,7 +239,10 @@ public final class GraphicsSettings {
             m.put("vulkan_allow_present_mode_mailbox", "true");
             m.put("vulkan_allow_present_mode_fifo_relaxed", "true");
             m.put("log_level", "info");
-            m.put("log_high_frequency_kernel_calls", "false");
+            // (Hunt v1.4.6 ronda 3, A4-R3-11.) log_high_frequency_kernel_calls
+            // was a dead cvar (defined, never read by any logging path), so
+            // it is no longer emitted; the definition/declaration were
+            // removed with it.
             m.put("vulkan_log_debug_messages", "false");
             m.put("gpu_debug_markers", "false");
             m.put("vulkan_dynamic_rendering", "true");
@@ -282,7 +285,6 @@ public final class GraphicsSettings {
             // STFS fd, affinity pin, pipelines created) -- that is why the
             // v1.4.1 log the user sent was warnings-only.
             m.put("log_level", "info");
-            m.put("log_high_frequency_kernel_calls", "false");
             m.put("vulkan_log_debug_messages", "false");
             m.put("gpu_debug_markers", "false");
             // dynamic rendering: no VkRenderPass objects, fewer pipeline variants
