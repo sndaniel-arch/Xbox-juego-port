@@ -233,7 +233,7 @@ public class MainActivity extends SDLActivity {
      * screen-off) is a harmless second call, and a focus change before
      * the runtime exists is a no-op.
      */
-@Override
+    @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         if (!mHasMultiWindow) {
             if (hasFocus) resumeEmulation(); else pauseEmulation();
