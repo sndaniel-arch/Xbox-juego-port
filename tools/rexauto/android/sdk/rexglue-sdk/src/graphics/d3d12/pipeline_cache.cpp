@@ -221,6 +221,7 @@ void PipelineCache::Shutdown() {
 
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
+  std::error_code ec_r316_1;
   ShutdownShaderStorage();
 
   auto shader_storage_root = cache_root / "shaders";
@@ -231,8 +232,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   // cost - though D3D's internal validation would possibly be enough to ensure
   // they are up to date).
   auto shader_storage_shareable_root = shader_storage_root / "shareable";
-  if (!std::filesystem::exists(shader_storage_shareable_root)) {
-    if (!std::filesystem::create_directories(shader_storage_shareable_root)) {
+  if (!std::filesystem::exists(shader_storage_shareable_root, ec_r316_1)) {
+    std::error_code ec;
+    if (!std::filesystem::create_directories(shader_storage_shareable_root, ec)) {
       REXGPU_ERROR(
           "Failed to create the shareable shader storage directory, persistent "
           "shader storage will be disabled: {}",
