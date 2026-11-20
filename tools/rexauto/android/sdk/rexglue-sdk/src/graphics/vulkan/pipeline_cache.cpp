@@ -572,11 +572,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
   }
+  std::error_code ec_r316_1;
 
   auto shader_storage_root = cache_root / "shaders";
   auto shader_storage_shareable_root = shader_storage_root / "shareable";
-  if (!std::filesystem::exists(shader_storage_shareable_root)) {
-    if (!std::filesystem::create_directories(shader_storage_shareable_root)) {
+  if (!std::filesystem::exists(shader_storage_shareable_root, ec_r316_1)) {
+    std::error_code ec;
+    if (!std::filesystem::create_directories(shader_storage_shareable_root, ec)) {
       REXGPU_ERROR(
           "Failed to create the shareable shader storage directory, persistent "
           "shader storage will be disabled: {}",
@@ -728,6 +730,17 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         break;
       }
       size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
+      // (Hunt v1.4.6 round 3, A1-R3-04.) ucode_dword_count is a 31-bit field
+      // in the file header: without a bound a corrupt header makes the
+      // resize() below attempt a multi-GiB allocation (std::bad_alloc on
+      // the CP thread -> std::terminate at startup) before the fread that
+      // would expose it. The writer never stores more than 0xFFFF dwords
+      // (ucode_dwords.reserve(0xFFFF) above, same cap on the write side),
+      // so anything larger is corruption: stop and truncate, like the
+      // invalid-hash path below.
+      if (shader_header.ucode_dword_count > 0xFFFF) {
+        break;
+      }
       ucode_dwords.resize(shader_header.ucode_dword_count);
       if (shader_header.ucode_dword_count &&
           !fread(ucode_dwords.data(), ucode_byte_count, 1, shader_storage_file_)) {
