@@ -171,6 +171,13 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
 u32 ExTerminateThread_entry(u32 exit_code) {
   XThread* thread = XThread::GetCurrentThread();
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null when
+  // called from a host thread with no guest TLS (xthread.cpp); the
+  // old code dereferenced it unconditionally. Guest code always runs
+  // on a guest thread, so this is defence-in-depth only.
+  if (!thread) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   // NOTE: this kills us right now. We won't return from it.
   return thread->Exit(exit_code);
 }
@@ -271,6 +278,12 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
                                      mapped_void stack_alloc_base, mapped_void stack_base,
                                      mapped_void stack_limit) {
   auto current_thread = XThread::GetCurrentThread();
+  // (Hunt v1.4.6, ronda 3, A3-R3-08/A3-R3-20.) UpdateGuestStackPointers
+  // writes through thread, and thread_state() is read off
+  // current_thread -- both were dereferenced unconditionally.
+  if (!thread || !current_thread) {
+    return;
+  }
   auto context = current_thread->thread_state()->context();
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
@@ -333,6 +346,11 @@ u32 KeSetBasePriorityThread_entry(mapped_void thread_ptr, u32 increment) {
 }
 
 u32 KeSetDisableBoostThread_entry(ppc_ptr_t<X_KTHREAD> thread_ptr, u32 disabled) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-08.) thread_ptr->boost_disabled was
+  // exchanged through the raw pointer with no check.
+  if (!thread_ptr) {
+    return 0;
+  }
   auto old_boost_disabled = reinterpret_cast<std::atomic_uint8_t*>(&thread_ptr->boost_disabled)
                                 ->exchange(static_cast<uint8_t>(disabled));
   return old_boost_disabled;
@@ -340,6 +358,10 @@ u32 KeSetDisableBoostThread_entry(ppc_ptr_t<X_KTHREAD> thread_ptr, u32 disabled)
 
 u32 KeGetCurrentProcessType_entry() {
   auto current_thread = XThread::GetCurrentThread();
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+  if (!current_thread) {
+    return 0;
+  }
   auto context = current_thread->thread_state()->context();
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
@@ -359,6 +381,11 @@ void KeSetCurrentProcessType_entry(u32 type) {
   REX_KERNEL_STATE()->set_process_type(type);
 
   auto current_thread = XThread::GetCurrentThread();
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above;
+  // the process type above is already set, so just skip the PCR write.
+  if (!current_thread) {
+    return;
+  }
   auto context = current_thread->thread_state()->context();
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
@@ -376,6 +403,15 @@ u32 KeQueryPerformanceFrequency_entry() {
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
   XThread* thread = XThread::GetCurrentThread();
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-08/A3-R3-20.) *interval_ptr was
+  // dereferenced unconditionally, and thread is null on a host thread
+  // with no guest TLS.
+  if (!interval_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!thread) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   if (alertable) {
     thread->DeliverAPCs();
   }
@@ -416,7 +452,10 @@ uint64_t KeQueryInterruptTime_entry() {
 u32 KeTlsAlloc_entry() {
   uint32_t slot = REX_KERNEL_STATE()->AllocateTLS(current_ppc_context());
   if (slot != X_TLS_OUT_OF_INDEXES) {
-    XThread::GetCurrentThread()->SetTLSValue(slot, 0);
+    // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+    if (auto* thread = XThread::GetCurrentThread()) {
+      thread->SetTLSValue(slot, 0);
+    }
   }
   REXKRNL_IMPORT_RESULT("KeTlsAlloc", "slot={}", slot);
   return slot;
@@ -440,7 +479,9 @@ u32 KeTlsGetValue_entry(u32 tls_index) {
   // xboxkrnl doesn't actually have an error branch - it always succeeds, even
   // if it overflows the TLS.
   uint32_t value = 0;
-  if (XThread::GetCurrentThread()->GetTLSValue(tls_index, &value)) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+  auto* thread = XThread::GetCurrentThread();
+  if (thread && thread->GetTLSValue(tls_index, &value)) {
     return value;
   }
 
@@ -453,7 +494,9 @@ u32 KeTlsSetValue_entry(u32 tls_index, u32 tls_value) {
                        (uint32_t)tls_value);
   // xboxkrnl doesn't actually have an error branch - it always succeeds, even
   // if it overflows the TLS.
-  if (XThread::GetCurrentThread()->SetTLSValue(tls_index, tls_value)) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+  auto* thread = XThread::GetCurrentThread();
+  if (thread && thread->SetTLSValue(tls_index, tls_value)) {
     REXKRNL_IMPORT_RESULT("KeTlsSetValue", "1");
     return 1;
   }
@@ -463,6 +506,11 @@ u32 KeTlsSetValue_entry(u32 tls_index, u32 tls_value) {
 }
 
 void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 event_type, u32 initial_state) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) Zero() is null-safe, the header
+  // writes below are not.
+  if (!event_ptr) {
+    return;
+  }
   event_ptr.Zero();
   event_ptr->header.type = event_type;
   event_ptr->header.signal_state = (uint32_t)initial_state;
@@ -593,6 +641,11 @@ u32 NtClearEvent_entry(u32 handle) {
 
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
 void KeInitializeSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 count, u32 limit) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) The header/limit writes below
+  // dereference semaphore_ptr with no check.
+  if (!semaphore_ptr) {
+    return;
+  }
   semaphore_ptr->header.type = 5;  // SemaphoreObject
   semaphore_ptr->header.signal_state = (uint32_t)count;
   semaphore_ptr->limit = (uint32_t)limit;
@@ -777,6 +830,11 @@ u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u
 void KeInitializeTimerEx_entry(ppc_ptr_t<X_KTIMER> timer_ptr, u32 timer_type, u32 proc_type) {
   assert_true(timer_type == 0 || timer_type == 1);
   assert_true(proc_type < 3);
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) Every write below dereferences
+  // timer_ptr with no check.
+  if (!timer_ptr) {
+    return;
+  }
   // Other fields are unmodified; they must carry through multiple calls.
   timer_ptr->header.process_type = static_cast<uint8_t>(proc_type & 0xFF);
   timer_ptr->header.inserted = 0;
@@ -797,6 +855,11 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
   assert_true(unk_one == 1);
   assert_true(unk_zero == 0);
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-08.) due_time_ptr was dereferenced
+  // before the timer handle was even looked up.
+  if (!due_time_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t due_time = *due_time_ptr;
 
   X_STATUS result = X_STATUS_SUCCESS;
@@ -841,7 +904,9 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
 
   if (alertable && result == X_STATUS_USER_APC) {
-    XThread::GetCurrentThread()->DeliverAPCs();
+    // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
+    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
   }
 
   return result;
@@ -870,7 +935,9 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
     if (alertable && result == X_STATUS_USER_APC) {
-      XThread::GetCurrentThread()->DeliverAPCs();
+      // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
+    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
     }
   } else {
     result = X_STATUS_INVALID_HANDLE;
@@ -884,6 +951,17 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-13.) objects_ptr was dereferenced
+  // with no null check, and count was uncapped: a guest array
+  // repeating one valid handle grew the host vector without limit.
+  // 64 is MAXIMUM_WAIT_OBJECTS on Xbox, the same cap the WSA wrapper
+  // in xam_net.cpp already enforces.
+  if (!objects_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (count > 64) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
@@ -900,7 +978,9 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
   if (alertable && result == X_STATUS_USER_APC) {
-    XThread::GetCurrentThread()->DeliverAPCs();
+    // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
+    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
   }
   return result;
 }
@@ -910,6 +990,17 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-13.) As in
+  // KeWaitForMultipleObjects_entry above: handles was unchecked and
+  // count uncapped. This is also the callee of
+  // NetDll_WSAWaitForMultipleEvents (which caps at 64 already) and
+  // NtWaitForMultipleObjectsEx.
+  if (!handles) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (count > 64) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
     uint32_t object_handle = handles[n];
@@ -923,7 +1014,9 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
   auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
                                       6, wait_mode, alertable, timeout_ptr);
   if (alertable && result == X_STATUS_USER_APC) {
-    XThread::GetCurrentThread()->DeliverAPCs();
+    // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
+    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
   }
   return result;
 }
@@ -950,7 +1043,9 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
   }
 
   if (alertable && result == X_STATUS_USER_APC) {
-    XThread::GetCurrentThread()->DeliverAPCs();
+    // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
+    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
   }
 
   return result;
@@ -1058,21 +1153,38 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
 }
 
 u32 KfAcquireSpinLock_entry(mapped_u32 lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) host_address() is null for
+  // guest 0; xeKeKfAcquireSpinLock dereferences lock->prcb_of_owner.
+  if (!lock_ptr) {
+    return 0;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   return xeKeKfAcquireSpinLock(current_ppc_context(), lock);
 }
 
 void KfReleaseSpinLock_entry(mapped_u32 lock_ptr, u32 old_irql) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!lock_ptr) {
+    return;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   xeKeKfReleaseSpinLock(current_ppc_context(), lock, old_irql);
 }
 
 void KeAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!lock_ptr) {
+    return;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   xeKeKfAcquireSpinLock(current_ppc_context(), lock, false);
 }
 
 u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!lock_ptr) {
+    return 0;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   auto* ctx = current_ppc_context();
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
@@ -1083,16 +1195,26 @@ u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
 }
 
 void KeReleaseSpinLockFromRaisedIrql_entry(mapped_u32 lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As KfAcquireSpinLock above.
+  if (!lock_ptr) {
+    return;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   xeKeKfReleaseSpinLock(current_ppc_context(), lock, 0, false);
 }
 
 void KeEnterCriticalRegion_entry() {
-  XThread::GetCurrentThread()->EnterCriticalRegion();
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+  if (auto* thread = XThread::GetCurrentThread()) {
+    thread->EnterCriticalRegion();
+  }
 }
 
 void KeLeaveCriticalRegion_entry() {
-  XThread::GetCurrentThread()->LeaveCriticalRegion();
+  // (Hunt v1.4.6, ronda 3, A3-R3-20.) See ExTerminateThread above.
+  if (auto* thread = XThread::GetCurrentThread()) {
+    thread->LeaveCriticalRegion();
+  }
 }
 
 u32 KeRaiseIrqlToDpcLevel_entry() {
@@ -1146,6 +1268,11 @@ void NtQueueApcThread_entry(u32 thread_handle, mapped_void apc_routine,
 void KeInitializeApc_entry(ppc_ptr_t<XAPC> apc, mapped_void thread_ptr, mapped_void kernel_routine,
                            mapped_void rundown_routine, mapped_void normal_routine,
                            u32 processor_mode, mapped_void normal_context) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) xeKeInitializeApc writes
+  // apc->thread_ptr through apc.host_address(), null for guest 0.
+  if (!apc) {
+    return;
+  }
   xeKeInitializeApc(apc.host_address(), thread_ptr.guest_address(), kernel_routine.guest_address(),
                     rundown_routine.guest_address(), normal_routine.guest_address(), processor_mode,
                     normal_context.guest_address());
@@ -1153,11 +1280,21 @@ void KeInitializeApc_entry(ppc_ptr_t<XAPC> apc, mapped_void thread_ptr, mapped_v
 
 u32 KeInsertQueueApc_entry(ppc_ptr_t<XAPC> apc, mapped_void arg1, mapped_void arg2,
                            u32 priority_increment) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) xeKeInsertQueueApc reads
+  // apc->thread_ptr; a NULL apc used to crash the host there.
+  if (!apc) {
+    return 0;
+  }
   return xeKeInsertQueueApc(apc.host_address(), arg1.guest_address(), arg2.guest_address(),
                             priority_increment, current_ppc_context());
 }
 
 u32 KeRemoveQueueApc_entry(ppc_ptr_t<XAPC> apc) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) apc->thread_ptr is read first
+  // thing below.
+  if (!apc) {
+    return 0;
+  }
   uint32_t thread_guest_pointer = apc->thread_ptr;
   if (!thread_guest_pointer) {
     return 0;
@@ -1183,12 +1320,22 @@ u32 KiApcNormalRoutineNop_entry(u32 unk0 /* output? */, u32 unk1 /* 0x13 */) {
 }
 
 void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void context) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) XDPC::Initialize writes
+  // through `this`; a NULL dpc used to crash the host.
+  if (!dpc) {
+    return;
+  }
   dpc->Initialize(routine.guest_address(), context.guest_address());
 }
 
 u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
   assert_always("DPC does not dispatch yet; going to hang!");
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) dpc->arg1/arg2 are written
+  // below; a NULL dpc used to crash the host there.
+  if (!dpc) {
+    return 0;
+  }
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
 
   // Lock dispatcher.
@@ -1237,6 +1384,11 @@ struct X_ERWLOCK {
 static_assert_size(X_ERWLOCK, 0x38);
 
 void ExInitializeReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) Every write below dereferences
+  // lock_ptr with no check.
+  if (!lock_ptr) {
+    return;
+  }
   lock_ptr->lock_count = -1;
   lock_ptr->writers_waiting_count = 0;
   lock_ptr->readers_waiting_count = 0;
@@ -1252,6 +1404,11 @@ void ExInitializeReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 }
 
 void ExAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) &lock_ptr->spin_lock is taken
+  // first thing below.
+  if (!lock_ptr) {
+    return;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1268,6 +1425,10 @@ void ExAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 }
 
 u32 ExTryToAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above; 0 = not acquired.
+  if (!lock_ptr) {
+    return 0;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1284,6 +1445,10 @@ u32 ExTryToAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 }
 
 void ExAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!lock_ptr) {
+    return;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1301,6 +1466,10 @@ void ExAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 }
 
 u32 ExTryToAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above; 0 = not acquired.
+  if (!lock_ptr) {
+    return 0;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1319,6 +1488,10 @@ u32 ExTryToAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 }
 
 void ExReleaseReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!lock_ptr) {
+    return;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1355,8 +1528,12 @@ void ExReleaseReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 // NOTE: This function is very commonly inlined, and probably won't be called!
 u32 InterlockedPushEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr,
                                     ppc_ptr_t<X_SINGLE_LIST_ENTRY> entry) {
-  assert_not_null(plist_ptr);
-  assert_not_null(entry);
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) The only guards were
+  // assert_not_null, no-ops in Release; *plist_ptr and entry->next
+  // were dereferenced below.
+  if (!plist_ptr || !entry) {
+    return 0;
+  }
 
   alignas(8) X_SLIST_HEADER old_hdr = *plist_ptr;
   alignas(8) X_SLIST_HEADER new_hdr = {};
@@ -1376,7 +1553,10 @@ u32 InterlockedPushEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr,
 }
 
 u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
-  assert_not_null(plist_ptr);
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!plist_ptr) {
+    return 0;
+  }
 
   uint32_t popped = 0;
   alignas(8) X_SLIST_HEADER old_hdr = {0};
@@ -1399,7 +1579,10 @@ u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
 }
 
 u32 InterlockedFlushSList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
-  assert_not_null(plist_ptr);
+  // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
+  if (!plist_ptr) {
+    return 0;
+  }
 
   alignas(8) X_SLIST_HEADER old_hdr = *plist_ptr;
   alignas(8) X_SLIST_HEADER new_hdr = {0};
