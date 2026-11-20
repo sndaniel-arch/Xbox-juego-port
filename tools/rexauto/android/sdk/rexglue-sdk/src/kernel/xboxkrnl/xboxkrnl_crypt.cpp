@@ -182,8 +182,8 @@ void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) The three inputs are guarded
   // above; output was not -- the copy wrote through a null pointer.
   if (output && output_size) {
-    std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size,
-                output.as<uint8_t*>();
+    std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size),
+                output.as<uint8_t*>());
   }
 }
 
@@ -195,7 +195,7 @@ typedef struct {
 } XECRYPT_SHA256_STATE;
 
 void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
-// (Hunt v1.4.6, ronda 3, A3-R3-05.) As XeCryptShaInit above.
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) As XeCryptShaInit above.
   if (!sha_state) {
     return;
   }
@@ -271,22 +271,22 @@ static_assert_size(XECRYPT_RSA, 0x10);
 
 u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t> qw_b,
                                    ppc_ptr_t<XECRYPT_RSA> rsa) {
-// (Hunt v1.4.6, ronda 3, A3-R3-05.) The Win32 branch below reads
-// rsa->size and the qw pointers; a NULL one used to crash the host.
-if (!qw_a || !qw_b || !rsa) {
-return 0;
-}
   // 0 indicates failure (but not a BOOL return value)
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) The Win32 branch below reads
+  // rsa->size and the qw pointers; a NULL one used to crash the host.
+  if (!qw_a || !qw_b || !rsa) {
+    return 0;
+  }
 #if !REX_PLATFORM_WIN32
   REXKRNL_ERROR(
       "XeCryptBnQwNeRsaPubCrypt called but no implementation available for "
       "this platform!");
   assert_always();
   // (Hunt v1.4.6, ronda 3, A3-R3-17.) Was 1 (success) without doing
-// anything: the header comment above says 0 is failure, and on
-// Android this function can never succeed -- the Win32 branch is
-// dead here. Fail honestly instead of lying success.
-return 0;
+  // anything: the header comment above says 0 is failure, and on
+  // Android this function can never succeed -- the Win32 branch is
+  // dead here. Fail honestly instead of lying success.
+  return 0;
 #else
   uint32_t modulus_size = rsa->size * 8;
 
@@ -384,7 +384,7 @@ u32 XeCryptBnDwLePkcs1Verify_entry(mapped_void hash, mapped_void sig, u32 size) 
 }
 
 void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
-    // (Hunt v1.4.6, ronda 3, A3-R3-05.) memset through a NULL buf.
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) memset through a NULL buf.
   if (!buf) {
     return;
   }
@@ -410,7 +410,7 @@ struct XECRYPT_DES3_STATE {
 };
 
 void XeCryptDes3Key_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 key) {
-// (Hunt v1.4.6, ronda 3, A3-R3-05.) key[0..2] and
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) key[0..2] and
   // state_ptr->des_state[i] are dereferenced below; the Des3Ecb/Cbc
   // sisters already carry this guard (R6-06).
   if (!state_ptr || !key) {
@@ -482,11 +482,11 @@ static inline uint8_t xeXeCryptAesMul2(uint8_t a) {
 }
 
 void XeCryptAesKey_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void key) {
-// (Hunt v1.4.6, ronda 3, A3-R3-05.) aes_key_schedule_128 reads key
-// and state_ptr->keytabenc is written throughout.
-if (!state_ptr || !key) {
-  return;
-}
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) aes_key_schedule_128 reads key
+  // and state_ptr->keytabenc is written throughout.
+  if (!state_ptr || !key) {
+    return;
+  }
   aes_key_schedule_128(key, reinterpret_cast<uint8_t*>(state_ptr->keytabenc));
   // Decryption key schedule not needed by openluopworld/aes_128, but generated
   // to fill the context structure properly.
@@ -567,10 +567,10 @@ void XeCryptAesEcb_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
 void XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp_ptr, u32 inp_size,
                          mapped_void out_ptr, mapped_void feed_ptr, u32 encrypt) {
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) feed[j] ^= inp[j] and the
-// memcpy(out, feed, 16) below all dereference these pointers.
-if (!state_ptr || !inp_ptr || !out_ptr || !feed_ptr) {
-return;
-}
+  // memcpy(out, feed, 16) below all dereference these pointers.
+  if (!state_ptr || !inp_ptr || !out_ptr || !feed_ptr) {
+    return;
+  }
   const uint8_t* keytab = reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
   const uint8_t* inp = inp_ptr.as<const uint8_t*>();
   uint8_t* out = out_ptr.as<uint8_t*>();
@@ -604,7 +604,7 @@ return;
 void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u32 inp_1_size,
                           mapped_void inp_2, u32 inp_2_size, mapped_void inp_3, u32 inp_3_size,
                           mapped_void out, u32 out_size) {
-      // (Hunt v1.4.6, ronda 3, A3-R3-05.) key is memcpy'd/hashed, the
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) key is memcpy'd/hashed, the
   // inputs are processBytes'd and the digest is memcpy'd to out --
   // all without a check. A pointer is only required when its size is
   // non-zero, matching the XeCryptSha shape above.
@@ -639,6 +639,8 @@ void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u
   // Inner
   sha.processBytes(kpad_i, 0x40);
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) The old code only checked the
+  // sizes: a NULL input with a non-zero size was read through.
   if (inp_1 && inp_1_size) {
     sha.processBytes(inp_1, inp_1_size);
   }
