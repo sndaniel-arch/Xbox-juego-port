@@ -54,12 +54,15 @@ X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_offset
     return X_STATUS_ACCESS_DENIED;
   }
 
-  // (Hunt v1.4.6, A2-R6-04/A2-R6-09.) Writes to the null device are
-  // discarded by design (it exists to make cache/raw-partition IO
-  // "succeed"), so SUCCESS stays -- but the count is now written (0,
-  // null-guarded) instead of left stale.
+  // (Hunt v1.4.6, A2-R6-04/A2-R6-09, fixed A2-R3-03.) Writes to the null
+  // device are discarded by design (it exists to make cache/raw-partition
+  // IO "succeed"), so SUCCESS stays -- but the count must be the full
+  // buffer size, not 0: the old SUCCESS + 0 made any guest "write until
+  // complete" loop spin forever, never making progress and never seeing
+  // an error. Same "accepted and dropped" semantics as
+  // XbMovieFile::WriteSync, which reports buffer.size().
   if (out_bytes_written) {
-    *out_bytes_written = 0;
+    *out_bytes_written = buffer.size();
   }
   return X_STATUS_SUCCESS;
 }
