@@ -196,6 +196,19 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16
     // File.
     entry->data_offset_ = state->game_offset + (sector * kXESectorSize);
     entry->data_size_ = length;
+      // (Hunt v1.4.6, A2-R2-07.) Same bounds check as the directory branch
+    // above, extended to the full extent: sector/length come from the
+    // image itself, so a corrupt GDFX could place the file data past the
+    // mapped image and ReadSync would memcpy out of bounds. Reject the
+    // entry (the mount fails) instead of crashing on the first read.
+    // (state->size - data_offset_ underflows only if data_offset_ is
+    // already past the end, which the first half of the check excludes.)
+    if (state->size < entry->data_offset_ ||
+          state->size - entry->data_offset_ < entry->data_size_) {
+      REXFS_ERROR("DiscImageDevice::ReadEntry file data out of bounds (offset {:#x} size {})",
+                    entry->data_offset_, entry->data_size_);
+              return false;
+    }
     ++file_count_;
     total_file_size_ += length;
   }
