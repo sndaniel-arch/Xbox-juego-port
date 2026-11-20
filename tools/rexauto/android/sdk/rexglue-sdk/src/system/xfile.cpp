@@ -27,6 +27,11 @@ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchr
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  // (Hunt v1.4.6, A2-R3-09.) Track the open handle on the entry so a
+  // delete-on-close flag can be honored when the LAST handle closes.
+  if (file_ && file_->entry()) {
+    file_->entry()->AddOpenHandle();
+  }
 }
 
 XFile::XFile() : XObject(kObjectType) {
@@ -42,7 +47,18 @@ XFile::~XFile() {
   // nullptr in that case, but never let the destructor dereference a
   // null file_ if one ever slips through.
   if (file_) {
+    // (Hunt v1.4.6, A2-R3-09.) Honor delete-on-close: when the last open
+    // handle to a flagged entry closes, the entry is deleted. Capture the
+    // entry BEFORE Destroy() (the File owns no entry reference past its
+    // own destruction) and release the handle AFTER it, so the count
+    // this handle contributed is dropped first; ReleaseOpenHandle does
+    // the delete itself, under the VFS lock, only at count zero.
+    auto* entry = file_->entry();
     file_->Destroy();
+    file_ = nullptr;
+    if (entry) {
+      entry->ReleaseOpenHandle();
+    }
   }
 }
 
@@ -90,7 +106,11 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
   const auto& entry_name = entry->name();
   if (reinterpret_cast<uint8_t*>(&out_info->file_name[0]) + entry_name.size() > end) {
     assert_always("Buffer overflow?");
-    return X_STATUS_NO_SUCH_FILE;
+    // (Hunt v1.4.6, A2-R3-14.) A buffer that fits the fixed header but not
+    // the name is a length problem, not a missing file: the caller must
+    // retry with a bigger buffer, not stop the enumeration as if the
+    // directory had no such file.
+    return X_STATUS_BUFFER_OVERFLOW;
   }
 
   out_info->next_entry_offset = 0;
@@ -343,14 +363,30 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   // host memory outside the guest mapping, and WriteSync would then read it
   // (for the xbmovie probe: the first 16 bytes land in the phone log).
   // Same check, same status code as the read path.
+  // (Hunt v1.4.6, A2-R3-01.) The wrap check was only half the read-path
+  // validation: ReadInternal ALSO rejects a buffer outside any heap, a
+  // buffer spanning heaps of different kinds (or two physical heaps), and
+  // a physical range without kReadWrite access -- Write did none of that,
+  // so a write buffer in an unmapped hole handed WriteSync a bogus host
+  // pointer (host SIGSEGV, or host-memory bytes written to disk / the
+  // phone log). Mirror the full ReadInternal validation here, including
+  // the physical-heap TranslatePhysical path. A zero-length write keeps
+  // the old path: like ReadInternal's `if (buffer_length)` guard, there
+  // is no buffer to validate and no bytes for WriteSync to read.
   X_STATUS result;
-  if (UINT32_MAX - buffer_guest_address < buffer_length) {
-    result = X_STATUS_ACCESS_VIOLATION;
-  } else {
+  if (buffer_length == 0) {
     result = file_->WriteSync(
         std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
         size_t(byte_offset), &bytes_written);
-  }
+  } else if (UINT32_MAX - buffer_guest_address < buffer_length) {
+    result = X_STATUS_ACCESS_VIOLATION;
+  } else {
+    uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
+    rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
+    const rex::memory::BaseHeap* buffer_end_heap =
+        memory()->LookupHeap(buffer_guest_high_address);
+    if (!buffer_start_heap || !buffer_end_heap ||
+     
   if (XSUCCEEDED(result)) {
     // (Hunt v1.4.6, A2-R2-02.) Mirror ReadInternal (R5-D2): position_ must
     // track the offset actually written, including an explicit one: the
@@ -461,6 +497,11 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
   file->file_ = vfs_file;
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;
+  // (Hunt v1.4.6, A2-R3-09.) The default ctor above had no file to count;
+  // this is where the restored handle starts existing.
+  if (vfs_file && vfs_file->entry()) {
+    vfs_file->entry()->AddOpenHandle();
+  }
 
   return object_ref<XFile>(file);
 }
