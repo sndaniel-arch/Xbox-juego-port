@@ -90,7 +90,11 @@ public class SetupActivity extends Activity {
         if (!new GraphicsSettings(this).experimentalGpuDriver()) {
             try {
                 GpuDriver gd = new GpuDriver(this);
-                if (gd.selected() != null) gd.select(null);
+                // (Hunt v1.4.6 ronda 3, A4-R3-10.) Same stale-driver.txt
+                // clear as MainActivity: also clear when only the file
+                // survives (see GpuDriver.selected() fallback /
+                // driverConfigExists()).
+                if (gd.selected() != null || gd.driverConfigExists()) gd.select(null);
             } catch (Exception e) {
                 // (Hunt v1.4.6, sweep of R-A-M1.) Same swallowed
                 // select(null) as MainActivity: say so instead of
