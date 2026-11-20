@@ -376,8 +376,21 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
   }
 
   uint32_t num_clients = stream->Read<uint32_t>();
+    // (Hunt v1.4.6, A4-R6-03.) Same class as C-01: the stream is untrusted
+    // (a corrupt/truncated save), and assert_true is a no-op in Release.
+    // Bound the count and every id before indexing clients_ /
+    // client_semaphores_ below; a bad save fails instead of indexing OOB.
+    if (num_clients > kMaximumClientCount) {
+      REXAPU_ERROR("AudioSystem::Restore - num_clients {} exceeds maximum {}",
+                   num_clients, kMaximumClientCount);
+      return false;
+    }
   for (uint32_t i = 0; i < num_clients; i++) {
     auto id = stream->Read<uint32_t>();
+    if (id >= kMaximumClientCount) {
+      REXAPU_ERROR("AudioSystem::Restore - client id {} out of range", id);
+      return false;
+    }
     assert_true(id < kMaximumClientCount);
 
     auto& client = clients_[id];
