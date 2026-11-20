@@ -85,6 +85,12 @@ u32 XMsgStartIORequest_entry(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> ove
 }
 
 u32 XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-10.) XOverlappedGetEvent reads p[3]
+  // of the struct unconditionally; a NULL overlapped pointer SIGSEGVd
+  // the host before anything else ran.
+  if (!overlapped_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -117,6 +123,12 @@ u32 XMsgCompleteIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 re
 
 u32 XamGetOverlappedResult_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mapped_u32 length_ptr,
                                  u32 unknown) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-10.) overlapped_ptr->result is read
+  // first thing below; a NULL overlapped pointer SIGSEGVd the host.
+  // (length_ptr in this same function is already guarded.)
+  if (!overlapped_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   uint32_t result;
   if (overlapped_ptr->result != X_ERROR_IO_PENDING) {
     result = overlapped_ptr->result;
