@@ -201,7 +201,7 @@ class VulkanTextureCache final : public TextureCache {
   // inherit stale alpha decisions. Mutable: the scan is consulted from the
   // const GetHostFormatPair().
   mutable std::unordered_map<TextureKey, bool, TextureKey::Hasher> dxt1_alpha_memo_;
-  static bool ReadGuestBcBlock(const SharedMemory& shared_memory,
+  static void ReadGuestBcBlock(const SharedMemory& shared_memory,
                                const texture_util::TextureGuestLayout::Level& level_layout,
                                uint32_t guest_level_base, const TextureKey& key,
                                bool is_3d_tiling, uint32_t bx, uint32_t by, uint32_t bz,
