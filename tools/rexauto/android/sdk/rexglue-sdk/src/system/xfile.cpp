@@ -385,7 +385,7 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
     rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
     const rex::memory::BaseHeap* buffer_end_heap =
         memory()->LookupHeap(buffer_guest_high_address);
-        if (!buffer_start_heap || !buffer_end_heap ||
+    if (!buffer_start_heap || !buffer_end_heap ||
         (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
             (buffer_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
         (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical &&
@@ -398,7 +398,7 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
               : nullptr;
       if (buffer_physical_heap && buffer_physical_heap->QueryRangeAccess(
                                       buffer_guest_address, buffer_guest_high_address) !=
-                                                                            memory::PageAccess::kReadWrite) {
+                                      memory::PageAccess::kReadWrite) {
         result = X_STATUS_ACCESS_VIOLATION;
       } else {
         result = file_->WriteSync(
