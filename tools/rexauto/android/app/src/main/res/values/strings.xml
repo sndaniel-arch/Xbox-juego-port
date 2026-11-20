@@ -81,9 +81,8 @@
         <item>3x (2160p)</item>
     </string-array>
     <string-array name="gfx_effect_options">
+        <!-- (Hunt v1.4.6 ronda 3, A4-R3-05.) CAS/FSR removed: no FidelityFX in the Android build. -->
         <item>Bilineal (la más barata)</item>
-        <item>AMD CAS (nitidez)</item>
-        <item>AMD FSR (reescalado)</item>
     </string-array>
     <string-array name="gfx_mode_options">
         <item>1280x720 (por defecto)</item>
