@@ -31,7 +31,7 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
    dormirse entre frames.
 2. **Escala de resolución**: 720p de objetivo; **540p como fallback manual**
    en GPUs débiles (el usuario lo elige en el diálogo de gráficos, modo
-      960×540; no hay bajada automática). La escala baja es mejor
+   960×540; no hay bajada automática). La escala baja es mejor
    que perder frames.
 3. **Presets Performance / Balanced / Accuracy** (los del launcher de
    rexauto): Performance por defecto en gama media, Accuracy solo en gama
@@ -41,13 +41,13 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
    compilar al usar, con caché persistente, y nunca bloquear el primer frame.
 5. **Perfiles por GPU + detección automática** (como Zandatsu): Adreno,
    Mali, Xclipse y otros. La detección elige el .so del driver
-      (`GpuDriver.pickLibrary()`: PanVK en Mali, Turnip en Adreno) y los
-         ajustes aplican un perfil Mali en tiempo de ejecución
-            (`GraphicsSettings.asCvars()`: sin consultas de oclusión ni MSAA 2×
-               nativo en Mali, salvo preset accuracy). El plugin de GPU emulada
-                  (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige al arrancar; si
-                     el renderer nativo pierde el dispositivo, el runtime aborta con
-                        `FatalError` — no hay cambio automático a otro backend en caliente.
+   (`GpuDriver.pickLibrary()`: PanVK en Mali, Turnip en Adreno) y los
+   ajustes aplican un perfil Mali en tiempo de ejecución
+   (`GraphicsSettings.asCvars()`: sin consultas de oclusión ni MSAA 2×
+   nativo en Mali, salvo preset accuracy). El plugin de GPU emulada
+   (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige al arrancar; si
+   el renderer nativo pierde el dispositivo, el runtime aborta con
+   `FatalError` — no hay cambio automático a otro backend en caliente.
 6. **Capa de validación de Vulkan desde el primer día** (no al final): es el
    único procedimiento que ha convertido un "bug Mali" en "bug nuestro,
    arreglado" (NFSMW 0.5.5). Objetivo: cero avisos de sincronización.
@@ -116,5 +116,5 @@ importable como zip, como en NFSMW y xendroid-mali.
 - Aceptación: **60 fps sostenidos en gameplay en el teléfono del usuario**,
   y 60 fps en Adreno (matriz de comunidad: Redmi 10C, POCO X6 Pro,
   Galaxy A56). Si un dispositivo no llega a 60, baja a 540p a mano
-     (diálogo de gráficos, 960×540) antes de bajar a 30 fps: no hay bajada
+   (diálogo de gráficos, 960×540) antes de bajar a 30 fps: no hay bajada
      automática.
