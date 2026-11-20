@@ -45,14 +45,14 @@ public final class GraphicsDialog {
         String[] presets = {"performance", "balanced", "accuracy"};
         preset.setAdapter(new ArrayAdapter<>(activity, android.R.layout.simple_spinner_dropdown_item,
                 new String[]{activity.getString(R.string.preset_performance), activity.getString(R.string.preset_balanced), activity.getString(R.string.preset_accuracy)}));
-// (Hunt v1.4.6 ronda 3, A4-R3-12.) If the stored value matches no
+        // (Hunt v1.4.6 ronda 3, A4-R3-12.) If the stored value matches no
         // offered option, the spinner sits at position 0 and the OK handler
         // below must NOT write that first option back over the stored
         // value. The *_known flags record whether the stored value was
         // offered; an unknown stored value is only overwritten when the
         // user actually picks a different position.
         final boolean[] presetKnown = {false};
-        for (int i = 0; i < presets.length; i++) if (presets[i].equals(gs.preset()))  { preset.setSelection(i); presetKnown[0] = true; }
+        for (int i = 0; i < presets.length; i++) if (presets[i].equals(gs.preset())) { preset.setSelection(i); presetKnown[0] = true; }
         box.addView(preset);
 
         label(activity, box, R.string.gfx_fps_cap);
@@ -60,8 +60,8 @@ public final class GraphicsDialog {
         int[] caps = {0, 30, 60};
         fps.setAdapter(new ArrayAdapter<>(activity, android.R.layout.simple_spinner_dropdown_item,
                 new String[]{activity.getString(R.string.fps_off), activity.getString(R.string.fps_30), activity.getString(R.string.fps_60)}));
-final boolean[] fpsKnown = {false};
-        for (int i = 0; i < caps.length; i++) if (caps[i] == gs.fpsCap())  { fps.setSelection(i); fpsKnown[0] = true; }
+        final boolean[] fpsKnown = {false};
+        for (int i = 0; i < caps.length; i++) if (caps[i] == gs.fpsCap()) { fps.setSelection(i); fpsKnown[0] = true; }
         box.addView(fps);
 
         label(activity, box, R.string.gfx_scale);
@@ -90,11 +90,11 @@ final boolean[] fpsKnown = {false};
         int[][] modes = {{1280, 720}, {1920, 1080}, {1024, 576}, {960, 540}};
         mode.setAdapter(new ArrayAdapter<>(activity, android.R.layout.simple_spinner_dropdown_item,
                 activity.getResources().getStringArray(R.array.gfx_mode_options)));
-final boolean[] modeKnown = {false};
+        final boolean[] modeKnown = {false};
         // (A4-R3-12.) Match on width AND height: the old width-only match
         // showed e.g. 1280x800 as 1280x720 and OK then overwrote the
         // height as well.
-        for (int i = 0; i < modes.length; i++) if (modes[i][0] == gs.videoWidth() && modes[i][1] == gs.videoHeight())  { mode.setSelection(i); modeKnown[0] = true; }
+        for (int i = 0; i < modes.length; i++) if (modes[i][0] == gs.videoWidth() && modes[i][1] == gs.videoHeight()) { mode.setSelection(i); modeKnown[0] = true; }
         box.addView(mode);
 
         label(activity, box, R.string.gfx_orientation);
@@ -102,8 +102,8 @@ final boolean[] modeKnown = {false};
         String[] orients = {"landscape", "portrait", "auto"};
         orient.setAdapter(new ArrayAdapter<>(activity, android.R.layout.simple_spinner_dropdown_item,
                 new String[]{activity.getString(R.string.orient_landscape), activity.getString(R.string.orient_portrait), activity.getString(R.string.orient_auto)}));
-final boolean[] orientKnown = {false};
-        for (int i = 0; i < orients.length; i++) if (orients[i].equals(gs.orientation()))  { orient.setSelection(i); orientKnown[0] = true; }
+        final boolean[] orientKnown = {false};
+        for (int i = 0; i < orients.length; i++) if (orients[i].equals(gs.orientation())) { orient.setSelection(i); orientKnown[0] = true; }
         box.addView(orient);
 
         CheckBox vsync = new CheckBox(activity);
@@ -139,7 +139,7 @@ final boolean[] orientKnown = {false};
                 .setTitle(R.string.graphics)
                 .setView(sv)
                 .setPositiveButton(android.R.string.ok, (d, w) -> {
-                     // (A4-R3-12.) Unknown stored values are preserved:
+                    // (A4-R3-12.) Unknown stored values are preserved:
                     // a spinner left untouched at its display position 0
                     // must not overwrite a value the dialog never offered.
                     // Picking any other position is a real choice and is
@@ -151,8 +151,8 @@ final boolean[] orientKnown = {false};
                     gs.setResolutionScale(scale.getSelectedItemPosition() + 1);
                     gs.setPresentEffect(effects[effect.getSelectedItemPosition()]);
                     if (modeKnown[0] || mode.getSelectedItemPosition() != 0) {
-                         int[] m = modes[mode.getSelectedItemPosition()];
-                             gs.setVideoMode(m[0], m[1]);
+                        int[] m = modes[mode.getSelectedItemPosition()];
+                        gs.setVideoMode(m[0], m[1]);
                     }
                     if (orientKnown[0] || orient.getSelectedItemPosition() != 0) gs.setOrientation(orients[orient.getSelectedItemPosition()]);
                     gs.setVsync(vsync.isChecked());
