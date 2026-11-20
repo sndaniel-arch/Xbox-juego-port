@@ -214,6 +214,18 @@ void AudioSystem::Shutdown() {
   }
 
   worker_running_ = false;
+    // (Hunt v1.4.6 ronda 2, A4-R2-03.) Resume a paused worker before waiting
+    // for it: Pause() parks the worker in Wait(resume_event_) (see the
+    // shutdown-event branch of WorkerThreadMain), so it never observes the
+    // shutdown event and the 500 ms wait below always expires into the
+    // Terminate(0) last resort on a normal pause-then-teardown path. Same
+    // pattern as XmaDecoder::Shutdown, which already does
+    // `if (paused_) Resume();` before waiting for its worker. Resume() also
+    // calls xma_decoder->Resume(), which is a no-op here: the decoder was
+    // just shut down above and its own paused_ is already false.
+    if (paused_) {
+      Resume();
+    }  
   shutdown_event_->Set();
   if (worker_thread_) {
     // The worker may be stuck inside a guest callback that is itself blocked on
@@ -385,6 +397,13 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
                  num_clients, kMaximumClientCount);
     return false;
   }
+    // (Hunt v1.4.6 ronda 2, A4-R2-04.) Which clients the stream actually
+    // restores, so clients that were live before Restore but are absent from
+    // the stream can be cleared below instead of staying live with dead
+    // drivers/callbacks. Only filled in on the success path: on a failure
+    // return above, the stream was not fully consumed, so a partial seen-set
+    // must not kill live clients.
+    bool restored[kMaximumClientCount] = {};
   for (uint32_t i = 0; i < num_clients; i++) {
     auto id = stream->Read<uint32_t>();
     if (id >= kMaximumClientCount) {
@@ -404,12 +423,7 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
     client.callback_arg = stream->Read<uint32_t>();
     client.wrapped_callback_arg = stream->Read<uint32_t>();
 
-    client.in_use = true;
-
-    auto client_semaphore = client_semaphores_[id].get();
-    auto ret = client_semaphore->Release(queued_frames_, nullptr);
-    assert_true(ret);
-
+ auto client_semaphore = client_semaphores_[id].get();
     AudioDriver* driver = nullptr;
     auto status = CreateDriver(id, client_semaphore, &driver);
     if (XFAILED(status)) {
@@ -417,12 +431,35 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
           "AudioSystem::Restore - Call to CreateDriver failed with status "
           "{:08X}",
           status);
+        // Roll the half-restored client back to empty: it never became live,
+        // so it must not keep in_use=true with driver==nullptr, nor the
+        // wrapped_callback_arg copied verbatim from the untrusted stream.
+        client = {nullptr, 0, 0, 0, false};
       return false;
     }
 
     assert_not_null(driver);
+      // Only now, with a live driver, fill the semaphore and mark the client
+      // in use. (CreateDriver only stores the semaphore pointer — see
+      // SDLAudioSystem::CreateDriver — so releasing after creation instead of
+      // before changes nothing on success, and on failure above no permits
+      // are left behind for a client that does not exist.)
+      auto ret = client_semaphore->Release(queued_frames_, nullptr);
+      assert_true(ret);
     client.driver = driver;
+      client.in_use = true;
+      restored[id] = true;
   }
+
+    // Clear clients that were live before Restore but are absent from the
+    // stream: their guest state is gone, so keeping them would leave stale
+    // drivers and callbacks behind. UnregisterClient destroys the driver,
+    // frees the wrapped arg and drains the semaphore.
+    for (size_t i = 0; i < kMaximumClientCount; i++) {
+        if (clients_[i].in_use && !restored[i]) {
+            UnregisterClient(i);
+        }
+    }
 
   return true;
 }
