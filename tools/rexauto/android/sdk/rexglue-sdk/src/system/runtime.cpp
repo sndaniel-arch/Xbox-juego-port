@@ -357,8 +357,16 @@ bool Runtime::SetupVfs() {
       return true;
     }
 
-    auto abs_game_root = std::filesystem::absolute(game_data_root_);
-    if (!std::filesystem::exists(abs_game_root)) {
+    // (Hunt v1.4.6, A2-R3-16.) Non-throwing absolute()/exists(): keep the
+    // path as given when it cannot be absolutized; a stat error reads as
+    // "does not exist", which is the existing failure path below.
+    std::error_code abs_ec;
+    auto abs_game_root = std::filesystem::absolute(game_data_root_, abs_ec);
+    if (abs_ec) {
+      abs_game_root = game_data_root_;
+    }
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(abs_game_root, exists_ec)) {
       REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
       return false;
     }
@@ -384,8 +392,15 @@ bool Runtime::SetupVfs() {
 
   // Mount update_data_root as update:\ if provided
   if (!update_data_root_.empty()) {
-    auto abs_update_root = std::filesystem::absolute(update_data_root_);
-    if (std::filesystem::exists(abs_update_root)) {
+    // (Hunt v1.4.6, A2-R3-16.) Same non-throwing absolute()/exists() as
+    // the game root above.
+    std::error_code abs_ec;
+    auto abs_update_root = std::filesystem::absolute(update_data_root_, abs_ec);
+    if (abs_ec) {
+      abs_update_root = update_data_root_;
+    }
+    std::error_code exists_ec;
+    if (std::filesystem::exists(abs_update_root, exists_ec)) {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
