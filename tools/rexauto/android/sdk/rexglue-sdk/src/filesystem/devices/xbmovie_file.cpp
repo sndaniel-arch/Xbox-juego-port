@@ -95,6 +95,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/xbmovie_entry.h>
@@ -163,6 +164,12 @@ X_STATUS XbMovieFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
       REXFS_WARN("XbMovieDevice: ReadSync total denied={} (len={} offset={} access={:#x}) "
                  "-> ACCESS_DENIED",
                  denied_count, buffer.size(), byte_offset, file_access_);
+    }
+    // (Hunt v1.4.6, A2-R2-05.) Denied paths must still write the count
+    // (0, null-guarded), per the file.h contract (R6-09): a caller
+    // passing an uninitialized out-param would otherwise read stale data.
+    if (out_bytes_read) {
+      *out_bytes_read = 0;
     }
     return X_STATUS_ACCESS_DENIED;
   }
@@ -241,6 +248,11 @@ X_STATUS XbMovieFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_off
                  "first_bytes=[{}]) -> ACCESS_DENIED",
                  denied_count, buffer.size(), byte_offset, file_access_, hex);
     }
+    // (Hunt v1.4.6, A2-R2-05.) Same as ReadSync above: the denied path
+    // writes 0 (null-guarded) before returning, per file.h (R6-09).
+    if (out_bytes_written) {
+      *out_bytes_written = 0;
+    }
     return X_STATUS_ACCESS_DENIED;
   }
 
@@ -313,6 +325,14 @@ X_STATUS XbMovieFile::SetLength(size_t length) {
 }
 
 bool XbMovieFile::RecordUnimplementedIoctl(uint32_t io_control_code) {
+  // (Hunt v1.4.6, A2-R2-04.) The check-and-update must be one step: the
+  // two atomics alone let two threads with different codes interleave the
+  // reset and the increment, so a mixed-code streak could reach 64 and
+  // end the movie early for a code that never got there on its own. One
+  // small lock for the pair; the readers (IoctlBackoffMs /
+  // ConsecutiveIoctlCount) stay plain atomic loads -- a count stale by
+  // one only moves a log line / a few ms of backoff.
+  std::lock_guard<std::mutex> lock(ioctl_streak_mutex_);
   if (io_control_code != last_ioctl_code_) {
     last_ioctl_code_ = io_control_code;
     consecutive_ioctl_count_ = 0;
