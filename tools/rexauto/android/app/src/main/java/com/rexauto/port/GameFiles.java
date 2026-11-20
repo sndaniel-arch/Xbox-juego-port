@@ -6,6 +6,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
@@ -48,10 +49,16 @@ public final class GameFiles {
             File config = configFile(ctx);
             if (!config.isFile()) return null;
             byte[] bytes = new byte[(int) Math.min(config.length(), 8192)];
+            // (Hunt v1.4.6, R-A-B4.) A single read() may return short, and
+            // new String(bytes) decoded the whole buffer (zeros included)
+            // with the platform charset: loop to EOF and decode only the
+            // bytes actually read, as UTF-8.
+            int n = 0, r;
             try (FileInputStream in = new FileInputStream(config)) {
-                if (in.read(bytes) <= 0) return null;
+                while (n < bytes.length && (r = in.read(bytes, n, bytes.length - n)) > 0) n += r;
             }
-            String line = new String(bytes).split("\n", 2)[0].trim();
+            if (n <= 0) return null;
+            String line = new String(bytes, 0, n, StandardCharsets.UTF_8).split("\n", 2)[0].trim();
             return line.isEmpty() ? null : line;
         } catch (Exception e) {
             return null;
