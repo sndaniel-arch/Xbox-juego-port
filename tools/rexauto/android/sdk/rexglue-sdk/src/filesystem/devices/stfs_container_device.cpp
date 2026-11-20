@@ -54,11 +54,16 @@ StfsContainerDevice::~StfsContainerDevice() {
 
 std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
     const std::filesystem::path& file_path) {
-  if (!std::filesystem::exists(file_path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(file_path, ec)) {
     return nullptr;
   }
 
-  if (std::filesystem::file_size(file_path) < sizeof(StfsHeader)) {
+  // (Hunt v1.4.6, A2-R3-16.) Non-throwing file_size(): on error treat
+  // the header as unreadable instead of terminating the process.
+  std::error_code size_ec;
+  auto header_size = std::filesystem::file_size(file_path, size_ec);
+  if (size_ec || header_size < sizeof(StfsHeader)) {
     return nullptr;
   }
 
@@ -90,14 +95,16 @@ bool StfsContainerDevice::Initialize() {
       return false;
     }
   } else {
+    std::error_code ec_r316_1;
     // Resolve a valid STFS file if a directory is given.
-    if (std::filesystem::is_directory(host_path_) && !ResolveFromFolder(host_path_)) {
+if (std::filesystem::is_directory(host_path_, ec_r316_1) && !ResolveFromFolder(host_path_)) {
       REXFS_ERROR("Could not resolve an STFS container given path {}",
                   rex::path_to_utf8(host_path_));
       return false;
     }
+    std::error_code ec;
 
-    if (!std::filesystem::exists(host_path_)) {
+    if (!std::filesystem::exists(host_path_, ec)) {
       REXFS_ERROR("Path to STFS container does not exist: {}", rex::path_to_utf8(host_path_));
       return false;
     }
@@ -168,12 +175,13 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
     files_.emplace(std::make_pair(0, std::move(header_file)));
     return Error::kSuccess;
   }
+  std::error_code ec;
 
   // If the STFS package is multi-file, it is an SVOD system. We need to map
   // the files in the .data folder and can discard the header.
   auto data_fragment_path = host_path_;
   data_fragment_path += ".data";
-  if (!std::filesystem::exists(data_fragment_path)) {
+  if (!std::filesystem::exists(data_fragment_path, ec)) {
     REXFS_ERROR("STFS container is multi-file, but path {} does not exist.",
                 rex::path_to_utf8(data_fragment_path));
     return Error::kErrorFileMismatch;
