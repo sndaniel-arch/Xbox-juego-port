@@ -124,6 +124,12 @@ u32 XamGetOverlappedResult_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mappe
     result = X_ERROR_IO_INCOMPLETE;
   } else {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(overlapped_ptr->event);
+    // (Hunt v1.4.6, ronda 2, A3-R2-02.) LookupObject returns nullptr
+    // for an invalid/closed handle; there was no check at all here,
+    // so ev->Wait on null used to SIGSEGV the host.
+    if (!ev) {
+      return X_ERROR_INVALID_HANDLE;
+    }
     result = ev->Wait(3, 1, 0, nullptr);
     if (XSUCCEEDED(result)) {
       result = overlapped_ptr->result;
