@@ -24,6 +24,11 @@ void NullFile::Destroy() {
 
 X_STATUS NullFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read) {
   if (!(file_access_ & FileAccess::kFileReadData)) {
+    // (Hunt v1.4.6, A2-R2-05.) Denied paths must still write the count
+    // (0, null-guarded), per the file.h contract (R6-09).
+    if (out_bytes_read) {
+      *out_bytes_read = 0;
+    }
     return X_STATUS_ACCESS_DENIED;
   }
 
@@ -41,6 +46,11 @@ X_STATUS NullFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_
 X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_offset,
                              size_t* out_bytes_written) {
   if (!(file_access_ & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
+    // (Hunt v1.4.6, A2-R2-05.) Denied paths must still write the count
+    // (0, null-guarded), per the file.h contract (R6-09).
+    if (out_bytes_written) {
+      *out_bytes_written = 0;
+    }
     return X_STATUS_ACCESS_DENIED;
   }
 
