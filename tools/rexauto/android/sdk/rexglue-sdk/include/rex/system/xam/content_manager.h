@@ -130,6 +130,13 @@ class ContentPackage {
 
   uint32_t GetPackageLicense() const { return license_; }
 
+// (Hunt v1.4.6, A2-R3-15.) True only when Initialize() succeeded and
+// the device + symlink were registered. A package whose device failed
+// to initialize is a phantom: the guest would open root_name: and get
+// NO_SUCH_FILE while the manager believes the package is open.
+// ResolvePackage() returns nullptr for it instead.
+bool is_open() const { return device_registered_; }
+
  private:
   KernelState* kernel_state_;
   std::string root_name_;
@@ -137,6 +144,7 @@ class ContentPackage {
   std::filesystem::path package_path_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_ = 0;
+bool device_registered_= false;
 };
 
 class ContentManager {
