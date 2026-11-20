@@ -36,7 +36,19 @@ X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   }
   size_t real_offset = entry_->data_offset() + byte_offset;
   size_t real_length = std::min(buffer.size(), entry_->data_size() - byte_offset);
-  std::memcpy(buffer.data(), entry_->mmap()->data() + real_offset, real_length);
+// (Hunt v1.4.6, A2-R2-07.) Defense in depth for the ReadEntry check in
+    // disc_image_device.cpp: a data range that runs past the mapped image
+    // must fail, not memcpy out of bounds. Unreachable for entries built
+    // by ReadEntry (it rejects them at mount), but ReadSync is the last
+    // place the memcpy can still be stopped.
+    if (real_offset > entry_->mmap()->size() ||
+        real_length > entry_->mmap()->size() - real_offset) {
+        if (out_bytes_read) {
+            *out_bytes_read = 0;
+        }
+        return X_STATUS_UNSUCCESSFUL;
+    }
+    std::memcpy(buffer.data(), entry_->mmap()->data() + real_offset, real_length);
   // (Hunt v1.4.6, A2-R6-09.) Null-guarded write of the count.
   if (out_bytes_read) {
     *out_bytes_read = real_length;
