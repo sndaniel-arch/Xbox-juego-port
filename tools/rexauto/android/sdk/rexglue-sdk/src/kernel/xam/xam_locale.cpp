@@ -222,6 +222,12 @@ u32 XamGetOnlineCountryFromLocale_entry(u32 id) {
 }
 
 u32 XamGetOnlineCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) buffer was never checked:
+  // store_and_swap writes through it unconditionally, so a NULL
+  // buffer with a plausible length SIGSEGVd the host.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -242,6 +248,10 @@ u32 XamGetOnlineCountryString_entry(u32 id, u32 buffer_length, mapped_wstring bu
 }
 
 u32 XamGetCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -262,6 +272,10 @@ u32 XamGetCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) 
 }
 
 u32 XamGetLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -283,6 +297,10 @@ u32 XamGetLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer)
 
 u32 XamGetLanguageLocaleString_entry(u32 language_id, u32 locale_id, u32 buffer_length,
                                      mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -309,6 +327,10 @@ u32 XamGetLanguageLocaleString_entry(u32 language_id, u32 locale_id, u32 buffer_
 
 u32 XamGetOnlineLanguageAndCountryString_entry(u32 language_id, u32 country_id, u32 buffer_length,
                                                mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -334,6 +356,10 @@ u32 XamGetOnlineLanguageAndCountryString_entry(u32 language_id, u32 country_id, 
 }
 
 u32 XamGetLocaleString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -362,6 +388,10 @@ u32 XamGetLanguageFromOnlineLanguage_entry(u32 id) {
 }
 
 u32 XamGetOnlineLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-09.) See XamGetOnlineCountryString.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
