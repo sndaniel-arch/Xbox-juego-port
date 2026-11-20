@@ -253,6 +253,13 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+  // (Caza v1.4.6 ronda 4, A1-R4-03.) Current nesting depth of indirect
+  // buffers: ExecuteIndirectBuffer increments it on entry and decrements
+  // it on exit, and refuses to recurse past kMaxIndirectBufferDepth.
+  // Plain (non-atomic) member: indirect-buffer execution is synchronous
+  // on the single command processor worker thread, so no other thread
+  // can observe or mutate it.
+  uint32_t indirect_buffer_depth_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
