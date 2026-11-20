@@ -343,14 +343,34 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     return -1;
   }
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-02.) `buffers` is a guest pointer: NULL
+  // with num_buffers > 0 used to dereference a null host pointer on the
+  // first iteration. The combined length is guest-controlled, so
+  // accumulate in 64 bits and reject anything over 16 MiB before sizing
+  // the host vector -- two 0x80000000 buffers used to wrap the old
+  // uint32_t sum to 0, resize(0), then memcpy ~4 GiB into an empty
+  // vector (host heap overflow).
+  if (num_buffers && !buffers) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+  uint64_t combined_buffer_size = 0;
+  for (uint32_t i = 0; i < num_buffers; i++) {
+    combined_buffer_size += buffers[i].len;
+    if (combined_buffer_size > 16u * 1024u * 1024u) {
+      // WSAEMSGSIZE
+      XThread::SetLastError(0x2738);
+      return -1;
+    }
+  }
+
   // Our sockets implementation doesn't support multiple buffers, so we need
   // to combine the buffers the game has given us!
   std::vector<uint8_t> combined_buffer_mem;
-  uint32_t combined_buffer_size = 0;
+  combined_buffer_mem.resize(static_cast<size_t>(combined_buffer_size));
   uint32_t combined_buffer_offset = 0;
   for (uint32_t i = 0; i < num_buffers; i++) {
-    combined_buffer_size += buffers[i].len;
-    combined_buffer_mem.resize(combined_buffer_size);
     uint8_t* combined_buffer = combined_buffer_mem.data();
 
     std::memcpy(combined_buffer + combined_buffer_offset,
@@ -358,8 +378,23 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     combined_buffer_offset += buffers[i].len;
   }
 
-  N_XSOCKADDR_IN native_to(to_ptr);
-  socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
+  // (Hunt v1.4.6, ronda 3, A3-R3-01.) A NULL destination is legitimate
+  // Winsock use (send on the connected socket); the old unconditional
+  // N_XSOCKADDR_IN constructor dereferenced it and SIGSEGVd the host.
+  // XSocket::SendTo already takes a null `to` -- pass it through.
+  N_XSOCKADDR_IN native_to;
+  if (to_ptr) {
+    native_to = *to_ptr;
+  }
+  int bytes_sent = socket->SendTo(combined_buffer_mem.data(),
+                                  static_cast<uint32_t>(combined_buffer_size), flags,
+                                  to_ptr ? &native_to : nullptr, to_len);
+
+  // (Hunt v1.4.6, ronda 3, A3-R3-16.) The out-param was never written:
+  // the guest read stale memory after a "successful" send.
+  if (num_bytes_sent) {
+    *num_bytes_sent = bytes_sent < 0 ? 0u : static_cast<uint32_t>(bytes_sent);
+  }
 
   // TODO: Instantly complete overlapped
 
@@ -701,6 +736,16 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     return -1;
   }
 
+  // (Hunt v1.4.6, ronda 3, A3-R3-01.) A NULL name used to crash the
+  // host twice over: the N_XSOCKADDR_IN constructor dereferences it,
+  // and XSocket::Bind reads name->sin_port. bind with no address is
+  // invalid input, not a connected-socket send -- WSAEFAULT.
+  if (!name) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   N_XSOCKADDR_IN native_name(name);
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
@@ -716,6 +761,15 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  // (Hunt v1.4.6, ronda 3, A3-R3-01.) As in bind above: the
+  // N_XSOCKADDR constructor dereferences a NULL name. connect with no
+  // address is invalid input -- WSAEFAULT.
+  if (!name) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
     return -1;
   }
 
@@ -769,7 +823,15 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
   auto new_socket = socket->Accept(&native_addr, &native_len);
   if (new_socket) {
     addr_ptr->address_family = native_addr.address_family;
-    std::memcpy(addr_ptr->sa_data, native_addr.sa_data, *addrlen_ptr - 2);
+    // (Hunt v1.4.6, ronda 3, A3-R3-03.) *addrlen_ptr is guest-controlled:
+    // 0 or 1 used to wrap `*addrlen_ptr - 2` to ~4 GiB in the memcpy,
+    // and > 16 over-read the 14-byte host sa_data. Copy at most what
+    // fits, and only when the guest length holds an address family.
+    uint32_t addrlen = static_cast<uint32_t>(*addrlen_ptr);
+    if (addrlen >= 2) {
+      std::memcpy(addr_ptr->sa_data, native_addr.sa_data,
+                  std::min<uint32_t>(addrlen - 2, (uint32_t)sizeof(addr_ptr->sa_data)));
+    }
     *addrlen_ptr = native_len;
 
     return new_socket->handle();
@@ -823,7 +885,14 @@ struct host_set {
   void Store(fd_set* native_set) {
     FD_ZERO(native_set);
     for (uint32_t i = 0; i < this->count; ++i) {
-      FD_SET(this->sockets[i]->native_handle(), native_set);
+      // (Hunt v1.4.6, ronda 3, A3-R3-21.) FD_SET on a host fd >=
+      // FD_SETSIZE writes past the stack fd_set (undefined behaviour).
+      // Host fds come from socket() and are normally small; skip any
+      // that are not representable instead of corrupting the stack.
+      uint64_t native_handle = this->sockets[i]->native_handle();
+      if (native_handle < (uint64_t)FD_SETSIZE) {
+        FD_SET((int)native_handle, native_set);
+      }
     }
   }
 
@@ -831,7 +900,10 @@ struct host_set {
     uint32_t new_count = 0;
     for (uint32_t i = 0; i < this->count; ++i) {
       auto socket = this->sockets[i];
-      if (FD_ISSET(socket->native_handle(), native_set)) {
+      // (Hunt v1.4.6, ronda 3, A3-R3-21.) FD_ISSET has the same
+      // FD_SETSIZE bound as FD_SET; a skipped fd was never set.
+      uint64_t native_handle = socket->native_handle();
+      if (native_handle < (uint64_t)FD_SETSIZE && FD_ISSET((int)native_handle, native_set)) {
         this->sockets[new_count++] = socket;
       }
     }
@@ -868,6 +940,13 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
     chrono::Clock::ScaleGuestDurationTimeval(reinterpret_cast<int32_t*>(&timeout.tv_sec),
                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
     timeout_in = &timeout;
+  }
+  // (Hunt v1.4.6, ronda 3, A3-R3-21.) nfds is guest-controlled and was
+  // passed straight to the host select(): out of range is undefined
+  // for select() (Linux returns EINVAL, but the contract is not
+  // portable). Reject it here with the same -1 the host would give.
+  if (nfds < 0 || nfds > FD_SETSIZE) {
+    return -1;
   }
   int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
@@ -959,11 +1038,23 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
     return -1;
   }
 
-  N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  // (Hunt v1.4.6, ronda 3, A3-R3-01.) A NULL destination is legitimate
+  // Winsock use (send on the connected socket); XSocket::SendTo
+  // already takes a null `to` -- pass it through instead of crashing
+  // the host in the N_XSOCKADDR_IN constructor.
+  N_XSOCKADDR_IN native_to;
+  if (to_ptr) {
+    native_to = *to_ptr;
+  }
+  return socket->SendTo(buf_ptr, buf_len, flags, to_ptr ? &native_to : nullptr, to_len);
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-04.) A NULL fd_set used to be
+  // dereferenced for fd_count below. Not a member -> not in the set.
+  if (!fd_set) {
+    return 0;
+  }
   const uint8_t max_fd_count = std::min((uint32_t)fd_set->fd_count, uint32_t(64));
   for (uint8_t i = 0; i < max_fd_count; i++) {
     if (fd_set->fd_array[i] == socket_handle) {
