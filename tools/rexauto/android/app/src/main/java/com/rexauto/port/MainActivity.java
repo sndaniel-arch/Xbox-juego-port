@@ -218,6 +218,7 @@ public class MainActivity extends SDLActivity {
         if (!mHasMultiWindow) pauseEmulation();
         super.onPause();
     }
+
     /**
      * (Hunt v1.4.6 ronda 3, A4-R3-03.) Focus loss pauses the SDL thread
      * but NOT the guest: opening any in-game dialog (gear menu, graphics
