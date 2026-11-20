@@ -171,7 +171,7 @@ bool ReXApp::SetupEnvironment() {
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
                          cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
-    std::error_code ec_r316_2;
+  std::error_code ec_r316_2;
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
