@@ -936,8 +936,8 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
     if (alertable && result == X_STATUS_USER_APC) {
       // (Hunt v1.4.6, ronda 3, A3-R3-20.) GetCurrentThread() is null
-    // on a host thread with no guest TLS; DeliverAPCs only when there is one.
-    if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
+      // on a host thread with no guest TLS; DeliverAPCs only when there is one.
+      if (auto* current_thread = XThread::GetCurrentThread()) current_thread->DeliverAPCs();
     }
   } else {
     result = X_STATUS_INVALID_HANDLE;
