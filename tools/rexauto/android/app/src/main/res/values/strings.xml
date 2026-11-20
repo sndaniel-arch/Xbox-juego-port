@@ -62,6 +62,11 @@
     <string name="orient_landscape">Horizontal (por defecto)</string>
     <string name="orient_auto">Seguir la rotación del dispositivo</string>
     <string name="gfx_preset">Preajuste de rendimiento</string>
+    <string name="gfx_restart_required">Los cambios se aplican al reiniciar el juego.</string>
+    <string name="gfx_restart_now">Reiniciar ahora</string>
+    <string name="gfx_restart_later">Más tarde</string>
+    <string name="err_settings_write">No se pudieron guardar los ajustes (%1$s). El juego se inicia con los ajustes anteriores.</string>
+    <string name="err_driver_disable">No se pudo quitar el controlador GPU seleccionado (%1$s). El juego puede arrancar con ese controlador.</string>
     <string name="preset_performance">Rendimiento (por defecto en teléfonos)</string>
     <string name="preset_balanced">Equilibrado</string>
     <string name="preset_accuracy">Precisión (valores de escritorio)</string>
