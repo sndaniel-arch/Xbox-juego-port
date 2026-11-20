@@ -10,6 +10,7 @@
  */
 
 #include <array>
+#include <cstring>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -96,8 +97,9 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
+        std::error_code ec;
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
-        if (!std::filesystem::exists(mappings_path)) {
+        if (!std::filesystem::exists(mappings_path, ec)) {
           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
                       REXCVAR_GET(hid_mappings_file));
         } else {
@@ -156,7 +158,17 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
                      static_cast<int>(sizeof(guid_text)));
     info.guid = guid_text;
-    info.synthetic = false;
+        // (Hunt v1.4.6 ronda 3, A4-R3-04). The virtual touch pad is synthetic:
+    // InputSystem parks synthetic devices on kSyntheticOrdinal and
+    // SlotAssignment routes them to guest user 0 alongside a physical pad,
+    // so a real pad always takes ordinal 0 (Aurora) instead of landing on
+    // user 1 (Igniculus) depending on connection order. Matched by NAME
+    // only, deliberately not by VID/PID: the virtual pad copies the Xbox
+    // 360 identity (0x045E/0x028E, android_gamepad.cpp), so a VID/PID
+    // match would also flag a real wired Xbox 360 pad synthetic. The
+    // name "Child of Light Touch Pad" is set only by the virtual pad.
+    info.synthetic = name && std::strcmp(name, "Child of Light Touch Pad") == 0;
+    
     out.push_back(info);
   }
 }
@@ -436,9 +448,26 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+  // (Hunt v1.4.6 ronda 3, A4-R3-14). SDL normally sends one ADD per
+  // instance, but a duplicate ADD for an id already in controllers_ would
+  // push a second entry for one SDL_Gamepad; a later REMOVE closes/erases
+  // only one, leaving a dangling entry behind. Guard on the instance id
+  // before opening. (Verified in code as a missing guard; no duplicate
+  // ADD was ever observed, so the guard is defense in depth.)
+  if (GetControllerIndexFromInstanceID(event.gdevice.which)) {
+    REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored duplicate ADD for instance {}.",
+                    static_cast<int>(event.gdevice.which));
+        return;
+  }
   const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
-    assert_always();
+    // (A4-R3-14). The old code only had assert_always() here — a no-op
+    // in Release — so a pad that disconnected between the ADD event and
+    // the open vanished with no log line at all. Log the real SDL error
+    // with the instance id; SDL will not re-send ADD for this pad.
+    REXLOG_ERROR("SDL OnControllerDeviceAdded: SDL_OpenGamepad({}) failed: {}",
+                     static_cast<int>(event.gdevice.which), SDL_GetError());
+    
     return;
   }
   REXLOG_INFO(
@@ -541,16 +570,20 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
           X_INPUT_GAMEPAD_DPAD_LEFT,
           X_INPUT_GAMEPAD_DPAD_RIGHT,
           // There are additional buttons only available on some controllers.
-          // For now just assign sensible defaults
+          // (Hunt v1.4.6 ronda 3, A4-R3-13.) The old table mapped these to
+  // face buttons / Guide, so an Xbox Elite paddle fired Y/B/X/A in
+  // game and a PS touchpad click fired Guide. 0 is no XInput bit:
+  // pressing one now does nothing, like the unknown-button path
+  // below, instead of pressing a button the player never touched.
           // Misc:
-          X_INPUT_GAMEPAD_GUIDE,
+          0,
           // Xbox Elite paddles:
-          X_INPUT_GAMEPAD_Y,
-          X_INPUT_GAMEPAD_B,
-          X_INPUT_GAMEPAD_X,
-          X_INPUT_GAMEPAD_A,
+          0,
+          0,
+          0,
+          0,
           // PS touchpad button
-          X_INPUT_GAMEPAD_GUIDE,
+          0,
       };
   static_assert(SDL_GAMEPAD_BUTTON_SOUTH == 0);
   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);
