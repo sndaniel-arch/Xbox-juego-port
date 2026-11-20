@@ -268,12 +268,12 @@ class MessageBoxDialog : public XamDialog {
 u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_wstring text_ptr,
                               u32 button_count, mapped_u32 button_ptrs, u32 active_button,
                               u32 flags, mapped_u32 result_ptr, mapped_void overlapped) {
-    // (Audit A3, ronda 6, R6-06.) result_ptr is written by the lambdas
-    // below (headless run + dialog close); a NULL one used to write the
-    // chosen button to guest address 0 when the dialog closed.
-    if (!result_ptr) {
-      return X_ERROR_INVALID_PARAMETER;
-    }
+  // (Audit A3, ronda 6, R6-06.) result_ptr is written by the lambdas
+  // below (headless run + dialog close); a NULL one used to write the
+  // chosen button to guest address 0 when the dialog closed.
+  if (!result_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   REXKRNL_DEBUG(
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
@@ -509,12 +509,12 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_flags,
                                   u64 total_requested, mapped_u32 device_id_ptr,
                                   mapped_void overlapped) {
-    // (Audit A3, ronda 6, R6-06.) device_id_ptr is written by the
-    // headless lambda below; a NULL one used to write the device id to
-    // guest address 0.
-    if (!device_id_ptr) {
-      return X_ERROR_INVALID_PARAMETER;
-    }
+  // (Audit A3, ronda 6, R6-06.) device_id_ptr is written by the
+  // headless lambda below; a NULL one used to write the device id to
+  // guest address 0.
+  if (!device_id_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   REXKRNL_INFO("XamShowDeviceSelectorUI({:08X}, {:08X}, {:08X}, {:016X}, {:08X}, {:08X})",
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
