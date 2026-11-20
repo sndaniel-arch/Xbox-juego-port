@@ -1148,6 +1148,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  // (Hunt v1.4.6 round 3, V-01 second sweep.) Declared here, in Resolve():
+  // the first version of the oversize guard below used `device_properties`
+  // without declaring it — the file has locals of that name only in other
+  // functions (Initialize:201, etc.), not in this scope.
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      vulkan_device->properties();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   // Copying.
@@ -1219,10 +1225,36 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                                          resolve_info.copy_dest_extent_length);
       }
-      if (!copy_dest_committed) {
+      // (Hunt v1.4.6 round 3, A1-R3-01 same-class, coordinator second sweep.)
+  // Same maxStorageBufferRange bound as the texture-cache compute load:
+  // the destination descriptor below covers the whole resolve range in
+  // one storage-buffer range, and the Vulkan spec requires range <=
+  // maxStorageBufferRange (128 MiB minimum, device_properties above). A
+  // full-screen 720p RGBA8 resolve is ~3.7 MiB, so this only fires on
+  // absurd ranges — but emitting an out-of-limit descriptor is invalid
+  // usage, so refuse deterministically instead: skip the copy, leave
+  // `copied` false (same as the!copy_dest_committed path above), and
+  // retry next submission. Full descriptor switching (the upstream
+  // TODO below) is still open.
+  const bool copy_dest_range_oversize =
+      copy_dest_range_length > device_properties.maxStorageBufferRange;
+  if (copy_dest_range_oversize) {
+    static bool resolve_range_oversize_logged = false;
+    if (!resolve_range_oversize_logged) {
+      resolve_range_oversize_logged = true;
+      REXGPU_WARN(
+        "VulkanRenderTargetCache: Resolve destination range ({} MiB) "
+        "exceeds maxStorageBufferRange ({} MiB); skipping resolve",
+        copy_dest_range_length >> 20,
+        uint64_t(device_properties.maxStorageBufferRange) >> 20);
+    }
+  }
+  if (!copy_dest_committed) {
         REXGPU_ERROR(
             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
+  } else if (copy_dest_range_oversize) {
+    // Skip: no descriptor emitted, `copied` stays false.
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
