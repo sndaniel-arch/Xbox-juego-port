@@ -62,7 +62,11 @@ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
     REXFS_WARN("Refusing self-referential symbolic link: {} => {}", path, target);
     return false;
   }
-  symlinks_.insert({std::string(path), std::string(target)});
+  // (Hunt v1.4.6, A2-R2-08.) insert() keeps the old target when the key
+  // already exists while this function still returns true, so a
+  // re-registration silently changed nothing. Overwrite instead: the
+  // caller (and the log line below) is told the new target took effect.
+  symlinks_.insert_or_assign(std::string(path), std::string(target));
   REXFS_DEBUG("Registered symbolic link: {} => {}", path, target);
 
   return true;
@@ -83,6 +87,12 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::string& target) {
+  // (Hunt v1.4.6, A2-R2-03.) This is the only symlinks_ access that ran
+  // without the VFS lock: Register/Unregister take it, and the callers
+  // (NtOpenSymbolicLinkObject, ContentManager) run on guest threads, so a
+  // concurrent insert during this find_if was UB on the unordered_map.
+  // Same lock as its sisters (recursive: safe even if a caller holds it).
+  auto global_lock = global_critical_region_.Acquire();
   auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
     return rex::string::utf8_starts_with_case(path, s.first);
   });
