@@ -261,7 +261,7 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     return status;
   };
 
-// (Hunt v1.4.6, A2-R3-07.) Same null guard the sibling
+  // (Hunt v1.4.6, A2-R3-07.) Same null guard the sibling
   // NtQueryInformationFile has (R6-06): without it every case below
   // dereferences info_ptr.as<T*>() at guest address 0 -- the
   // XFileEndOfFileInformation case would call SetLength() with whatever
@@ -419,7 +419,7 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
     return status;
   };
 
-    // (Hunt v1.4.6, A2-R3-07, same-class extension.) No null guard here
+  // (Hunt v1.4.6, A2-R3-07, same-class extension.) No null guard here
   // either: info_ptr.Zero() below would write to guest address 0.
   if (!info_ptr) {
     return fail(X_STATUS_INVALID_PARAMETER);
