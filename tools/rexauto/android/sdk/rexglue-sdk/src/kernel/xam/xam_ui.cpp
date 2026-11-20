@@ -81,7 +81,11 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto run = [dialog, close_callback]() -> X_RESULT {
-    X_RESULT result;
+    // (Hunt v1.4.6, ronda 3, A3-R3-18.) result was uninitialised: it
+    // is only assigned inside the close callback, which never runs
+    // when there is no UI thread (the else branch below just deletes
+    // the dialog). The caller then returned stack garbage.
+    X_RESULT result = X_ERROR_FUNCTION_FAILED;
     dialog->set_close_callback(
         [&dialog, &result, &close_callback]() { result = close_callback(dialog); });
     rex::thread::Fence fence;
@@ -123,7 +127,12 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
   };
   auto run = [dialog, close_callback](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
-    X_RESULT result;
+    // (Hunt v1.4.6, ronda 3, A3-R3-18.) As in xeXamDispatchDialog:
+    // result/extended_error/length are only assigned inside the close
+    // callback, which never runs when there is no UI thread.
+    X_RESULT result = X_ERROR_FUNCTION_FAILED;
+    extended_error = X_ERROR_FUNCTION_FAILED;
+    length = 0;
     dialog->set_close_callback([&dialog, &result, &extended_error, &length, &close_callback]() {
       result = close_callback(dialog, extended_error, length);
     });
@@ -146,7 +155,10 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
   };
   if (!overlapped) {
     pre();
-    uint32_t extended_error, length;
+    // (Hunt v1.4.6, ronda 3, A3-R3-18.) See xeXamDispatchDialogEx
+    // above: these are only assigned inside the close callback.
+    uint32_t extended_error = X_ERROR_FUNCTION_FAILED;
+    uint32_t length = 0;
     auto result = run(extended_error, length);
     post();
     // TODO(gibbed): do something with extended_error/length?
@@ -293,6 +305,13 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
                              : "";
 
   std::vector<std::string> buttons;
+  // (Hunt v1.4.6, ronda 3, A3-R3-12.) button_ptrs was the one
+  // pointer in this function without a guard (result_ptr, title_ptr
+  // and text_ptr all have one): button_count > 0 with a NULL array
+  // SIGSEGVd the host on the first iteration.
+  if (button_count && !button_ptrs) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   for (uint32_t i = 0; i < button_count; ++i) {
     uint32_t button_ptr = button_ptrs[i];
     auto button = rex::memory::load_and_swap<std::u16string>(
