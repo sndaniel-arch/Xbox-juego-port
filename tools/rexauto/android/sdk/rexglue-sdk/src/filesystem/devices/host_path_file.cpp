@@ -27,6 +27,11 @@ void HostPathFile::Destroy() {
 X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                 size_t* out_bytes_read) {
   if (!(file_access_ & (FileAccess::kGenericRead | FileAccess::kFileReadData))) {
+    // (Hunt v1.4.6, A2-R2-05.) Denied paths must still write the count
+    // (0, null-guarded), per the file.h contract (R6-09).
+    if (out_bytes_read) {
+      *out_bytes_read = 0;
+    }
     return X_STATUS_ACCESS_DENIED;
   }
 
@@ -57,6 +62,11 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
                                  size_t* out_bytes_written) {
   if (!(file_access_ &
         (FileAccess::kGenericWrite | FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
+    // (Hunt v1.4.6, A2-R2-05.) Denied paths must still write the count
+    // (0, null-guarded), per the file.h contract (R6-09).
+    if (out_bytes_written) {
+      *out_bytes_written = 0;
+    }
     return X_STATUS_ACCESS_DENIED;
   }
 
@@ -71,7 +81,13 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
     if (out_bytes_written) {
       *out_bytes_written = 0;
     }
-    return X_STATUS_END_OF_FILE;
+    // (Hunt v1.4.6, A2-R2-06.) A failed pwrite is a real I/O error
+    // (EIO, ENOSPC, EFBIG, EBADF -- EINTR is retried and a 0-progress
+    // write reports success with a partial count, so reaching here
+    // always means an error), not end-of-file: EOF is not a write
+    // status, and a guest treating EOF-on-write as "done" would stop
+    // writing silently on a full disk instead of seeing the error.
+    return X_STATUS_UNSUCCESSFUL;
   }
 }
 
@@ -83,7 +99,9 @@ X_STATUS HostPathFile::SetLength(size_t length) {
   if (file_handle_->SetLength(length)) {
     return X_STATUS_SUCCESS;
   } else {
-    return X_STATUS_END_OF_FILE;
+    // (Hunt v1.4.6, A2-R2-06.) Same as WriteSync above: a failed
+    // truncate is an I/O error, not end-of-file.
+    return X_STATUS_UNSUCCESSFUL;
   }
 }
 
