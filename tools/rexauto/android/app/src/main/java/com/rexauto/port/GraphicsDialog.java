@@ -132,10 +132,47 @@ public final class GraphicsDialog {
                     gs.setTolerant(tolerant.isChecked());
                     gs.setExperimentalGpuDriver(experimentalDriver.isChecked());
                     gs.setExtra(extra.getText().toString());
-                    try { gs.write(activity); } catch (Exception e) { Toast.makeText(activity, e.toString(), Toast.LENGTH_LONG).show(); }
+                    try {
+                        gs.write(activity);
+                        // (Hunt v1.4.6, A4-R6-02.) settings.txt is only read
+                        // once, at startup: nothing above takes effect
+                        // until the game restarts, and before this the
+                        // dialog said nothing at all. Offer the restart
+                        // now instead of leaving the player believing the
+                        // change applied.
+                        showRestartDialog(activity);
+                    } catch (Exception e) { Toast.makeText(activity, e.toString(), Toast.LENGTH_LONG).show(); }
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
+    }
+
+    /** After a successful write, offer the restart the settings need. */
+    private static void showRestartDialog(Activity activity) {
+        if (activity.isFinishing() || activity.isDestroyed()) return;
+        new AlertDialog.Builder(activity)
+                .setMessage(R.string.gfx_restart_required)
+                .setPositiveButton(R.string.gfx_restart_now, (d, w) -> restartGame(activity))
+                .setNegativeButton(R.string.gfx_restart_later, null)
+                .show();
+    }
+
+    /**
+     * Restart the game so the new settings.txt takes effect. The native
+     * runtime (SDL thread + guest threads) lives in this process, so
+     * finishing the activity alone would leave it running: queue the fresh
+     * MainActivity with the system first, then exit this process. The
+     * queued launch survives the exit (ActivityManager holds the intent),
+     * so the game comes back in a fresh process; SetupActivity routes
+     * straight back into MainActivity because the game root is valid.
+     * Phone verification required: this path has no CI coverage.
+     */
+    private static void restartGame(Activity activity) {
+        Intent i = new Intent(activity, MainActivity.class);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        activity.startActivity(i);
+        activity.finish();
+        System.exit(0);
     }
 
     private static void label(Activity activity, LinearLayout parent, int text) {
