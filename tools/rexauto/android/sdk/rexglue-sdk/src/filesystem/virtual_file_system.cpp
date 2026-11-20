@@ -93,13 +93,23 @@ bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::strin
   // concurrent insert during this find_if was UB on the unordered_map.
   // Same lock as its sisters (recursive: safe even if a caller holds it).
   auto global_lock = global_critical_region_.Acquire();
-  auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
-    return rex::string::utf8_starts_with_case(path, s.first);
-  });
-  if (it == symlinks_.cend()) {
+  // (Hunt v1.4.6, A2-R3-11.) Overlapping prefixes used to resolve by
+  // unordered_map order: find_if takes the FIRST prefix match, so if two
+  // registered links ever overlap (e.g. "game:" and "game:\dlc") which
+  // target won was hash order, not the longest match. Scan the whole map
+  // and keep the longest matching prefix.
+auto best = symlinks_.cend();
+  for (auto it = symlinks_.cbegin(); it != symlinks_.cend(); ++it) {
+    if (rex::string::utf8_starts_with_case(path, it->first) &&
+            (best == symlinks_.cend() || it->first.size() > best->first.size()) {
+          best = it;
+    }
+  }
+  if (best == symlinks_.cend()) {
     return false;
   }
-  target = (*it).second;
+  target = best->second;
+  
   return true;
 }
 
@@ -119,9 +129,16 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
   std::string resolved_prefixes[kMaxSymbolicLinkResolutions];
   size_t resolutions = 0;
   while (true) {
-    auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
-      return rex::string::utf8_starts_with_case(result, s.first);
-    });
+    // (Hunt v1.4.6, A2-R3-11.) Same longest-prefix rule as
+    // FindSymbolicLink above: the old find_if took the first prefix match
+    // in unordered_map order, so overlapping links resolved arbitrarily.
+auto it = symlinks_.cend();
+for (auto candidate = symlinks_.cbegin(); candidate != symlinks_.cend(); ++candidate) {
+  if (rex::string::utf8_starts_with_case(result, candidate->first) &&
+          (it == symlinks_.cend() || candidate->first.size() > it->first.size()) {
+          it = candidate;
+  }
+}
     if (it == symlinks_.cend()) {
       break;
     }
@@ -278,6 +295,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
   if (entry) {
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
+      // (Hunt v1.4.6, A2-R3-05.) Every exit must write *out_action:
+      // NtCreateFile copies it into the caller's IO_STATUS_BLOCK even on
+      // failure, and an unwritten value there is uninitialized stack.
+      *out_action = FileAction::kDoesNotExist;
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
@@ -285,8 +306,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     if (parent_entry) {
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
+        std::error_code ec;
         const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
-        if (!std::filesystem::exists(file_path)) {
+        if (!std::filesystem::exists(file_path, ec)) {
           entry->Delete();
           entry = nullptr;
         }
@@ -337,10 +359,14 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       case FileDisposition::kCreate:
         // Shouldn't be possible to hit this.
         assert_always();
+        // (Hunt v1.4.6, A2-R3-05.) See the FILE_IS_A_DIRECTORY exit
+      // above: the action must be written on failure paths too.
+      *out_action = FileAction::kDoesNotExist;
         return X_STATUS_ACCESS_DENIED;
       case FileDisposition::kSuperscede:
         // Replace (by delete + recreate).
         if (!entry->Delete()) {
+          *out_action = FileAction::kDoesNotExist;
           return X_STATUS_ACCESS_DENIED;
         }
         entry = nullptr;
@@ -358,6 +384,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         if (entry->Delete()) {
           entry = nullptr;
         } else if (!entry->Truncate()) {
+          *out_action = FileAction::kDoesNotExist;
           return X_STATUS_ACCESS_DENIED;
         }
         *out_action = FileAction::kOverwritten;
@@ -368,6 +395,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     // Create if needed (either new or as a replacement).
     entry = CreatePath(path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
     if (!entry) {
+      *out_action = FileAction::kDoesNotExist;
       return X_STATUS_ACCESS_DENIED;
     }
   }
