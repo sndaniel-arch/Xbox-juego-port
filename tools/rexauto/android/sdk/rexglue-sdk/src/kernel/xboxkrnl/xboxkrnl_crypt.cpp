@@ -50,6 +50,11 @@ typedef struct {
 static_assert_size(XECRYPT_RC4_STATE, 0x102);
 
 void XeCryptRc4Key_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void key, u32 key_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) NULL rc4_ctx/key used to write
+  // rc4_ctx->S and read key[x] unconditionally. Void entry: skip.
+  if (!rc4_ctx || !key) {
+    return;
+  }
   // Setup RC4 state
   rc4_ctx->i = rc4_ctx->j = 0;
   for (uint32_t x = 0; x < 0x100; x++) {
@@ -66,6 +71,10 @@ void XeCryptRc4Key_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void key, 
 }
 
 void XeCryptRc4Ecb_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void data, u32 size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) As above: NULL rc4_ctx/data.
+  if (!rc4_ctx || !data) {
+    return;
+  }
   // Crypt data
   for (uint32_t idx = 0; idx < size; idx++) {
     rc4_ctx->i = (rc4_ctx->i + 1) % 0x100;
@@ -108,6 +117,11 @@ void StoreSha1(const sha1::SHA1* sha, XECRYPT_SHA_STATE* state) {
 }
 
 void XeCryptShaInit_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) Zero() is null-safe, the state
+  // writes below are not.
+  if (!sha_state) {
+    return;
+  }
   sha_state.Zero();
 
   sha_state->state[0] = 0x67452301;
@@ -119,6 +133,11 @@ void XeCryptShaInit_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state) {
 
 void XeCryptShaUpdate_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, mapped_void input,
                             u32 input_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) InitSha1 dereferences
+  // sha_state and processBytes reads through input.
+  if (!sha_state || (!input && input_size)) {
+    return;
+  }
   sha1::SHA1 sha;
   InitSha1(&sha, sha_state);
 
@@ -129,6 +148,11 @@ void XeCryptShaUpdate_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, mapped_void 
 
 void XeCryptShaFinal_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, ppc_ptr_t<uint8_t> out,
                            u32 out_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) InitSha1 dereferences
+  // sha_state; the digest copy writes through out.
+  if (!sha_state || !out) {
+    return;
+  }
   sha1::SHA1 sha;
   InitSha1(&sha, sha_state);
 
@@ -155,7 +179,12 @@ void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2
 
   uint8_t digest[0x14];
   sha.finalize(digest);
-  std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size), output.as<uint8_t*>());
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) The three inputs are guarded
+  // above; output was not -- the copy wrote through a null pointer.
+  if (output && output_size) {
+    std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size,
+                output.as<uint8_t*>();
+  }
 }
 
 // TODO: Size of this struct hasn't been confirmed yet.
@@ -166,6 +195,10 @@ typedef struct {
 } XECRYPT_SHA256_STATE;
 
 void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
+// (Hunt v1.4.6, ronda 3, A3-R3-05.) As XeCryptShaInit above.
+  if (!sha_state) {
+    return;
+  }
   sha_state.Zero();
 
   sha_state->state[0] = 0x6a09e667;
@@ -180,6 +213,11 @@ void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
 
 void XeCryptSha256Update_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, mapped_void input,
                                u32 input_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) sha_state->state/buffer are
+  // read before the hash runs; sha.add reads through input.
+  if (!sha_state || (!input && input_size)) {
+    return;
+  }
   sha256::SHA256 sha;
   std::copy(std::begin(sha_state->state), std::end(sha_state->state), sha.getHashValues());
   std::copy(std::begin(sha_state->buffer), std::end(sha_state->buffer), sha.getBuffer());
@@ -194,6 +232,11 @@ void XeCryptSha256Update_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, mapped
 
 void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr_t<uint8_t> out,
                               u32 out_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) sha_state is read and the hash
+  // is copied through out.
+  if (!sha_state || !out) {
+    return;
+  }
   sha256::SHA256 sha;
   std::copy(std::begin(sha_state->state), std::end(sha_state->state), sha.getHashValues());
   std::copy(std::begin(sha_state->buffer), std::end(sha_state->buffer), sha.getBuffer());
@@ -209,6 +252,11 @@ void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr
 // Byteswaps each 8 bytes
 void XeCryptBnQw_SwapDwQwLeBe_entry(ppc_ptr_t<uint64_t> qw_inp, ppc_ptr_t<uint64_t> qw_out,
                                     u32 size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) copy_and_swap dereferences
+  // both pointers.
+  if (!qw_inp || !qw_out) {
+    return;
+  }
   memory::copy_and_swap<uint64_t>(qw_out, qw_inp, size);
 }
 
@@ -223,13 +271,22 @@ static_assert_size(XECRYPT_RSA, 0x10);
 
 u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t> qw_b,
                                    ppc_ptr_t<XECRYPT_RSA> rsa) {
+// (Hunt v1.4.6, ronda 3, A3-R3-05.) The Win32 branch below reads
+// rsa->size and the qw pointers; a NULL one used to crash the host.
+if (!qw_a || !qw_b || !rsa) {
+return 0;
+}
   // 0 indicates failure (but not a BOOL return value)
 #if !REX_PLATFORM_WIN32
   REXKRNL_ERROR(
       "XeCryptBnQwNeRsaPubCrypt called but no implementation available for "
       "this platform!");
   assert_always();
-  return 1;
+  // (Hunt v1.4.6, ronda 3, A3-R3-17.) Was 1 (success) without doing
+// anything: the header comment above says 0 is failure, and on
+// Android this function can never succeed -- the Win32 branch is
+// dead here. Fail honestly instead of lying success.
+return 0;
 #else
   uint32_t modulus_size = rsa->size * 8;
 
@@ -327,6 +384,10 @@ u32 XeCryptBnDwLePkcs1Verify_entry(mapped_void hash, mapped_void sig, u32 size) 
 }
 
 void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
+    // (Hunt v1.4.6, ronda 3, A3-R3-05.) memset through a NULL buf.
+  if (!buf) {
+    return;
+  }
   std::memset(buf, 0xFD, buf_size);
 }
 
@@ -336,6 +397,11 @@ struct XECRYPT_DES_STATE {
 
 // Sets bit 0 to make the parity odd
 void XeCryptDesParity_entry(mapped_void inp, u32 inp_size, mapped_void out_ptr) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) DES::set_parity reads inp and
+  // writes out_ptr unconditionally.
+  if (!inp || !out_ptr) {
+    return;
+  }
   DES::set_parity(inp, inp_size, out_ptr);
 }
 
@@ -344,6 +410,12 @@ struct XECRYPT_DES3_STATE {
 };
 
 void XeCryptDes3Key_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 key) {
+// (Hunt v1.4.6, ronda 3, A3-R3-05.) key[0..2] and
+  // state_ptr->des_state[i] are dereferenced below; the Des3Ecb/Cbc
+  // sisters already carry this guard (R6-06).
+  if (!state_ptr || !key) {
+    return;
+  }
   DES3 des3(key[0], key[1], key[2]);
   DES* des = des3.getDES();
 
@@ -410,6 +482,11 @@ static inline uint8_t xeXeCryptAesMul2(uint8_t a) {
 }
 
 void XeCryptAesKey_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void key) {
+// (Hunt v1.4.6, ronda 3, A3-R3-05.) aes_key_schedule_128 reads key
+// and state_ptr->keytabenc is written throughout.
+if (!state_ptr || !key) {
+  return;
+}
   aes_key_schedule_128(key, reinterpret_cast<uint8_t*>(state_ptr->keytabenc));
   // Decryption key schedule not needed by openluopworld/aes_128, but generated
   // to fill the context structure properly.
@@ -474,6 +551,11 @@ void XeCryptAesKey_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void key
 
 void XeCryptAesEcb_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp_ptr,
                          mapped_void out_ptr, u32 encrypt) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) The AES calls read the keytab
+  // and inp_ptr and write out_ptr.
+  if (!state_ptr || !inp_ptr || !out_ptr) {
+    return;
+  }
   const uint8_t* keytab = reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
   if (encrypt) {
     aes_encrypt_128(keytab, inp_ptr, out_ptr);
@@ -484,6 +566,11 @@ void XeCryptAesEcb_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
 
 void XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp_ptr, u32 inp_size,
                          mapped_void out_ptr, mapped_void feed_ptr, u32 encrypt) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) feed[j] ^= inp[j] and the
+// memcpy(out, feed, 16) below all dereference these pointers.
+if (!state_ptr || !inp_ptr || !out_ptr || !feed_ptr) {
+return;
+}
   const uint8_t* keytab = reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
   const uint8_t* inp = inp_ptr.as<const uint8_t*>();
   uint8_t* out = out_ptr.as<uint8_t*>();
@@ -517,6 +604,13 @@ void XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
 void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u32 inp_1_size,
                           mapped_void inp_2, u32 inp_2_size, mapped_void inp_3, u32 inp_3_size,
                           mapped_void out, u32 out_size) {
+      // (Hunt v1.4.6, ronda 3, A3-R3-05.) key is memcpy'd/hashed, the
+  // inputs are processBytes'd and the digest is memcpy'd to out --
+  // all without a check. A pointer is only required when its size is
+  // non-zero, matching the XeCryptSha shape above.
+  if ((!key && key_size_in) || (!out && out_size)) {
+    return;
+  }
   uint32_t key_size = key_size_in;
   sha1::SHA1 sha;
   uint8_t kpad_i[0x40];
@@ -545,15 +639,15 @@ void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u
   // Inner
   sha.processBytes(kpad_i, 0x40);
 
-  if (inp_1_size) {
+  if (inp_1 && inp_1_size) {
     sha.processBytes(inp_1, inp_1_size);
   }
 
-  if (inp_2_size) {
+  if (inp_2 && inp_2_size) {
     sha.processBytes(inp_2, inp_2_size);
   }
 
-  if (inp_3_size) {
+  if (inp_3 && inp_3_size) {
     sha.processBytes(inp_3, inp_3_size);
   }
 
@@ -579,6 +673,13 @@ static const uint8_t key19[] = {0xE1, 0xBC, 0x15, 0x9C, 0x73, 0xB1, 0xEA, 0xE9,
 u32 XeKeysHmacSha_entry(u32 key_num, mapped_void inp_1, u32 inp_1_size, mapped_void inp_2,
                         u32 inp_2_size, mapped_void inp_3, u32 inp_3_size, mapped_void out,
                         u32 out_size) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) The inputs/out funnel into
+  // XeCryptHmacSha, which now guards them -- but without a guard here
+  // this entry would still return SUCCESS for a call that did nothing.
+  if ((!inp_1 && inp_1_size) || (!inp_2 && inp_2_size) || (!inp_3 && inp_3_size) ||
+      (!out && out_size)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   const uint8_t* key = nullptr;
   if (key_num == 0x19) {
     key = key19;
@@ -599,6 +700,12 @@ static const uint8_t xe_key_obfuscation_key[16] = {0x00, 0x00, 0x00, 0x00, 0x00,
 
 u32 XeKeysAesCbcUsingKey_entry(mapped_void obscured_key, mapped_void inp_ptr, u32 inp_size,
                                mapped_void out_ptr, mapped_void feed_ptr, u32 encrypt) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) All four pointers funnel into
+  // the AES entries below; without a guard here a NULL one would make
+  // the callees silently no-op and this entry still return SUCCESS.
+  if (!obscured_key || !inp_ptr || !out_ptr || !feed_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint8_t key[16];
 
   // Deobscure key
@@ -617,6 +724,12 @@ u32 XeKeysAesCbcUsingKey_entry(mapped_void obscured_key, mapped_void inp_ptr, u3
 }
 
 u32 XeKeysObscureKey_entry(mapped_void input, mapped_void output) {
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) input/output funnel into
+  // XeCryptAesEcb; without a guard here a NULL one would make the
+  // callee silently no-op and this entry still return SUCCESS.
+  if (!input || !output) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Based on HvxKeysObscureKey
   // Seems to encrypt input with per-console KEY_OBFUSCATION_KEY (key 0x18)
 
@@ -632,6 +745,14 @@ u32 XeKeysHmacShaUsingKey_entry(mapped_void obscured_key, mapped_void inp_1, u32
                                 mapped_void inp_2, u32 inp_2_size, mapped_void inp_3,
                                 u32 inp_3_size, mapped_void out, u32 out_size) {
   if (!obscured_key) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 3, A3-R3-05.) obscured_key was the only
+  // guarded pointer; the inputs/out funnel into XeCryptHmacSha, which
+  // now guards them -- but without a guard here this entry would
+  // still return SUCCESS for a call that did nothing.
+  if ((!inp_1 && inp_1_size) || (!inp_2 && inp_2_size) || (!inp_3 && inp_3_size) ||
+      (!out && out_size)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
