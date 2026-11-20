@@ -176,13 +176,6 @@ void VulkanTextureCache::RecordEtc2TranscodeFailure(const TextureKey& key,
   // (Audit A-3b.) A transcode failure is transient (staging allocation
   // or a guest block with no data), so it retries next frame -- but a
   // texture that fails every frame burns CPU in the transcode loop
-  // forever and never renders. After kEtc2MaxConsecutiveFailures
-  // failures in a row it is served the 1x1 placeholder for
-  // kEtc2FailureCooldownSubmissions, like MarkTexturePlaceholder above
-  // but for repeated transient failures instead of a deterministic
-  // missing loader. The cooldown is stamped here; the gate in
-  // LoadTextureDataFromResidentMemoryImpl erases the entry when the
-  // cooldown expires, and the success path erases it too.
   Etc2TranscodeFailure& state = etc2_failed_textures_[key];
   ++state.consecutive_failures;
   state.last_failure_submission = submission;
@@ -199,13 +192,16 @@ void VulkanTextureCache::RecordEtc2TranscodeFailure(const TextureKey& key,
 }
 
 // Reads one BC block (8 bytes for BC1, 16 for BC3) of a texture level from
-// guest CPU memory, applying the fetch endianness swap, and returns false
-// if the texture has no data for it. `level_layout` / `guest_level_base`
-// describe one loop level exactly like LoadTextureDataFromResidentMemoryImpl
-// does (for a packed mip tail, the tail extent and its own base). Block
-// coordinates are in 4x4 blocks; `slice` is the array slice (1 for 3D,
-// where `bz` is the depth slice instead).
-bool VulkanTextureCache::ReadGuestBcBlock(
+// guest CPU memory, applying the fetch endianness swap.
+// (Hunt v1.4.6 round 3, A1-R3-07.) This always succeeds: guest physical
+// memory is fully mapped, and TranslatePhysical masks the address into
+// that 512 MiB mapping, so it never returns null -- there is no
+// "unreadable block" case. The old `if (!guest_block) return false` (and
+// the "fall back to the safe RGBA8 path" branches in both callers) could
+// never fire; the only real protection against a false "opaque" verdict
+// is the game writing the texture data before creating it, and the
+// memo-staleness caveat documented on Dxt1TextureHasOneBitAlpha below.
+void VulkanTextureCache::ReadGuestBcBlock(
     const SharedMemory& shared_memory,
     const texture_util::TextureGuestLayout::Level& level_layout, uint32_t guest_level_base,
     const TextureKey& key, bool is_3d_tiling, uint32_t bx, uint32_t by, uint32_t bz,
@@ -230,11 +226,7 @@ bool VulkanTextureCache::ReadGuestBcBlock(
   uint32_t guest_address = guest_level_base + block_offset +
                            slice * level_layout.array_slice_stride_bytes;
   const uint8_t* guest_block = shared_memory.TranslatePhysicalForDebug(guest_address);
-  if (!guest_block) {
-    return false;
-  }
   etc2::ApplyGuestEndian(uint32_t(key.endianness), block_out, guest_block, bytes_per_block);
-  return true;
 }
 
 // Whether a DXT1 texture uses 1-bit alpha anywhere in its base level (a
@@ -278,14 +270,12 @@ bool VulkanTextureCache::Dxt1TextureHasOneBitAlpha(
   for (uint32_t block_index = 0; block_index < total_blocks && !has_alpha;
        block_index += stride) {
     const uint32_t bx = block_index % level_layout.x_extent_blocks;
-    const uint32_t by = block_index / level_layout.x_extent_blocks;
-    if (!ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0,
-                          block, 8)) {
-      // Unreadable guest data: fall back to the safe RGBA8 path.
-      has_alpha = true;
-      break;
-    }
-    if (etc2::Bc1BlockHasOneBitAlpha(block)) {
+        const uint32_t by = block_index / level_layout.x_extent_blocks;
+         // (Hunt v1.4.6 round 3, A1-R3-07.) No unreadable-block fallback: the
+         // read always succeeds (see ReadGuestBcBlock).
+         ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0, block,
+                     8);
+           if (etc2::Bc1BlockHasOneBitAlpha(block)) {
       has_alpha = true;
       break;
     }
@@ -1696,24 +1686,16 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           etc2_load_complete = false;
           break;
         }
-        bool slice_transcode_failed = false;
-        for (uint32_t bz = 0; bz < level_depth && !slice_transcode_failed; ++bz) {
-          for (uint32_t by = 0; by < y_blocks && !slice_transcode_failed; ++by) {
+        for (uint32_t bz = 0; bz < level_depth; ++bz) {
+          for (uint32_t by = 0; by < y_blocks; ++by) {
             for (uint32_t bx = 0; bx < x_blocks; ++bx) {
               uint8_t guest_block[16];
-              if (!ReadGuestBcBlock(guest_shared_memory, level_guest_layout, guest_level_base,
-                                    texture_key, is_3d_tiling, bx, by, bz, slice, guest_block,
-                                    guest_bytes_per_block)) {
-                // (Audit A-3b.) Guest block with no data: transient, but
-                // count it -- see the staging failure above. The slices
-                // already transcoded in this call are still uploaded
-                // below; the next call resumes at this slice.
-                vulkan_texture.SetEtc2Progress(loop_level, slice);
-                RecordEtc2TranscodeFailure(texture_key, submission_current);
-                etc2_load_complete = false;
-                slice_transcode_failed = true;
-                break;
-              }
+              // (Hunt v1.4.6 round 3, A1-R3-07.) No "block with no data"
+              // case: the read always succeeds (see ReadGuestBcBlock), so
+              // the old failure-counting branch here could never fire.
+              ReadGuestBcBlock(guest_shared_memory, level_guest_layout, guest_level_base,
+                               texture_key, is_3d_tiling, bx, by, bz, slice, guest_block,
+                               guest_bytes_per_block);
               etc2::Rgba pixels[16];
               uint8_t* etc2_block =
                   upload_mapping +
@@ -1988,6 +1970,42 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
   }
+  // (Hunt v1.4.6 round 3, A1-R3-01.) The destination descriptor below
+  // covers the whole scratch buffer in one storage-buffer range, and the
+  // Vulkan spec requires range <= maxStorageBufferRange (128 MiB minimum,
+  // read from the real device limits -- vulkan_device.cpp fills it from
+  // VkPhysicalDeviceLimits). A stacked/array texture can exceed it
+  // (1024x1024 RGBA8 x 64 layers = 256 MiB): emitting that descriptor is
+  // invalid usage, so refuse deterministically instead -- the 1x1
+  // placeholder, the same treatment as a missing load pipeline above.
+  // Full per-layer/per-slice chunking (the upstream TODO below) is still
+  // open: it needs one fresh transient descriptor set per chunk (a set
+  // cannot be updated and re-bound mid-submission) plus offset-adjusted
+  // push constants in both dispatch loops and the float-convert pass,
+  // which is not safely verifiable without a device test.
+  const ui::vulkan::VulkanDevice* vulkan_device_for_range =
+      command_processor_.GetVulkanDevice();
+  const uint64_t max_storage_buffer_range =
+      vulkan_device_for_range
+          ? uint64_t(vulkan_device_for_range->properties().maxStorageBufferRange)
+          : (uint64_t(1) << 27);  // Vulkan minimum, device.h:61.
+  if (host_buffer_size > max_storage_buffer_range) {
+    // Log once: this is per-texture deterministic, and the load is
+    // retried every submission, so an unthrottled log would flush to disk
+    // every frame.
+    static bool storage_buffer_range_oversize_logged = false;
+    if (!storage_buffer_range_oversize_logged) {
+      storage_buffer_range_oversize_logged = true;
+      REXGPU_WARN(
+          "VulkanTextureCache: Texture {}x{} {} ({} layers) needs a {} MiB "
+          "storage buffer, over maxStorageBufferRange ({} MiB); serving the "
+          "1x1 placeholder",
+          width, height, FormatInfo::Get(texture_key.format)->name, array_size,
+          host_buffer_size >> 20, max_storage_buffer_range >> 20);
+    }
+    MarkTexturePlaceholder(texture_key);
+    return false;
+  }
   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
       command_processor_.AcquireScratchGpuBuffer(
           host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
@@ -1997,8 +2015,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   }
 
   // Begin loading.
-  // TODO(Triang3l): Going from one descriptor to another on per-array-layer
-  // or even per-8-depth-slices level to stay within maxStorageBufferRange.
+  // (Hunt v1.4.6 round 3, A1-R3-01.) TODO(Triang3l): Going from one
+  // descriptor to another on per-array-layer or even per-8-depth-slices
+  // level to stay within maxStorageBufferRange. Until that chunking lands,
+  // oversize textures are refused above (1x1 placeholder) instead of
+  // emitting an out-of-limit descriptor range.
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2063,6 +2084,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
       write_descriptor_set_source_base_buffer_info.buffer = vulkan_shared_memory.buffer();
     }
+        // (Hunt v1.4.6 round 3, A1-R3-01.) Same maxStorageBufferRange bound
+    // as the destination above: a stacked base level can exceed it too.
+    if (source_base_range > max_storage_buffer_range) {
+      MarkTexturePlaceholder(texture_key);
+      return false;
+    }
     write_descriptor_set_source_base_buffer_info.offset = source_base_start;
     write_descriptor_set_source_base_buffer_info.range = source_base_range;
     VkWriteDescriptorSet& write_descriptor_set_source_base =
@@ -2102,6 +2129,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         return false;
       }
       write_descriptor_set_source_mips_buffer_info.buffer = vulkan_shared_memory.buffer();
+    }
+        // (Hunt v1.4.6 round 3, A1-R3-01.) Same bound as the base source.
+    if (source_mips_range > max_storage_buffer_range) {
+      MarkTexturePlaceholder(texture_key);
+      return false;
     }
     write_descriptor_set_source_mips_buffer_info.offset = source_mips_start;
     write_descriptor_set_source_mips_buffer_info.range = source_mips_range;
@@ -2634,8 +2666,14 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     texture_3d_as_2d_->SetForceLoad3DTiling(true);
 
     if (!vulkan_texture_cache.LoadTextureData(*texture_3d_as_2d_)) {
-      REXGPU_ERROR("VulkanTextureCache: Failed to load 3D-as-2D wrapper data");
-      texture_3d_as_2d_.reset();
+      // (Hunt v1.4.6 round 3, A1-R3-03.) LoadTextureData returns false on
+      // transient deferrals too (ETC2 budget exhausted, scratch buffer
+      // already used this submission): keep the wrapper and retry on the
+      // next submission instead of destroying it, which logged an ERROR
+      // and paid a full vmaCreateImage + re-transcode per submission. The
+      // wrapper is a single slice, so it completes as soon as budget or
+      // scratch is free; a deterministic failure just retries like any
+      // other unloaded texture.
       return VK_NULL_HANDLE;
     }
 
