@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
+import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
@@ -20,6 +21,7 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -89,7 +91,14 @@ public class SetupActivity extends Activity {
             try {
                 GpuDriver gd = new GpuDriver(this);
                 if (gd.selected() != null) gd.select(null);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                // (Hunt v1.4.6, sweep of R-A-M1.) Same swallowed
+                // select(null) as MainActivity: say so instead of
+                // launching with a driver the switch claims is off.
+                Log.w("SetupActivity", "could not clear selected GPU driver", e);
+                Toast.makeText(this, getString(R.string.err_driver_disable,
+                        e.getMessage() == null ? e.toString() : e.getMessage()),
+                        Toast.LENGTH_LONG).show();
             }
         }
         // Crash guard for custom GPU drivers first (PanVK / Turnip): if the
@@ -549,7 +558,19 @@ public class SetupActivity extends Activity {
     }
 
     private void launchGame() {
-        try { new GraphicsSettings(this).write(this); } catch (Exception ignored) { }
+        try {
+            new GraphicsSettings(this).write(this);
+        } catch (Exception e) {
+            // (Hunt v1.4.6, R-A-M1.) The write failure used to be swallowed
+            // and the game launched on a stale settings.txt (or SDK
+            // defaults) with no word to anyone. Warn and launch anyway: a
+            // stale settings.txt still boots, while refusing to launch
+            // would strand a FULL build on an activity with no UI at all.
+            Log.w("SetupActivity", "launchGame: settings write failed", e);
+            Toast.makeText(this, getString(R.string.err_settings_write,
+                    e.getMessage() == null ? e.toString() : e.getMessage()),
+                    Toast.LENGTH_LONG).show();
+        }
         startActivity(new Intent(this, MainActivity.class));
     }
 }
