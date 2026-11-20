@@ -176,6 +176,13 @@ void VulkanTextureCache::RecordEtc2TranscodeFailure(const TextureKey& key,
   // (Audit A-3b.) A transcode failure is transient (staging allocation
   // or a guest block with no data), so it retries next frame -- but a
   // texture that fails every frame burns CPU in the transcode loop
+  // forever and never renders. After kEtc2MaxConsecutiveFailures
+  // failures in a row it is served the 1x1 placeholder for
+  // kEtc2FailureCooldownSubmissions, like MarkTexturePlaceholder above
+  // but for repeated transient failures instead of a deterministic
+  // missing loader. The cooldown is stamped here; the gate in
+  // LoadTextureDataFromResidentMemoryImpl erases the entry when the
+  // cooldown expires, and the success path erases it too.
   Etc2TranscodeFailure& state = etc2_failed_textures_[key];
   ++state.consecutive_failures;
   state.last_failure_submission = submission;
@@ -270,12 +277,12 @@ bool VulkanTextureCache::Dxt1TextureHasOneBitAlpha(
   for (uint32_t block_index = 0; block_index < total_blocks && !has_alpha;
        block_index += stride) {
     const uint32_t bx = block_index % level_layout.x_extent_blocks;
-        const uint32_t by = block_index / level_layout.x_extent_blocks;
-         // (Hunt v1.4.6 round 3, A1-R3-07.) No unreadable-block fallback: the
-         // read always succeeds (see ReadGuestBcBlock).
-         ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0, block,
+    const uint32_t by = block_index / level_layout.x_extent_blocks;
+    // (Hunt v1.4.6 round 3, A1-R3-07.) No unreadable-block fallback: the
+    // read always succeeds (see ReadGuestBcBlock).
+    ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0, block,
                      8);
-           if (etc2::Bc1BlockHasOneBitAlpha(block)) {
+    if (etc2::Bc1BlockHasOneBitAlpha(block)) {
       has_alpha = true;
       break;
     }
@@ -2084,7 +2091,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
       write_descriptor_set_source_base_buffer_info.buffer = vulkan_shared_memory.buffer();
     }
-        // (Hunt v1.4.6 round 3, A1-R3-01.) Same maxStorageBufferRange bound
+    // (Hunt v1.4.6 round 3, A1-R3-01.) Same maxStorageBufferRange bound
     // as the destination above: a stacked base level can exceed it too.
     if (source_base_range > max_storage_buffer_range) {
       MarkTexturePlaceholder(texture_key);
@@ -2130,7 +2137,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
       write_descriptor_set_source_mips_buffer_info.buffer = vulkan_shared_memory.buffer();
     }
-        // (Hunt v1.4.6 round 3, A1-R3-01.) Same bound as the base source.
+    // (Hunt v1.4.6 round 3, A1-R3-01.) Same bound as the base source.
     if (source_mips_range > max_storage_buffer_range) {
       MarkTexturePlaceholder(texture_key);
       return false;
