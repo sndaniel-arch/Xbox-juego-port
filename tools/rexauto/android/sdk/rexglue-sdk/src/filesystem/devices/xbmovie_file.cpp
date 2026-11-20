@@ -70,22 +70,22 @@
  *   reads/s instead of spinning unbounded. This probe never returns data,
  *   so no real read is stalled, and the status stays EOF - no new
  *   protocol semantics are invented.
-  *   (Hunt v1.4.6, A2-R6-12.) That sleep has since moved out of ReadSync
-  *   (it ran under XFile::file_lock_ and keyed off the process-wide total,
-  *   so after 1024 EOF reads anywhere every later EOF read slept): the
-  *   streak is now per-handle and consecutive, and NtReadFile sleeps
-  *   EofBackoffMs() after the read returns, lock-free. See EofBackoffMs.
-  *   (Hunt v1.4.6, A2-R6-01.) The same treatment now applies to the IOCTL
-  *   channel (NtDeviceIoControlFile): every IOCTL used to be answered
-  *   NOT_IMPLEMENTED forever, with an unthrottled WARN per call, so a
-  *   component retrying its start IOCTL spun with no sleep, no counter
-  *   and no exit. Now the per-handle streak is counted with exponential
-  *   backoff (1-8 ms), the log is throttled like the reads, and after 64
-  *   consecutive NOT_IMPLEMENTED answers to the same code the probe
-  *   answers X_STATUS_END_OF_FILE -- the probe's established "movie
-  *   ended" signal, same as its reads -- instead of NOT_IMPLEMENTED
-  *   forever. The play command itself is still only logged, not decoded:
-  *   the first 8 writes are now logged in full (up to 256 bytes each).
+ *   (Hunt v1.4.6, A2-R6-12.) That sleep has since moved out of ReadSync
+ *   (it ran under XFile::file_lock_ and keyed off the process-wide total,
+ *   so after 1024 EOF reads anywhere every later EOF read slept): the
+ *   streak is now per-handle and consecutive, and NtReadFile sleeps
+ *   EofBackoffMs() after the read returns, lock-free. See EofBackoffMs.
+ *   (Hunt v1.4.6, A2-R6-01.) The same treatment now applies to the IOCTL
+ *   channel (NtDeviceIoControlFile): every IOCTL used to be answered
+ *   NOT_IMPLEMENTED forever, with an unthrottled WARN per call, so a
+ *   component retrying its start IOCTL spun with no sleep, no counter
+ *   and no exit. Now the per-handle streak is counted with exponential
+ *   backoff (1-8 ms), the log is throttled like the reads, and after 64
+ *   consecutive NOT_IMPLEMENTED answers to the same code the probe
+ *   answers X_STATUS_END_OF_FILE -- the probe's established "movie
+ *   ended" signal, same as its reads -- instead of NOT_IMPLEMENTED
+ *   forever. The play command itself is still only logged, not decoded:
+ *   the first 8 writes are now logged in full (up to 256 bytes each).
  * Do NOT build a decoder on top of these semantics until the traced
  * protocol says what a read/write really carries.
  */
@@ -182,19 +182,19 @@ X_STATUS XbMovieFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                buffer.size(), byte_offset);
   }
 
-      // (Run #16, C-04; hunt v1.4.6, A2-R6-12.) Bounded backoff for a caller
-    // looping on EOF reads. The sleep used to live HERE, inside
-    // XFile::file_lock_ (ReadSync runs under it), and keyed off the
-    // process-wide read total above -- so after 1024 EOF reads anywhere in
-    // the process, EVERY later EOF read slept, and no other op on the same
-    // handle could progress during the sleep. Both are fixed now: the
-    // streak is per-handle (consecutive_eof_reads_, reset by any write or
-    // SetLength on this handle), and the sleep itself moved out of this
-    // function entirely -- NtReadFile/NtReadFileScatter read EofBackoffMs()
-    // after XFile::Read returns and sleep there, with no lock held. This
-    // function only counts the streak.
-    ++consecutive_eof_reads_;
-  
+  // (Run #16, C-04; hunt v1.4.6, A2-R6-12.) Bounded backoff for a caller
+  // looping on EOF reads. The sleep used to live HERE, inside
+  // XFile::file_lock_ (ReadSync runs under it), and keyed off the
+  // process-wide read total above -- so after 1024 EOF reads anywhere in
+  // the process, EVERY later EOF read slept, and no other op on the same
+  // handle could progress during the sleep. Both are fixed now: the
+  // streak is per-handle (consecutive_eof_reads_, reset by any write or
+  // SetLength on this handle), and the sleep itself moved out of this
+  // function entirely -- NtReadFile/NtReadFileScatter read EofBackoffMs()
+  // after XFile::Read returns and sleep there, with no lock held. This
+  // function only counts the streak.
+  ++consecutive_eof_reads_;
+
   // EOF: end of movie. See the TODO(PROTOCOL) note at the top of this file.
   // (Audit D, ronda 6, R6-D1.) END_OF_FILE, not SUCCESS + 0: that is the
   // status every real file device returns at EOF in this tree, and the one
@@ -242,18 +242,19 @@ X_STATUS XbMovieFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_off
                  denied_count, buffer.size(), byte_offset, file_access_, hex);
     }
     return X_STATUS_ACCESS_DENIED;
-    // (Hunt v1.4.6, A2-R6-12.) Any write breaks the EOF-read streak: the
-    // component is doing something other than looping on EOF.
-    consecutive_eof_reads_ = 0;
-    consecutive_ioctl_count_ = 0;
   }
+
+  // (Hunt v1.4.6, A2-R6-12.) Any write breaks the EOF-read streak: the
+  // component is doing something other than looping on EOF.
+  consecutive_eof_reads_ = 0;
+  consecutive_ioctl_count_ = 0;
 
   const uint32_t write_count = ++g_xbmovie_write_count;
   if (write_count <= kProbeLogFirstN) {
     // Log the first bytes: if the game writes a URL / command block to the
     // device, this is where the protocol shows up. Plain C hex, no new
     // dependencies (NullFile has none either).
-        // (Hunt v1.4.6, A2-R6-01.) The FIRST writes on a handle are the
+    // (Hunt v1.4.6, A2-R6-01.) The FIRST writes on a handle are the
     // play-command candidates (movie name / URL), and 16 bytes truncated
     // them mid-name. Log up to 256 bytes of each of the first 8 writes in
     // full; the later every-1024 lines keep the 16-byte prefix.
@@ -304,53 +305,53 @@ X_STATUS XbMovieFile::SetLength(size_t length) {
   }
 
   (void)length;
-    // (Hunt v1.4.6, A2-R6-12.) Same as WriteSync: activity other than an
-    // EOF read breaks the streaks.
-    consecutive_eof_reads_ = 0;
-    consecutive_ioctl_count_ = 0;
+  // (Hunt v1.4.6, A2-R6-12.) Same as WriteSync: activity other than an
+  // EOF read breaks the streaks.
+  consecutive_eof_reads_ = 0;
+  consecutive_ioctl_count_ = 0;
   return X_STATUS_SUCCESS;
 }
 
-  bool XbMovieFile::RecordUnimplementedIoctl(uint32_t io_control_code) {
-    if (io_control_code != last_ioctl_code_) {
-      last_ioctl_code_ = io_control_code;
-      consecutive_ioctl_count_ = 0;
-    }
-    ++consecutive_ioctl_count_;
-    return consecutive_ioctl_count_ >= kMaxConsecutiveIoctlRetries;
+bool XbMovieFile::RecordUnimplementedIoctl(uint32_t io_control_code) {
+  if (io_control_code != last_ioctl_code_) {
+    last_ioctl_code_ = io_control_code;
+    consecutive_ioctl_count_ = 0;
   }
+  ++consecutive_ioctl_count_;
+  return consecutive_ioctl_count_ >= kMaxConsecutiveIoctlRetries;
+}
 
-  uint32_t XbMovieFile::IoctlBackoffMs() const {
-    // 0 until the streak passes the first-8 detail lines, then 1 ms per
-    // doubling band, capped at 8 ms. The sleep is taken by
-    // NtDeviceIoControlFile, which holds no XFile lock.
-    if (consecutive_ioctl_count_ <= kProbeLogFirstN) {
-      return 0;
-    }
-    uint32_t band = (consecutive_ioctl_count_ - kProbeLogFirstN - 1) / 8;
-    if (band > 3) {
-      band = 3;  // Cap the shift: the streak is unbounded if the caller
-      // ignores the terminal EOF and keeps retrying, and 1u << 32+ is UB.
-    }
-    return 1u << band;  // 1, 2, 4, 8 ms.
+uint32_t XbMovieFile::IoctlBackoffMs() const {
+  // 0 until the streak passes the first-8 detail lines, then 1 ms per
+  // doubling band, capped at 8 ms. The sleep is taken by
+  // NtDeviceIoControlFile, which holds no XFile lock.
+  if (consecutive_ioctl_count_ <= kProbeLogFirstN) {
+    return 0;
   }
+  uint32_t band = (consecutive_ioctl_count_ - kProbeLogFirstN - 1) / 8;
+  if (band > 3) {
+    band = 3;  // Cap the shift: the streak is unbounded if the caller
+    // ignores the terminal EOF and keeps retrying, and 1u << 32+ is UB.
+  }
+  return 1u << band;  // 1, 2, 4, 8 ms.
+}
 
-  uint32_t XbMovieFile::EofBackoffMs() const {
-    if (consecutive_eof_reads_ <= kProbeLogEveryN) {
-      return 0;
-    }
-    // (Audit J-14.) REXCVAR_DEFINE_INT32 has no min/max: a typo in
-    // settings.txt (e.g. 1000) would sleep 1 s per EOF read and freeze the
-    // intro. Clamp to [0, 10] ms; 0 stays disabled. Manual clamp, no new
-    // include (std::clamp would need <algorithm>).
-    int32_t sleep_ms = REXCVAR_GET(xbmovie_probe_eof_sleep_ms);
-    if (sleep_ms < 0) {
-      sleep_ms = 0;
-    }
-    if (sleep_ms > 10) {
-      sleep_ms = 10;
-    }
-    return static_cast<uint32_t>(sleep_ms);
+uint32_t XbMovieFile::EofBackoffMs() const {
+  if (consecutive_eof_reads_ <= kProbeLogEveryN) {
+    return 0;
   }
+  // (Audit J-14.) REXCVAR_DEFINE_INT32 has no min/max: a typo in
+  // settings.txt (e.g. 1000) would sleep 1 s per EOF read and freeze the
+  // intro. Clamp to [0, 10] ms; 0 stays disabled. Manual clamp, no new
+  // include (std::clamp would need <algorithm>).
+  int32_t sleep_ms = REXCVAR_GET(xbmovie_probe_eof_sleep_ms);
+  if (sleep_ms < 0) {
+    sleep_ms = 0;
+  }
+  if (sleep_ms > 10) {
+    sleep_ms = 10;
+  }
+  return static_cast<uint32_t>(sleep_ms);
+}
 
 }  // namespace rex::filesystem
