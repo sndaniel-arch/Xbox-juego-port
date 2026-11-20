@@ -22,9 +22,13 @@ import java.util.Map;
  */
 public final class GraphicsSettings {
     private final SharedPreferences prefs;
+    // Application context (never an Activity): needed to read the selected
+    // GPU driver in asCvars() (R-A-M6) without leaking the caller.
+    private final Context appCtx;
 
     public GraphicsSettings(Context ctx) {
         prefs = ctx.getSharedPreferences("graphics", Context.MODE_PRIVATE);
+        appCtx = ctx.getApplicationContext();
     }
 
     // --- knobs (defaults tuned for a mid-range Adreno/Mali phone) -----------
@@ -66,6 +70,25 @@ public final class GraphicsSettings {
      */
     public boolean experimentalGpuDriver() { return prefs.getBoolean("experimental_gpu_driver", false); }
     public void setExperimentalGpuDriver(boolean v) { prefs.edit().putBoolean("experimental_gpu_driver", v).apply(); }
+
+    /**
+     * True when the selected custom GPU driver is a PanVK (Mesa/Mali)
+     * build (hunt v1.4.6, R-A-M6). No driver selected, or a Turnip/Adreno
+     * driver, means the running driver has fragment stores+atomics and
+     * the requirement must stay on.
+     */
+    private boolean selectedDriverIsPanvk() {
+        try {
+            GpuDriver gd = new GpuDriver(appCtx);
+            String sel = gd.selected();
+            if (sel == null) return false;
+            for (GpuDriver.Info info : gd.installed()) {
+                if (sel.equals(info.slug)) return GpuDriver.isPanvk(info);
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
 
     /**
      * Game language (ISO 639 code, e.g. "es", "en"). First run auto-detects
@@ -125,7 +148,21 @@ public final class GraphicsSettings {
      *                   texture cache capped so it never evicts mid-level.
      *   balanced     -- like performance but 4x anisotropic and real occlusion
      *                   queries (some games use them for lens flares / LOD).
-     *   accuracy     -- SDK defaults (what the desktop port runs).
+     *   accuracy     -- the SDK defaults for every knob in the bundle below
+     *                   (verified against the REXCVAR_DEFINE_* defaults, so
+     *                   picking it really undoes the bundle). The mobile
+     *                   platform defaults from android_main.cpp
+     *                   (clear_memory_page_state=false,
+     *                   ignore_thread_affinities/priorities=true,
+     *                   vulkan_pipeline_creation_threads=2, log_flush_interval)
+     *                   still apply: they are platform defaults, not preset
+     *                   knobs, and no preset restores the desktop values
+     *                   for them.
+     *
+     * On Mali GPUs (GpuDriver.isMali()) the performance/balanced presets
+     * also get the Mali runtime overlay (R-A-10): no occlusion queries and
+     * no native 2x MSAA (docs/RENDIMIENTO.md points 7 and 5). Accuracy
+     * never gets the overlay: it is the SDK defaults by definition.
      */
     public String preset() { return prefs.getString("preset", "performance"); }
     public void setPreset(String v) { prefs.edit().putString("preset", v).apply(); }
@@ -149,20 +186,22 @@ public final class GraphicsSettings {
         m.put("video_mode_height", Integer.toString(videoHeight()));
         m.put("present_letterbox", Boolean.toString(letterbox()));
 
-        // (Caza P-H4.) Vulkan feature requirements, gated on the experimental
-        // GPU driver switch: the native side defaults
+        // (Caza P-H4, corregido hunt v1.4.6, R-A-M6.) Vulkan feature
+        // requirements: the native side defaults
         // vulkan_require_fragment_stores_and_atomics=true (vulkan_device.cpp)
-        // and PanVK on Mali lacks both stores+atomics features, so with the
-        // switch on both cvars go false and SetupContext / CreateIfSupported
-        // boot the device instead of hard-failing (draws that actually use
-        // fragment memexport still fail individually). With the switch off
-        // the system driver runs and fragment keeps the SDK default (true).
-        // Vertex stays false in both cases: its SDK default is already
-        // false, and Mali may lack it, so emitting true would risk the
-        // system-driver boot too. A hand-written line in "extra" still wins
-        // (it is applied after this block).
-        boolean expDriver = experimentalGpuDriver();
-        m.put("vulkan_require_fragment_stores_and_atomics", Boolean.toString(!expDriver));
+        // and PanVK on Mali lacks both stores+atomics features, so the
+        // requirement is relaxed ONLY when a PanVK driver is actually
+        // selected -- not whenever the experimental switch is on. With the
+        // switch on but no driver selected (or a Turnip/Adreno driver
+        // selected) the system/Adreno driver runs, which has the feature,
+        // and relaxing it made draws that use fragment stores fail one by
+        // one for nothing. Vertex stays false in both cases: its SDK
+        // default is already false, and Mali may lack it, so emitting true
+        // would risk the system-driver boot too. A hand-written line in
+        // "extra" still wins (it is applied after this block).
+        boolean relaxFragmentStores =
+                experimentalGpuDriver() && selectedDriverIsPanvk();
+        m.put("vulkan_require_fragment_stores_and_atomics", Boolean.toString(!relaxFragmentStores));
         m.put("vulkan_require_vertex_pipeline_stores_and_atomics", "false");
 
         // DLC license (hunt 2 DLC, P0-1): the game checks bit 0 of the
@@ -176,7 +215,39 @@ public final class GraphicsSettings {
 
         // --- preset bundle -------------------------------------------------
         String p = preset();
-        if (!p.equals("accuracy")) {
+        if (p.equals("accuracy")) {
+            // (Hunt v1.4.6, R-A-M5.) Accuracy is the SDK defaults for every
+            // knob the performance/balanced bundle sets below, emitted
+            // explicitly with the compiled-in defaults (verified against
+            // the REXCVAR_DEFINE_* in the SDK): before this, accuracy
+            // emitted nothing, so it silently kept the mobile platform
+            // defaults from android_main.cpp (notably
+            // vulkan_async_skip_incomplete_frames=false) while the UI
+            // promised "desktop values". Emitting the defaults also makes
+            // accuracy differ from the bundle where the SDK disagrees with
+            // it (skip-incomplete-frames true, present immediate/mailbox
+            // allowed, 4x anisotropic, real occlusion queries, 2x MSAA).
+            m.put("readback_memexport", "true");
+            m.put("vulkan_readback_memexport", "false");
+            m.put("vulkan_readback_resolve", "false");
+            m.put("texture_cache_memory_limit_soft", "384");
+            m.put("texture_cache_memory_limit_hard", "768");
+            m.put("texture_cache_memory_limit_render_to_texture", "24");
+            m.put("async_shader_compilation", "true");
+            m.put("vulkan_async_skip_incomplete_frames", "true");
+            m.put("vulkan_allow_present_mode_immediate", "true");
+            m.put("vulkan_allow_present_mode_mailbox", "true");
+            m.put("vulkan_allow_present_mode_fifo_relaxed", "true");
+            m.put("log_level", "info");
+            m.put("log_high_frequency_kernel_calls", "false");
+            m.put("vulkan_log_debug_messages", "false");
+            m.put("gpu_debug_markers", "false");
+            m.put("vulkan_dynamic_rendering", "true");
+            m.put("anisotropic_override", "3");
+            m.put("occlusion_query_enable", "true");
+            m.put("native_2x_msaa", "true");
+            m.put("gamma_render_target_as_unorm16", "true");
+        } else {
             // no per-frame GPU->CPU copy of memexport buffers; almost no title
             // reads them back on the CPU, and the sync costs a full frame stall
             m.put("readback_memexport", "false");
@@ -224,6 +295,21 @@ public final class GraphicsSettings {
             m.put("gamma_render_target_as_unorm16", "false"); // 8-bit gamma RTs: half the bandwidth
         } else if (p.equals("balanced")) {
             m.put("anisotropic_override", "3");          // 4x
+        }
+        // (Hunt v1.4.6, R-A-10.) Per-GPU profile, Mali runtime overlay: on
+        // Mali GPUs the performance/balanced presets force occlusion
+        // queries off and native 2x MSAA off (docs/RENDIMIENTO.md, Mali-G57
+        // points 7 and 5). For performance this restates the preset; for
+        // balanced it is the actual per-GPU difference (balanced alone
+        // would keep real occlusion queries). Accuracy never gets the
+        // overlay: it is the SDK defaults by definition. This plus the
+        // driver-.so selection in GpuDriver.pickLibrary() is the whole
+        // per-GPU profile the code has; the rest of the 12-point Mali list
+        // in docs/RENDIMIENTO.md is build/translator constraints, and the
+        // docs now say so instead of promising more.
+        if (!p.equals("accuracy") && GpuDriver.isMali()) {
+            m.put("occlusion_query_enable", "false");
+            m.put("native_2x_msaa", "false");
         }
         if (fpsCap() > 0) m.put("env.REX_FPS_CAP", Integer.toString(fpsCap()));
         // "env.NAME=value" lines are exported as environment variables by the
