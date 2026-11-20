@@ -203,21 +203,21 @@ public final class GpuDriver {
      * see the stale selection and clear it. A corrupt/empty file still
      * returns null; driverConfigExists() covers that case for the guards.
      */
-public String selected() {
+    public String selected() {
         String slug = prefs.getString("selected", null);
-    if (slug != null) return slug;
-    File f = configFile();
-    if (!f.isFile()) return null;
-    try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+        if (slug != null) return slug;
+        File f = configFile();
+        if (!f.isFile()) return null;
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
             String line = r.readLine();
-        if (line == null) return null;
-        int slash = line.indexOf('/');
-        String s = (slash >= 0 ? line.substring(0, slash) : line).trim();
-        return s.isEmpty() ? null : s;
-    } catch (Exception e) {
+            if (line == null) return null;
+            int slash = line.indexOf('/');
+            String s = (slash >= 0 ? line.substring(0, slash) : line).trim();
+            return s.isEmpty() ? null : s;
+        } catch (Exception e) {
             return null;
+        }
     }
-}
 
     /** True when the native config file exists, even if its slug is unreadable. */
     public boolean driverConfigExists() { return configFile().exists(); }
