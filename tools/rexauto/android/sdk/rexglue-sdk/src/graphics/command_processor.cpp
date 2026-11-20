@@ -151,6 +151,15 @@ bool CommandProcessor::Initialize() {
 void CommandProcessor::Shutdown() {
   worker_running_ = false;
   write_ptr_index_event_->Set();
+  // (Hunt v1.4.6 ronda 2, A4-R2-03.) Resume a paused worker before waiting
+  // for it: Pause() parks the worker inside Suspend(), so a suspended worker
+  // never observes worker_running_ = false and the Wait below (no timeout:
+  // XObject::Wait with a null timeout waits milliseconds::max()) never
+  // returns. Same pattern as XmaDecoder::Shutdown, which already does
+  // `if (paused_) Resume();` before waiting for its worker.
+  if (paused_) {
+    Resume();
+    }
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
 }
