@@ -63,6 +63,7 @@
 #include <rex/main_android.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
+#include <rex/runtime.h>
 #include <rex/thread.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
@@ -117,6 +118,29 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path) {
     out.emplace_back("--" + line);
   }
   return out;
+}
+
+// (Hunt v1.4.6, R-A-M4.) Warn about settings.txt lines whose key names no
+// registered cvar. Must run AFTER the runtime exists (all modules, incl. the
+// GPU plugin, have registered their cvars by then): at cvar::Init time most
+// GPU/kernel cvars are not registered yet, so checking there would warn for
+// every legitimate vulkan_* line. A key that registers even later still
+// applies (cvar::Init stashes it as a pending value), so the message says
+// "not registered yet", not "unknown".
+void LogUnknownSettingsCvars(const std::vector<std::string>& settings_args) {
+  for (const auto& arg : settings_args) {
+    if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') continue;
+    const auto eq = arg.find('=');
+    const std::string name =
+        arg.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+    if (name.empty()) continue;
+    if (!rex::cvar::GetFlagInfo(name)) {
+      REXLOG_WARN("settings.txt: no cvar named '{}' is registered yet "
+                  "(typo? the line has no effect unless a cvar with that "
+                  "name registers later)",
+                  name);
+    }
+  }
 }
 
 // (Audit run #16, J-18.) The user's orientation choice lives in the
@@ -790,8 +814,23 @@ int RunAndroidApp() {
       int asset_fd = -1;
       std::int64_t asset_offset = 0, asset_length = 0;
       if (rexport::StfsAssetFd(&asset_fd, &asset_offset, &asset_length)) {
-        rex::filesystem::SetStfsAssetSource(asset_fd, uint64_t(asset_offset),
-                                            uint64_t(asset_length));
+        // (Hunt v1.4.6, A2-R6-07.) SetStfsAssetSource now reports
+        // failure (dup() with the fd table full): abort the launch with
+        // a clean startup-failure report instead of logging success and
+        // letting SetupVfs "succeed" with no game mounted, which only
+        // surfaced later as a generic LoadXexImage failure.
+        if (!rex::filesystem::SetStfsAssetSource(asset_fd, uint64_t(asset_offset),
+                                                 uint64_t(asset_length))) {
+          ALOGE("game root is %s but the STFS asset fd=%d could not be stored "
+                "(see childoflight.log) - the game cannot start",
+                game_root.c_str(), asset_fd);
+          WriteStartupFailureReport(
+              log_dir, "STFS asset fd could not be stored",
+              "SetStfsAssetSource failed (dup() of the APK asset fd failed, "
+              "most likely the fd table is full). See the REXFS_ERROR line "
+              "in childoflight.log just above; it carries the errno.");
+          return EXIT_FAILURE;
+        }
         ALOGI("game root is %s - STFS asset fd=%d offset=%lld length=%lld",
               game_root.c_str(), asset_fd, static_cast<long long>(asset_offset),
               static_cast<long long>(asset_length));
@@ -828,7 +867,10 @@ int RunAndroidApp() {
   // the vsync worker should sleep, not spin.
   args.emplace_back("--ignore_thread_affinities=true");
   args.emplace_back("--ignore_thread_priorities=true");
-  args.emplace_back("--log_flush_interval=5");  // batch log writes
+  args.emplace_back("--log_flush_interval=1");  // (Hunt v1.4.6, R-A-M2.) Was 5:
+  // up to 5 s of log sat unflushed before a crash, and the crash report is
+  // often the only diagnosis. 1 s loses at most 1 s; spdlog flush_every(1s)
+  // costs one periodic flush, far less than 5 s of lost diagnosis.
   // Present frames that used placeholder pipelines instead of dropping them:
   // the skip (default true) drops EVERY frame that still has an uncompiled
   // shader, so during shader warm-up whole frames vanish instead of showing
@@ -849,9 +891,16 @@ int RunAndroidApp() {
   // settings.txt (it overrides this arg). Phone verification required:
   // CI cannot tell whether 2 workers is safe on this driver.
   args.emplace_back("--vulkan_pipeline_creation_threads=2");
-  for (auto& a : ReadSettingsArgs(external_dir + "/" + kSettingsFileName)) {
+  // (Hunt v1.4.6, R-A-M4.) Keep the settings.txt lines so they can be
+  // checked against the registered cvars once the runtime exists (below):
+  // a typo'd key used to die silently -- cvar::Init stashes unknown
+  // --options as pending values and only a later-registered cvar ever
+  // applies them, so an unknown key never produced any feedback at all.
+  const std::vector<std::string> settings_args =
+      ReadSettingsArgs(external_dir + "/" + kSettingsFileName);
+  for (const auto& a : settings_args) {
     ALOGI("setting: %s", a.c_str());
-    args.emplace_back(std::move(a));
+    args.emplace_back(a);
   }
 
   std::vector<char*> argv_ptrs;
@@ -859,9 +908,18 @@ int RunAndroidApp() {
   for (auto& arg : args) argv_ptrs.push_back(arg.data());
 
   auto remaining = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
-  (void)remaining;
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+
+  // (Hunt v1.4.6, R-A-M4.) cvar::Init returns the arguments it did NOT
+  // consume: positionals. argv[0] (the app name) is expected; anything
+  // else is not a setting and was silently dropped before.
+  for (const auto& arg : remaining) {
+    if (arg == kAppIdentifier) continue;
+    REXLOG_WARN("android_main: ignoring unexpected positional argument '{}' "
+                "(settings.txt lines must be key=value)",
+                arg);
+  }
 
   REXLOG_INFO("android_main: app={} external_dir={} game_root={}", kAppIdentifier,
               external_dir, game_root);
@@ -891,6 +949,11 @@ int RunAndroidApp() {
     std::unique_ptr<rex::ui::WindowedApp> app = creator(app_context);
     if (app->OnInitialize()) {
       rexport::gamepad::EnsureVirtualPadAttached();
+      // (Hunt v1.4.6, R-A-M4.) The runtime exists now, so every cvar the
+      // game can ever set is registered: a settings.txt key still unknown
+      // here is a typo (or a hand-added line for a module that never
+      // loads), and the player finally hears about it in childoflight.log.
+      LogUnknownSettingsCvars(settings_args);
       result = app_context.RunMainMessageLoop();
     } else {
       REXLOG_ERROR("OnInitialize failed - see earlier errors");
@@ -908,6 +971,41 @@ int RunAndroidApp() {
 }
 
 }  // namespace
+
+// --- pause/resume from the Android lifecycle (hunt v1.4.6, A4-R6-01) ------
+// MainActivity.onPause/onResume (and onStop/onStart in multi-window) call
+// these via JNI. They reach the runtime through the global
+// Runtime::instance() (set in Runtime::Setup, cleared in ~Runtime): null
+// before OnInitialize / after teardown, in which case nothing is running
+// yet and this is a no-op. Pause()/Resume() are virtual no-ops on the
+// IAudioSystem/IGraphicsSystem interfaces, so this compiles against the
+// interfaces with no link dependency on the concrete systems (SDL audio
+// driver, GPU plugin).
+// Ordering: pause graphics first (command processor + vblank), then audio;
+// resume in the reverse order. Both Pause() calls can block waiting for
+// their worker threads to reach a safe point (audio pause_fence_); if a
+// worker is stuck inside a guest callback with no orderly exit, onPause
+// blocks -- the same pre-existing risk class as AudioSystem::Shutdown's
+// Terminate(0) fallback. Phone verification required.
+extern "C" {
+
+JNIEXPORT void JNICALL
+Java_com_rexauto_port_MainActivity_nativePauseEmulation(JNIEnv* /*env*/, jclass /*clazz*/) {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  if (!runtime) return;
+  if (auto* graphics_system = runtime->graphics_system()) graphics_system->Pause();
+  if (auto* audio_system = runtime->audio_system()) audio_system->Pause();
+}
+
+JNIEXPORT void JNICALL
+Java_com_rexauto_port_MainActivity_nativeResumeEmulation(JNIEnv* /*env*/, jclass /*clazz*/) {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  if (!runtime) return;
+  if (auto* audio_system = runtime->audio_system()) audio_system->Resume();
+  if (auto* graphics_system = runtime->graphics_system()) graphics_system->Resume();
+}
+
+}  // extern "C"
 
 int main(int argc, char* argv[]) {
   (void)argc;
