@@ -192,11 +192,11 @@ REX_EXPORT_STUB(__imp__VdSetStudioRGBMode);
 
 void VdGetCurrentDisplayGamma_entry(mapped_u32 type_ptr, mapped_f32 power_ptr) {
     // (Audit A3, ronda 6, R6-06, sweep.) NULL pointers used to write the
-    // gamma type/power to guest address 0.
-    if (!type_ptr || !power_ptr) {
-      return;
-    }
-  // 1 - sRGB.
+  // gamma type/power to guest address 0.
+  if (!type_ptr || !power_ptr) {
+    return;
+  }
+// 1 - sRGB.
   // 2 - TV (BT.709).
   // 3 - use the power written to *power_ptr.
   // Anything else - linear.
