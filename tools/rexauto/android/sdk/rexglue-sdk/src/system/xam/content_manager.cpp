@@ -51,22 +51,22 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   auto fs = kernel_state_->file_system();
   auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
                                                                   /*allow_share_delete=*/true);
-      // (Hunt v1.4.6, A2-R3-15.) The return value used to be ignored, unlike
-      // Runtime::SetupVfs and InstallContent, which both check it:
-      // Initialize() leaves root_entry_ null when the path does not exist
-      // and the device is read-only, and HostPathDevice::ResolvePath then
-      // dereferences it. Do not register a device that failed to initialize
-      // (read_only is false today so it effectively always succeeds, but one
-      // flag flip or one failed create_directories away from a registered
-      // device with a null root). The destructor's unregisters are safe on
-      // an unregistered device/symlink (both return false when not found).
-      if (!device->Initialize()) {
-      REXLOG_ERROR("ContentPackage: failed to initialize device for '{}'", package_path_.string());
-      return;
-    }
+  // (Hunt v1.4.6, A2-R3-15.) The return value used to be ignored, unlike
+  // Runtime::SetupVfs and InstallContent, which both check it:
+  // Initialize() leaves root_entry_ null when the path does not exist
+  // and the device is read-only, and HostPathDevice::ResolvePath then
+  // dereferences it. Do not register a device that failed to initialize
+  // (read_only is false today so it effectively always succeeds, but one
+  // flag flip or one failed create_directories away from a registered
+  // device with a null root). The destructor's unregisters are safe on
+  // an unregistered device/symlink (both return false when not found).
+  if (!device->Initialize()) {
+    REXLOG_ERROR("ContentPackage: failed to initialize device for '{}'", package_path_.string());
+    return;
+  }
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
-      device_registered_ = true;
+  device_registered_ = true;
 }
 
 ContentPackage::~ContentPackage() {
@@ -238,7 +238,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto path = ResolvePackagePath(xuid, data);
   std::error_code ec;
-return std::filesystem::exists(path, ec);
+  return std::filesystem::exists(path, ec);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
@@ -249,13 +249,13 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   if (data.xuid == uint64_t(-1)) {
     data.xuid = xuid;
   }
+  std::error_code ec_r316_3;
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
 
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
 
-  std::error_code ec_r316_3;
   if (!std::filesystem::exists(parent_path, ec_r316_3)) {
     std::error_code ec;
     if (!std::filesystem::create_directories(parent_path, ec)) {
@@ -365,13 +365,13 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
       return X_ERROR_ALREADY_EXISTS;
     }
   }
-
   std::error_code ec_r316_2;
+
   auto package_path = ResolvePackagePath(xuid, data);
   if (std::filesystem::exists(package_path, ec_r316_2)) {
     return X_ERROR_ALREADY_EXISTS;
-    }
-std::error_code ec;
+  }
+  std::error_code ec;
   if (!std::filesystem::create_directories(package_path, ec)) {
     return X_ERROR_ACCESS_DENIED;
   }
@@ -403,8 +403,8 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
       return X_ERROR_ALREADY_EXISTS;
     }
   }
-
   std::error_code ec;
+
   auto package_path = ResolvePackagePath(xuid, data);
   if (!std::filesystem::exists(package_path, ec)) {
     return X_ERROR_FILE_NOT_FOUND;
@@ -498,7 +498,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   std::error_code ec_r316_1;
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
-std::error_code ec;
+  std::error_code ec;
   std::filesystem::create_directories(package_path, ec);
   if (std::filesystem::exists(package_path, ec_r316_1)) {
     auto thumb_path = package_path / kThumbnailFileName;
@@ -878,7 +878,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
   }
 
   // Create destination directory
-    std::filesystem::create_directories(install_path, ec);
+  std::filesystem::create_directories(install_path, ec);
   if (ec) {
     return X_ERROR_ACCESS_DENIED;
   }
