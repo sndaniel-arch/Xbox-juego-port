@@ -44,6 +44,13 @@ namespace rex::audio {
 
 namespace {
 constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+// (Hunt v1.4.6 ronda 3, A4-R3-02.) Bound for the pause fence wait: long
+// enough for a worker parked inside a guest callback / FFmpeg decode to
+// reach its park point (the audio WaitAny cycle is 500 ms), short enough
+// that the Android UI thread never hangs on pause. On timeout Pause()
+// logs and returns with paused_ still set; the worker parks when it can
+// and Resume() unparks it.
+constexpr std::chrono::milliseconds kPauseFenceTimeout{1000};
 }  // namespace
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
@@ -354,6 +361,12 @@ void AudioSystem::UnregisterClient(size_t index) {
 }
 
 bool AudioSystem::Save(stream::ByteStream* stream) {
+  // (Hunt v1.4.6 ronda 3, A4-R3-07.) Save read clients_ with no lock while
+  // a guest thread could be inside SubmitFrame/RegisterClient on the same
+  // array; take the global critical region like every other clients_
+  // accessor. Recursive mutex, so the lock also covers Restore's
+  // UnregisterClient/CreateDriver calls below.
+  auto global_lock = global_critical_region_.Acquire();
   stream->Write(kAudioSaveSignature);
 
   // Count the number of used clients first.
@@ -382,6 +395,25 @@ bool AudioSystem::Save(stream::ByteStream* stream) {
 }
 
 bool AudioSystem::Restore(stream::ByteStream* stream) {
+  // (Hunt v1.4.6 ronda 3, A4-R3-07.) The old Restore ran with no lock, no
+  // duplicate-id check and no rollback: a guest thread in SubmitFrame
+  // could read clients_[] while Restore freed the driver under it; a
+  // stream listing the same id twice unregistered + recreated the client
+  // a second time; and a CreateDriver failure mid-stream left clients
+  // 0..k-1 restored with no way back. Fixed in three phases, all under
+  // the global critical region (recursive, so UnregisterClient below
+  // re-acquiring it is safe):
+  //  1. parse + validate the whole stream into a scratch list first
+  //     (range + duplicate-id checks) without touching clients_;
+  //  2. create every new driver into scratch — CreateDriver touches no
+  //     clients_ state, so a failure here destroys only the scratch
+  //     drivers and leaves the live system exactly as it was;
+  //  3. commit: unregister each old client, install its new driver and
+  //     fill its semaphore. The commit does no fallible work, so it
+  //     cannot fail halfway. Clients live before Restore but absent
+  //     from the stream are cleared last, as before.
+  auto global_lock = global_critical_region_.Acquire();
+
   if (stream->Read<uint32_t>() != kAudioSaveSignature) {
     REXAPU_ERROR("AudioSystem::Restore - Invalid magic value!");
     return false;
@@ -397,32 +429,34 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
                  num_clients, kMaximumClientCount);
     return false;
   }
-  // (Hunt v1.4.6 ronda 2, A4-R2-04.) Which clients the stream actually
-  // restores, so clients that were live before Restore but are absent from
-  // the stream can be cleared below instead of staying live with dead
-  // drivers/callbacks. Only filled in on the success path: on a failure
-  // return above, the stream was not fully consumed, so a partial seen-set
-  // must not kill live clients.
-  bool restored[kMaximumClientCount] = {};
+
+  struct RestoredClient {
+    uint32_t id;
+    uint32_t callback;
+    uint32_t callback_arg;
+    uint32_t wrapped_callback_arg;
+  };
+  RestoredClient entries[kMaximumClientCount];
+  bool seen[kMaximumClientCount] = {};
   for (uint32_t i = 0; i < num_clients; i++) {
     auto id = stream->Read<uint32_t>();
     if (id >= kMaximumClientCount) {
       REXAPU_ERROR("AudioSystem::Restore - client id {} out of range", id);
       return false;
     }
-    assert_true(id < kMaximumClientCount);
-
-    auto& client = clients_[id];
-
-    // Reset the semaphore and recreate the driver ourselves.
-    if (client.driver) {
-      UnregisterClient(id);
+    if (seen[id]) {
+      REXAPU_ERROR("AudioSystem::Restore - duplicate client id {}", id);
+      return false;
     }
+    seen[id] = true;
+    entries[i] = {id, stream->Read<uint32_t>(), stream->Read<uint32_t>(),
+                  stream->Read<uint32_t>()};
+  }
 
-    client.callback = stream->Read<uint32_t>();
-    client.callback_arg = stream->Read<uint32_t>();
-    client.wrapped_callback_arg = stream->Read<uint32_t>();
-
+  // Phase 2: build all replacement drivers before mutating anything.
+  AudioDriver* new_drivers[kMaximumClientCount] = {};
+  for (uint32_t i = 0; i < num_clients; i++) {
+    auto id = entries[i].id;
     auto client_semaphore = client_semaphores_[id].get();
     AudioDriver* driver = nullptr;
     auto status = CreateDriver(id, client_semaphore, &driver);
@@ -431,24 +465,40 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
           "AudioSystem::Restore - Call to CreateDriver failed with status "
           "{:08X}",
           status);
-      // Roll the half-restored client back to empty: it never became live,
-      // so it must not keep in_use=true with driver==nullptr, nor the
-      // wrapped_callback_arg copied verbatim from the untrusted stream.
-      client = {nullptr, 0, 0, 0, false};
+      for (uint32_t j = 0; j < i; j++) {
+        DestroyDriver(new_drivers[j]);
+      }
       return false;
     }
-
     assert_not_null(driver);
-    // Only now, with a live driver, fill the semaphore and mark the client
-    // in use. (CreateDriver only stores the semaphore pointer — see
+    new_drivers[i] = driver;
+  }
+
+  // Phase 3: commit. No fallible work below this point.
+  bool restored[kMaximumClientCount] = {};
+  for (uint32_t i = 0; i < num_clients; i++) {
+    const auto& entry = entries[i];
+    auto& client = clients_[entry.id];
+
+    // Reset the semaphore and recreate the driver ourselves.
+    if (client.driver) {
+      UnregisterClient(entry.id);
+    }
+
+    client.callback = entry.callback;
+    client.callback_arg = entry.callback_arg;
+    client.wrapped_callback_arg = entry.wrapped_callback_arg;
+
+    auto client_semaphore = client_semaphores_[entry.id].get();
+    // CreateDriver only stores the semaphore pointer — see
     // SDLAudioSystem::CreateDriver — so releasing after creation instead of
     // before changes nothing on success, and on failure above no permits
-    // are left behind for a client that does not exist.)
+    // are left behind for a client that does not exist.
     auto ret = client_semaphore->Release(queued_frames_, nullptr);
     assert_true(ret);
-    client.driver = driver;
+    client.driver = new_drivers[i];
     client.in_use = true;
-    restored[id] = true;
+    restored[entry.id] = true;
   }
 
   // Clear clients that were live before Restore but are absent from the
@@ -468,11 +518,29 @@ void AudioSystem::Pause() {
   if (paused_) {
     return;
   }
+  // (Hunt v1.4.6 ronda 3, A4-R3-01.) No worker exists yet between the
+  // audio-system assignment in Runtime::Setup and the end of Setup()
+  // (which creates the worker thread): the old code set paused_ and then
+  // waited on pause_fence_ forever, because nothing could ever signal it.
+  // A pause before the worker exists is a no-op — do NOT set paused_
+  // either, or the worker would start life believing it is parked while
+  // its loop only checks paused_ on the shutdown-event branch.
+  if (!worker_thread_ || !worker_running_) {
+    return;
+  }
   paused_ = true;
 
   // Kind of a hack, but it works.
   shutdown_event_->Set();
-  pause_fence_.Wait();
+  if (!pause_fence_.WaitFor(kPauseFenceTimeout)) {
+    // (A4-R3-02.) The worker is stuck inside a guest callback and has
+    // not parked yet. Do NOT clear paused_: the worker checks it on the
+    // shutdown-event branch, parks when it can, and Resume() (which sets
+    // resume_event_, an auto-reset event the worker consumes on arrival)
+    // unparks it. The UI thread returns instead of hanging.
+    REXAPU_WARN("AudioSystem::Pause: worker did not park within {} ms; continuing paused",
+                kPauseFenceTimeout.count());
+  }
 
   xma_decoder_->Pause();
 }
