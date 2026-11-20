@@ -254,16 +254,25 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
-  if (command_processor_) {
-    command_processor_->Shutdown();
-    command_processor_.reset();
-  }
+  // (Hunt v1.4.6 round 2, A1-R2-03.) Stop the vblank worker BEFORE
+    // destroying the command processor: MarkVblank() runs on that thread
+    // and reads/uses command_processor_, so resetting the unique_ptr first
+    // raced with the worker and could use-after-free the processor. No
+    // shutdown path pauses first -- Runtime::Shutdown runs from ~Runtime
+    // and the Setup failure paths with no Pause() in between, and the
+    // Android destroy path hard-exits without reaching Shutdown at all --
+    // so Pause() cannot be relied on to close this window; only stopping
+    // and joining the thread does.
+    if (vsync_worker_thread_) {
+        vsync_worker_running_ = false;
+        vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+        vsync_worker_thread_->reset();
+    }
 
-  if (vsync_worker_thread_) {
-    vsync_worker_running_ = false;
-    vsync_worker_thread_->Wait(0, 0, 0, nullptr);
-    vsync_worker_thread_.reset();
-  }
+    if (command_processor_) {
+        command_processor_->Shutdown();
+        command_processor_.reset();
+    }
 
   if (presenter_) {
     if (app_context_) {
