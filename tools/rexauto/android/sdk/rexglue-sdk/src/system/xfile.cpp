@@ -232,7 +232,7 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
   // the top of guest memory would read past the host mapping as segments
   // advances. Same wrap + heap check R5-D4 added for the data buffers
   // (ReadInternal/Write): the array spans ceil(length / 4096) 4-byte
-  // entries, and both ends must land in heaps of the same kind (and in)
+  // entries, and both ends must land in heaps of the same kind (and in
   // the same heap when physical). (length / page_size + remainder
   // avoids overflowing length + 4095 for a huge length.)
   if (length) {
@@ -242,8 +242,8 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
       result = X_STATUS_ACCESS_VIOLATION;
     } else {
       uint32_t array_high_address = segments_guest_address + array_bytes - 1;
-      rex::memory::BaseHeap* array_start_heap = memory()LookupHeap(segments_guest_address);
-      const rex::memory::BaseHeap* array_end_heap = memory()LookupHeap(array_high_address);
+      rex::memory::BaseHeap* array_start_heap = memory()->LookupHeap(segments_guest_address);
+      const rex::memory::BaseHeap* array_end_heap = memory()->LookupHeap(array_high_address);
       if (!array_start_heap || !array_end_heap ||
           (array_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
               (array_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
@@ -257,7 +257,7 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
   // segments points to an array of buffer pointers of type
   // "FILE_SEGMENT_ELEMENT", but they can just be treated as normal pointers
   rex::be<uint32_t>* segments =
-      reinterpret_cast<rex::be<uint32_t>*>(memory()TranslateVirtual(segments_guest_address));
+      reinterpret_cast<rex::be<uint32_t>*>(memory()->TranslateVirtual(segments_guest_address));
 
   uint32_t read_total = 0;
   uint32_t read_remain = length;
