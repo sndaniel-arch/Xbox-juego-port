@@ -158,7 +158,7 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
                      static_cast<int>(sizeof(guid_text)));
     info.guid = guid_text;
-        // (Hunt v1.4.6 ronda 3, A4-R3-04). The virtual touch pad is synthetic:
+    // (Hunt v1.4.6 ronda 3, A4-R3-04.) The virtual touch pad is synthetic:
     // InputSystem parks synthetic devices on kSyntheticOrdinal and
     // SlotAssignment routes them to guest user 0 alongside a physical pad,
     // so a real pad always takes ordinal 0 (Aurora) instead of landing on
@@ -168,7 +168,6 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     // match would also flag a real wired Xbox 360 pad synthetic. The
     // name "Child of Light Touch Pad" is set only by the virtual pad.
     info.synthetic = name && std::strcmp(name, "Child of Light Touch Pad") == 0;
-    
     out.push_back(info);
   }
 }
@@ -448,7 +447,7 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
-  // (Hunt v1.4.6 ronda 3, A4-R3-14). SDL normally sends one ADD per
+  // (Hunt v1.4.6 ronda 3, A4-R3-14.) SDL normally sends one ADD per
   // instance, but a duplicate ADD for an id already in controllers_ would
   // push a second entry for one SDL_Gamepad; a later REMOVE closes/erases
   // only one, leaving a dangling entry behind. Guard on the instance id
@@ -461,13 +460,12 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   }
   const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
-    // (A4-R3-14). The old code only had assert_always() here — a no-op
+    // (A4-R3-14.) The old code only had assert_always() here — a no-op
     // in Release — so a pad that disconnected between the ADD event and
     // the open vanished with no log line at all. Log the real SDL error
     // with the instance id; SDL will not re-send ADD for this pad.
     REXLOG_ERROR("SDL OnControllerDeviceAdded: SDL_OpenGamepad({}) failed: {}",
                      static_cast<int>(event.gdevice.which), SDL_GetError());
-    
     return;
   }
   REXLOG_INFO(
