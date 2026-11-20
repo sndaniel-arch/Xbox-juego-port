@@ -68,6 +68,10 @@ class File {
     (void)length;
     return X_STATUS_NOT_IMPLEMENTED;
   }
+  // (Hunt v1.4.6, A2-R4-19.) Flush pending writes to stable storage.
+  // Default is a no-op: read-only and memory-backed files have nothing
+  // buffered. HostPathFile overrides this with fsync on its host fd.
+  virtual void Flush() {}
 
   // rex::filesystem::FileAccess
   uint32_t file_access() const { return file_access_; }
