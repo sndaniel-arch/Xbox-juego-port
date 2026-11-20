@@ -106,7 +106,7 @@ class XbMovieFile : public File {
   // (IoctlBackoffMs / ConsecutiveIoctlCount) stay plain atomic loads.
   // The process-wide counters in xbmovie_file.cpp are already atomic;
   // these match them.
-   std::atomic<uint32_t> last_ioctl_code_ = 0;
+  std::atomic<uint32_t> last_ioctl_code_ = 0;
   std::atomic<uint32_t> consecutive_ioctl_count_ = 0;
   std::atomic<uint32_t> consecutive_eof_reads_ = 0;
   // (Hunt v1.4.6, A2-R2-04.) Guards last_ioctl_code_ +
