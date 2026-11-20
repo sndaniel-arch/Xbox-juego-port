@@ -106,24 +106,36 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, A2-R3-08.) The early returns below used to leave the
+  // caller's IO_STATUS_BLOCK stale (whatever a previous call left there,
+  // possibly SUCCESS for a failed call). Every failure exit goes through
+  // this helper so the iosb always carries the real status.
+  auto fail = [&](X_STATUS status) -> X_STATUS {
+    if (io_status_block_ptr) {
+      io_status_block_ptr->status = status;
+      io_status_block_ptr->information = 0;
+    }
+    return status;
+  };
+
   // (Audit A3, ronda 6, R6-06, sweep.) info_ptr is zeroed and written
   // per info class below; a NULL one used to write to guest address 0.
   if (!info_ptr) {
-    return X_STATUS_INVALID_PARAMETER;
+    return fail(X_STATUS_INVALID_PARAMETER);
   }
 
   uint32_t minimum_length = GetQueryFileInfoMinimumLength(info_class);
   if (!minimum_length) {
-    return X_STATUS_INVALID_INFO_CLASS;
+    return fail(X_STATUS_INVALID_INFO_CLASS);
   }
 
   if (info_length < minimum_length) {
-    return X_STATUS_INFO_LENGTH_MISMATCH;
+    return fail(X_STATUS_INFO_LENGTH_MISMATCH);
   }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
-    return X_STATUS_INVALID_HANDLE;
+    return fail(X_STATUS_INVALID_HANDLE);
   }
 
   info_ptr.Zero(info_length);
@@ -239,18 +251,37 @@ uint32_t GetSetFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, A2-R3-08.) Same iosb-on-early-return helper as
+  // NtQueryInformationFile above.
+  auto fail = [&](X_STATUS status) -> X_STATUS {
+    if (io_status_block) {
+      io_status_block->status = status;
+      io_status_block->information = 0;
+    }
+    return status;
+  };
+
+// (Hunt v1.4.6, A2-R3-07.) Same null guard the sibling
+  // NtQueryInformationFile has (R6-06): without it every case below
+  // dereferences info_ptr.as<T*>() at guest address 0 -- the
+  // XFileEndOfFileInformation case would call SetLength() with whatever
+  // value sits there.
+  if (!info_ptr) {
+    return fail(X_STATUS_INVALID_PARAMETER);
+  }
+
   uint32_t minimum_length = GetSetFileInfoMinimumLength(info_class);
   if (!minimum_length) {
-    return X_STATUS_INVALID_INFO_CLASS;
+    return fail(X_STATUS_INVALID_INFO_CLASS);
   }
 
   if (info_length < minimum_length) {
-    return X_STATUS_INFO_LENGTH_MISMATCH;
+    return fail(X_STATUS_INFO_LENGTH_MISMATCH);
   }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
-    return X_STATUS_INVALID_HANDLE;
+    return fail(X_STATUS_INVALID_HANDLE);
   }
 
   X_STATUS result = X_STATUS_SUCCESS;
@@ -300,12 +331,12 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), &info->ansi_string);
       if (!IsValidPath(target_path, false)) {
-        return X_STATUS_OBJECT_NAME_INVALID;
+        return fail(X_STATUS_OBJECT_NAME_INVALID);
       }
 
       auto target_file_path = rex::to_path(target_path);
       if (!target_file_path.has_filename()) {
-        return X_STATUS_INVALID_PARAMETER;
+        return fail(X_STATUS_INVALID_PARAMETER);
       }
 
       result = file->Rename(target_file_path);
@@ -378,18 +409,34 @@ uint32_t GetQueryVolumeInfoMinimumLength(uint32_t info_class) {
 u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
                                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                        mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, A2-R3-08, same-class extension.) This third sibling had
+  // the same stale-iosb hole on its early returns; same helper.
+  auto fail = [&](X_STATUS status) -> X_STATUS {
+    if (io_status_block_ptr) {
+      io_status_block_ptr->status = status;
+      io_status_block_ptr->information = 0;
+    }
+    return status;
+  };
+
+    // (Hunt v1.4.6, A2-R3-07, same-class extension.) No null guard here
+  // either: info_ptr.Zero() below would write to guest address 0.
+  if (!info_ptr) {
+    return fail(X_STATUS_INVALID_PARAMETER);
+  }
+
   uint32_t minimum_length = GetQueryVolumeInfoMinimumLength(info_class);
   if (!minimum_length) {
-    return X_STATUS_INVALID_INFO_CLASS;
+    return fail(X_STATUS_INVALID_INFO_CLASS);
   }
 
   if (info_length < minimum_length) {
-    return X_STATUS_INFO_LENGTH_MISMATCH;
+    return fail(X_STATUS_INFO_LENGTH_MISMATCH);
   }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
-    return X_STATUS_INVALID_HANDLE;
+    return fail(X_STATUS_INVALID_HANDLE);
   }
 
   info_ptr.Zero(info_length);
