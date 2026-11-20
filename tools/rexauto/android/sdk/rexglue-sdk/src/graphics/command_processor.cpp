@@ -319,15 +319,40 @@ void CommandProcessor::Pause() {
   if (paused_) {
     return;
   }
+  // (Hunt v1.4.6 ronda 3, A4-R3-01.) The CP object exists from
+  // GraphicsSystem::SetupGuestGpu, but its worker thread only exists after
+  // Initialize() creates it; the old code queued the suspend fn and waited
+  // on the fence forever, because nobody drained pending_fns_. No worker
+  // yet: no-op without setting paused_.
+  if (!worker_thread_ || !worker_running_) {
+    return;
+  }
   paused_ = true;
 
   thread::Fence fence;
-  CallInThread([&fence]() {
-    fence.Signal();
-    thread::Thread::GetCurrentThread()->Suspend();
+  CallInThread([this, &fence]() {
+    // (A4-R3-02.) The fence wait below is bounded now, so this fn can run
+    // AFTER a later Resume() cleared paused_: suspending then would park
+    // the worker with nobody left to resume it. Only suspend while the
+    // pause is still in effect; signal the fence either way so the waiter
+    // never blocks on a skipped suspend.
+    if (paused_) {
+      fence.Signal();
+      thread::Thread::GetCurrentThread()->Suspend();
+    } else {
+      fence.Signal();
+    }
   });
 
-  fence.Wait();
+  if (!fence.WaitFor(std::chrono::milliseconds(1000))) {
+    // The worker is inside ExecutePrimaryBuffer (a long draw batch /
+    // shader compile) and has not drained pending_fns_ yet. paused_
+    // stays set, so the queued fn suspends it when it runs (the
+    // paused_ check above only skips the suspend if Resume() already
+    // ran), and Resume() unparks it. The UI thread returns instead of
+    // hanging.
+    REXGPU_WARN("CommandProcessor::Pause: worker did not park within 1000 ms; continuing paused");
+  }
 }
 
 void CommandProcessor::Resume() {
@@ -336,6 +361,9 @@ void CommandProcessor::Resume() {
   }
   paused_ = false;
 
+  if (!worker_thread_) {
+    return;
+  }
   worker_thread_->thread()->Resume();
 }
 
