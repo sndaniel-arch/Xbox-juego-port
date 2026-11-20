@@ -274,7 +274,8 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   if (!result_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  REXKRNL_DEBUG(
+  
+  REXKRNL_DEBUG(    
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
       uint32_t(button_count), button_ptrs.guest_address(), uint32_t(active_button), uint32_t(flags),
@@ -515,10 +516,11 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
   if (!device_id_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  
   REXKRNL_INFO("XamShowDeviceSelectorUI({:08X}, {:08X}, {:08X}, {:016X}, {:08X}, {:08X})",
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
-                overlapped.guest_address());
+                overlapped.guest_address());  
   return xeXamDispatchHeadless(
       [device_id_ptr]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
