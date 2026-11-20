@@ -29,8 +29,9 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
    cap en 0 no se emite `REX_FPS_CAP` y el vblank del guest — 60 Hz por
    defecto — pauta el juego igualmente). Sin cap, el juego no puede
    dormirse entre frames.
-2. **Escala de resolución**: 720p de objetivo; **540p como fallback** en GPUs
-   débiles (misma receta que Zandatsu en RG Cube). La escala baja es mejor
+2. **Escala de resolución**: 720p de objetivo; **540p como fallback manual**
+   en GPUs débiles (el usuario lo elige en el diálogo de gráficos, modo
+      960×540; no hay bajada automática). La escala baja es mejor
    que perder frames.
 3. **Presets Performance / Balanced / Accuracy** (los del launcher de
    rexauto): Performance por defecto en gama media, Accuracy solo en gama
@@ -38,19 +39,15 @@ si el original corría a 60 fps, el port también debe correr a 60 fps.
 4. **Shaders bajo demanda, no precompilación total**: precompilar todos los
    shaders al arrancar costaba 1,5–2,5 min de pantalla negra. En el port:
    compilar al usar, con caché persistente, y nunca bloquear el primer frame.
-5. **Ajustes globales + interruptor experimental (NO hay perfiles por GPU
-   ni detección automática).** Los presets Performance / Balanced /
-   Accuracy son globales, iguales para todas las GPUs. Las heurísticas
-   `isMali()`/`isAdreno()` solo eligen la familia del controlador dentro
-   de un zip importado por el usuario (PanVK en Mali, Turnip en Adreno)
-   y los textos del diálogo del controlador: no aplican ningún perfil de
-   rendimiento. El interruptor experimental apaga
-   `vulkan_require_fragment_stores_and_atomics` (vertex ya es `false`
-   siempre) cuando se usa un controlador alternativo. El plugin de GPU
-   emulada (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige al
-   arrancar; si el renderer nativo pierde el dispositivo, el runtime
-   aborta con `FatalError` — no hay cambio automático a otro backend en
-   caliente.
+5. **Perfiles por GPU + detección automática** (como Zandatsu): Adreno,
+   Mali, Xclipse y otros. La detección elige el .so del driver
+      (`GpuDriver.pickLibrary()`: PanVK en Mali, Turnip en Adreno) y los
+         ajustes aplican un perfil Mali en tiempo de ejecución
+            (`GraphicsSettings.asCvars()`: sin consultas de oclusión ni MSAA 2×
+               nativo en Mali, salvo preset accuracy). El plugin de GPU emulada
+                  (`librexgpu-xenos.so`, `--gpu_plugin=xenos`) se elige al arrancar; si
+                     el renderer nativo pierde el dispositivo, el runtime aborta con
+                        `FatalError` — no hay cambio automático a otro backend en caliente.
 6. **Capa de validación de Vulkan desde el primer día** (no al final): es el
    único procedimiento que ha convertido un "bug Mali" en "bug nuestro,
    arreglado" (NFSMW 0.5.5). Objetivo: cero avisos de sincronización.
@@ -71,6 +68,14 @@ GPU ni bundle Mali en el launcher. Es una checklist de 12 puntos de
 referencia (con precedente verificado en otros ports): una parte vive como
 defaults globales del launcher, otra sigue sin verificar en este port.
 Nada de esto se aplica solo al detectar una G57.
+
+De los 12, solo los puntos 5 (sin MSAA 2×) y 7 (sin oclusión) son
+interruptores en tiempo de ejecución y se aplican en
+`GraphicsSettings.asCvars()` cuando la GPU es Mali (y el preset no es
+accuracy); el punto 3 se aplica en parte (vertex stores off siempre;
+fragment stores solo se relaja con un driver PanVK seleccionado). El
+resto son restricciones de compilación, traductor o driver, no ajustes
+que el launcher cambie por GPU.
 
 1. Vulkan 1.1 + `VK_EXT_descriptor_indexing`; SPIR-V rebajado a 1.3
    (sin verificar en este port).
@@ -110,7 +115,6 @@ importable como zip, como en NFSMW y xendroid-mali.
   mínimo, medio y picos; el mínimo manda, no la media.
 - Aceptación: **60 fps sostenidos en gameplay en el teléfono del usuario**,
   y 60 fps en Adreno (matriz de comunidad: Redmi 10C, POCO X6 Pro,
-  Galaxy A56). Si un dispositivo no llega a 60, el usuario puede bajar a
-  540p a mano (opción 960×540 en el diálogo de gráficos) antes de bajar
-  a 30 fps: no hay bajada automática — no existe detección de
-  rendimiento ni cambio automático de modo de vídeo.
+  Galaxy A56). Si un dispositivo no llega a 60, baja a 540p a mano
+     (diálogo de gráficos, 960×540) antes de bajar a 30 fps: no hay bajada
+     automática.
