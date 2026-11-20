@@ -117,7 +117,7 @@ class AndroidLogSinkMt final : public spdlog::sinks::base_sink<std::mutex> {
 
 std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                             std::string_view app_name) {
-    std::error_code ec;
+  std::error_code ec;
   std::filesystem::create_directories(logs_dir, ec);
 
   int max_seq = 0;
@@ -279,7 +279,7 @@ void InitLogging(const LogConfig& config) {
     // fall back to a relative "logs" directory instead of terminating.
     std::error_code cwd_ec;
     auto cwd = std::filesystem::current_path(cwd_ec);
-        auto log_dir = config.log_dir.empty()
+    auto log_dir = config.log_dir.empty()
                        ? (cwd_ec ? std::filesystem::path("logs") : cwd / "logs")
                        : std::filesystem::path(config.log_dir);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
