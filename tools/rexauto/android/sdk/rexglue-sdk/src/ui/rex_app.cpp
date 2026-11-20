@@ -197,7 +197,6 @@ bool ReXApp::SetupEnvironment() {
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
-
   }
   std::error_code ec;
 
