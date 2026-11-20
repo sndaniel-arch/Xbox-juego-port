@@ -118,7 +118,13 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     // ..? Some games do this. This parameter is not optional.
     return X_STATUS_INVALID_PARAMETER;
   }
-  assert_not_null(handle_out);
+  // (Hunt v1.4.6, A2-R3-06.) assert_not_null is a no-op in Release; a
+  // NULL handle_out used to write the handle to guest address 0 and
+  // return SUCCESS, leaking the handle. Same guard R6-06 added to
+  // NtOpenSymbolicLinkObject and IoCreateDevice.
+  if (!handle_out) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
@@ -210,7 +216,12 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   // Attempt open (or create).
   rex::filesystem::File* vfs_file;
-  rex::filesystem::FileAction file_action;
+  // (Hunt v1.4.6, A2-R3-05.) OpenFile used to leave this unwritten on
+  // five failure paths, and the io_status_block write below copies it
+  // unconditionally -- so the guest read uninitialized stack as
+  // iosb->information. OpenFile now writes it on every exit; initialize
+  // it here too so no future path can ever leak a garbage value again.
+  rex::filesystem::FileAction file_action = rex::filesystem::FileAction::kDoesNotExist;
   X_STATUS result = REX_KERNEL_FS()->OpenFile(
       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
       desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
@@ -314,8 +325,15 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
           REXKRNL_IMPORT_TRACE("NtReadFile",
                                "queue_apc thid={} normal={:#x} ctx={:#x} arg1={:#x} arg2=0",
                                thread ? thread->thread_id() : 0, apc_routine, apc_ctx, apc_arg1);
-          thread->EnqueueApc(apc_routine, apc_ctx, apc_arg1, 0);
-          apc_queued = true;
+          // (Hunt v1.4.6, A2-R3-10.) GetCurrentThread() returns null on a
+          // non-guest thread; the trace above already null-checks, but
+          // the very next statement dereferenced it. No current thread
+          // means nobody to deliver the APC to: skip it, like
+          // NtDeviceIoControlFile's complete_io already does.
+          if (thread) {
+            thread->EnqueueApc(apc_routine, apc_ctx, apc_arg1, 0);
+            apc_queued = true;
+          }
         } else {
           REXKRNL_IMPORT_TRACE("NtReadFile",
                                "skip_apc_queue (no apc_context, status={:#x})", result);
@@ -423,8 +441,12 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
       if ((uint32_t)apc_routine_ptr & ~1) {
         if (apc_context) {
           auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
-                             apc_context.guest_address(), io_status_block.guest_address(), 0);
+          // (Hunt v1.4.6, A2-R3-10.) Same null-thread guard as NtReadFile
+          // above: GetCurrentThread() is null on a non-guest thread.
+          if (thread) {
+            thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
+                               apc_context.guest_address(), io_status_block.guest_address(), 0);
+          }
         }
       }
 
@@ -524,8 +546,12 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
       if ((uint32_t)apc_routine & ~1) {
         if (apc_context) {
           auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u, apc_context.guest_address(),
-                             io_status_block.guest_address(), 0);
+          // (Hunt v1.4.6, A2-R3-10.) Same null-thread guard as NtReadFile
+          // above: GetCurrentThread() is null on a non-guest thread.
+          if (thread) {
+            thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u,
+                               apc_context.guest_address(), io_status_block.guest_address(), 0);
+          }
         }
       }
 
