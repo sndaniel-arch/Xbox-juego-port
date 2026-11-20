@@ -177,13 +177,25 @@ public class SetupActivity extends Activity {
         // failure (see GameFiles.hasValidGameRoot). The caller decides
         // what false means: picker on dev, reinstall error on FULL (M-17).
         if (!StfsAsset.isHandedOver()) return false;
-        try (PrintWriter w = new PrintWriter(new FileWriter(GameFiles.configFile(this), false))) {
+        // (Hunt v1.4.6 ronda 2, A4-R2-02.) Tmp + rename, as GpuDriver.select()
+        // does for driver.txt: truncating game_root.txt in place left a torn
+        // file on a kill/crash mid-write, and the next launch showed the
+        // reinstall error instead of booting. The rename runs after the
+        // writer closes, so the file it installs is complete.
+        File config = GameFiles.configFile(this);
+        File tmp = new File(config.getParentFile(), config.getName() + ".tmp");
+        try (PrintWriter w = new PrintWriter(new FileWriter(tmp, false))) {
             w.println(GameFiles.ASSET_PREFIX + StfsAsset.ASSET_NAME);
             // (Ronda 5, auditor F — R5-F4.) PrintWriter traga los errores de
             // E/S en silencio: sin checkError() un disco lleno dejaba
             // game_root.txt vacio y el arranque siguiente caia al picker.
             if (w.checkError()) throw new java.io.IOException("write game_root.txt");
         } catch (Exception e) {
+            tmp.delete();
+            return false;
+        }
+        if (!tmp.renameTo(config)) {
+            tmp.delete();
             return false;
         }
         launchGame();
@@ -508,12 +520,27 @@ public class SetupActivity extends Activity {
             }
         }
         File root = xex.getParentFile();
-        try (PrintWriter w = new PrintWriter(new FileWriter(GameFiles.configFile(this), false))) {
+        // (Hunt v1.4.6 ronda 2, A4-R2-02.) Tmp + rename, as GpuDriver.select()
+        // does for driver.txt (same reason as launchBundledAsset above: a
+        // torn game_root.txt makes the next launch show the reinstall
+        // error). The rename runs after the writer closes.
+        File config = GameFiles.configFile(this);
+        File tmp = new File(config.getParentFile(), config.getName() + ".tmp");
+        try (PrintWriter w = new PrintWriter(new FileWriter(tmp, false))) {
             w.println(root.getAbsolutePath());
             // (Ronda 5, auditor F — R5-F4.) Igual que en launchBundledAsset:
             // sin checkError() un fallo de escritura era invisible y el
             // siguiente arranque no encontraba el juego importado.
             if (w.checkError()) throw new java.io.IOException("write game_root.txt");
+        } catch (java.io.IOException e) {
+            // (Round 2 second sweep, LOW-3.) Don't leave a stale .tmp behind
+            // on the failure path, mirroring launchBundledAsset above.
+            tmp.delete();
+            throw e;
+        }
+        if (!tmp.renameTo(config)) {
+            tmp.delete();
+            throw new java.io.IOException("write game_root.txt");
         }
         new GraphicsSettings(this).write(this);
         ui.post(() -> {
