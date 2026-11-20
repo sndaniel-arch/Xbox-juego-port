@@ -716,10 +716,10 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
 
 u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr_ptr,
                         mapped_u32 addrlen_ptr) {
-    // (Audit A3, ronda 6, R6-06.) addrlen_ptr is read (*addrlen_ptr) and
-    // written back, but only addr_ptr was checked; a NULL addrlen_ptr
-    // used to read/write guest address 0.
-    if (!addr_ptr || !addrlen_ptr) {
+  // (Audit A3, ronda 6, R6-06.) addrlen_ptr is read (*addrlen_ptr) and
+  // written back, but only addr_ptr was checked; a NULL addrlen_ptr
+  // used to read/write guest address 0.
+  if (!addr_ptr || !addrlen_ptr) {
     // WSAEFAULT
     XThread::SetLastError(0x271E);
     return -1;
