@@ -597,7 +597,7 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
 }
 
 std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
-const std::filesystem::path& config_path) {
+    const std::filesystem::path& config_path) {
   std::error_code ec;
   std::map<std::string, std::string> result;
   if (!std::filesystem::exists(config_path, ec))
