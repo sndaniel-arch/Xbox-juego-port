@@ -51,10 +51,16 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     }
     return X_STATUS_SUCCESS;
   } else {
+    // (Hunt v1.4.6, A2-R3-02.) A failed pread is a real I/O error, not
+    // end-of-file -- the read-side mirror of A2-R2-06, which fixed the
+    // same mis-mapping for writes. PosixFileHandle::Read already wrote
+    // the partial count into bytes_read before returning false, so keep
+    // it (a mid-file disk error must not look like a clean EOF with 0
+    // bytes, hiding bytes already copied into the guest buffer).
     if (out_bytes_read) {
-      *out_bytes_read = 0;
+      *out_bytes_read = bytes_read;
     }
-    return X_STATUS_END_OF_FILE;
+    return X_STATUS_UNSUCCESSFUL;
   }
 }
 
