@@ -222,18 +222,46 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
   std::lock_guard<std::mutex> lock(file_lock_);
   X_STATUS result = X_STATUS_SUCCESS;
 
-  // segments points to an array of buffer pointers of type
-  // "FILE_SEGMENT_ELEMENT", but they can just be treated as normal pointers
-  rex::be<uint32_t>* segments =
-      reinterpret_cast<rex::be<uint32_t>*>(memory()->TranslateVirtual(segments_guest_address));
-
   // TODO: not sure if this is meant to change depending on buffer address?
   // (only game seen using this always seems to use 4096-byte buffers)
   uint32_t page_size = 4096;
 
+  // (Hunt v1.4.6, A2-R2-09.) Validate the guest segment array BEFORE
+  // dereferencing it: TranslateVirtual is unchecked pointer arithmetic
+  // (virtual_membase_ + guest_address, xmemory.h), so an array placed at
+  // the top of guest memory would read past the host mapping as segments
+  // advances. Same wrap + heap check R5-D4 added for the data buffers
+  // (ReadInternal/Write): the array spans ceil(length / 4096) 4-byte
+  // entries, and both ends must land in heaps of the same kind (and in)
+  // the same heap when physical). (length / page_size + remainder
+  // avoids overflowing length + 4095 for a huge length.)
+  if (length) {
+    uint32_t segment_count = length / page_size + (length % page_size != 0 ? 1 : 0);
+    uint32_t array_bytes = segment_count * 4u;  // one uint32_t per segment
+    if (UINT32_MAX - segments_guest_address < array_bytes) {
+      result = X_STATUS_ACCESS_VIOLATION;
+    } else {
+      uint32_t array_high_address = segments_guest_address + array_bytes - 1;
+      rex::memory::BaseHeap* array_start_heap = memory()LookupHeap(segments_guest_address);
+      const rex::memory::BaseHeap* array_end_heap = memory()LookupHeap(array_high_address);
+      if (!array_start_heap || !array_end_heap ||
+          (array_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
+              (array_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
+          (array_start_heap->heap_type() == memory::HeapType::kGuestPhysical &&
+           array_start_heap != array_end_heap)) {
+        result = X_STATUS_ACCESS_VIOLATION;
+      }
+    }
+  }
+
+  // segments points to an array of buffer pointers of type
+  // "FILE_SEGMENT_ELEMENT", but they can just be treated as normal pointers
+  rex::be<uint32_t>* segments =
+      reinterpret_cast<rex::be<uint32_t>*>(memory()TranslateVirtual(segments_guest_address));
+
   uint32_t read_total = 0;
   uint32_t read_remain = length;
-  while (read_remain) {
+  while (read_remain && result == X_STATUS_SUCCESS) {
     uint32_t read_length = read_remain;
     uint32_t read_buffer = *segments;
     if (read_length > page_size) {
@@ -324,6 +352,19 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
         size_t(byte_offset), &bytes_written);
   }
   if (XSUCCEEDED(result)) {
+    // (Hunt v1.4.6, A2-R2-02.) Mirror ReadInternal (R5-D2): position_ must
+    // track the offset actually written, including an explicit one: the
+    // old `position_ += bytes_written` left position_ at
+    // `old_position + written` after an explicit-offset write, so a later
+    // position-relative (-1) write landed at the wrong offset (hole or
+    // overwrite). -1 was already mapped to position_ above. -2 is NOT
+    // mapped here: on writes it means append (H-01, still open), and
+    // WriteSync may succeed while ignoring the offset, so assigning
+    // position_ = -2 would poison it for a later -1 read/write.
+    // (Round 2 second sweep, LOW-1.)
+    if (byte_offset != uint64_t(-2)) {
+      position_ = byte_offset;
+    }
     position_ += bytes_written;
   }
 
