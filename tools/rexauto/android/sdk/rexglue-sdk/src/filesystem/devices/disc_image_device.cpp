@@ -109,7 +109,11 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
 }
 
 bool DiscImageDevice::VerifyMagic(ParseState* state, size_t offset) {
-  if (offset >= state->size) {
+  // (Hunt v1.4.6, A2-R3-12.) The old guard only checked offset < size, so
+  // a magic offset within 20 bytes of EOF made memcmp read past the end
+  // of the image. Overflow-safe order: offset > size first, then the
+  // subtraction cannot underflow.
+  if (offset > state->size || state->size - offset < 20) {
     return false;
   }
 
