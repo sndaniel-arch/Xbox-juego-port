@@ -4,6 +4,8 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
+import android.widget.Toast;
 
 import com.rexauto.port.gamepad.PadSettings;
 import com.rexauto.port.gamepad.VirtualPadView;
@@ -54,7 +56,17 @@ public class MainActivity extends SDLActivity {
             try {
                 GpuDriver gd = new GpuDriver(this);
                 if (gd.selected() != null) gd.select(null);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                // (Hunt v1.4.6, sweep of R-A-M1.) select(null) throws when
+                // the driver.txt delete fails; swallowing it left the
+                // custom driver loading on the next launch while the UI
+                // claimed the system driver. Say so (and log it): the
+                // game still starts, but the player knows the switch-off
+                // did not take.
+                Log.w("MainActivity", "could not clear selected GPU driver", e);
+                Toast.makeText(this, getString(R.string.err_driver_disable,
+                        e.getMessage() == null ? e.toString() : e.getMessage()),
+                        Toast.LENGTH_LONG).show();
             }
         }
         // Driver crash guard first (E, ronda 2, fusion §7): if the last
@@ -197,7 +209,49 @@ public class MainActivity extends SDLActivity {
     @Override
     protected void onPause() {
         if (mGamepad != null) mGamepad.onHostPause();
+        if (!mHasMultiWindow) pauseEmulation();
         super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (!mHasMultiWindow) resumeEmulation();
+    }
+
+    @Override
+    protected void onStop() {
+        if (mHasMultiWindow) pauseEmulation();
+        super.onStop();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (mHasMultiWindow) resumeEmulation();
+    }
+
+    /**
+     * (Hunt v1.4.6, A4-R6-01.) Pause/resume the guest with the activity:
+     * before this, Home / screen-off / switching apps left the game
+     * running (audio included) in the background. The native side reaches
+     * the runtime via Runtime::instance() and is a no-op before the
+     * runtime exists (crash-guard dialogs, first launch). The split
+     * mirrors SDLActivity's own: onPause/onResume when not multi-window,
+     * onStop/onStart when it is (mHasMultiWindow is SDLActivity's own
+     * public static flag, API 24+; minSdk here is 28). The native calls
+     * are best-effort: a missing lib (mBrokenLibraries) must not crash
+     * the lifecycle.
+     */
+    private static native void nativePauseEmulation();
+    private static native void nativeResumeEmulation();
+
+    private void pauseEmulation() {
+        try { nativePauseEmulation(); } catch (Throwable t) { Log.w("MainActivity", "pause emulation failed", t); }
+    }
+
+    private void resumeEmulation() {
+        try { nativeResumeEmulation(); } catch (Throwable t) { Log.w("MainActivity", "resume emulation failed", t); }
     }
 
     @Override
