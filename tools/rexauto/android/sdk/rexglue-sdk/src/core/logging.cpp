@@ -117,13 +117,17 @@ class AndroidLogSinkMt final : public spdlog::sinks::base_sink<std::mutex> {
 
 std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                             std::string_view app_name) {
-  std::filesystem::create_directories(logs_dir);
+    std::error_code ec;
+  std::filesystem::create_directories(logs_dir, ec);
 
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
-  std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
-    if (!entry.is_regular_file())
+    // (Hunt v1.4.6, A2-R3-16). The directory_entry member also throws
+    // without an error_code; use a fresh one per entry, never the
+    // iterator's ec.
+    std::error_code entry_ec;
+    if (!entry.is_regular_file(entry_ec))
       continue;
     auto stem = entry.path().stem().string();
     if (stem.starts_with(prefix)) {
@@ -271,8 +275,13 @@ void InitLogging(const LogConfig& config) {
   if (config.log_file) {
     resolved_path = config.log_file;
   } else if (!config.app_name.empty()) {
-    auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
+        // (Hunt v1.4.6, A2-R3-16). Non-throwing current_path(): on error
+    // fall back to a relative "logs" directory instead of terminating.
+    std::error_code cwd_ec;
+    auto cwd = std::filesystem::current_path(cwd_ec);
+        auto log_dir = config.log_dir.empty()
+                       ? (cwd_ec ? std::filesystem::path("logs") : cwd / "logs")
+                       : std::filesystem::path(config.log_dir);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
   if (!resolved_path.empty()) {
@@ -588,9 +597,10 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
 }
 
 std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
-    const std::filesystem::path& config_path) {
+const std::filesystem::path& config_path) {
+  std::error_code ec;
   std::map<std::string, std::string> result;
-  if (!std::filesystem::exists(config_path))
+  if (!std::filesystem::exists(config_path, ec))
     return result;
 
   try {
