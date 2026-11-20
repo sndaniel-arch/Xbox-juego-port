@@ -351,7 +351,12 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
 
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
-      command_processor_->UpdateWritePointer(value);
+      // (Hunt v1.4.6 round 3, A1-R3-05.) command_processor_ is null after
+      // Shutdown() (and before SetupGuestGpu finishes); a register write
+      // racing teardown must be dropped, not dereferenced.
+      if (command_processor_) {
+        command_processor_->UpdateWritePointer(value);
+      }
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
@@ -397,10 +402,18 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
 }
 
 void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  // (Hunt v1.4.6 round 3, A1-R3-05.) See WriteRegister above.
+  if (!command_processor_) {
+    return;
+  }
   command_processor_->InitializeRingBuffer(ptr, size_log2);
 }
 
 void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+  // (Hunt v1.4.6 round 3, A1-R3-05.) See WriteRegister above.
+  if (!command_processor_) {
+    return;
+  }
   command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
 }
 
@@ -448,10 +461,18 @@ void GraphicsSystem::MarkVblank() {
 }
 
 void GraphicsSystem::ClearCaches() {
+  // (Hunt v1.4.6 round 3, A1-R3-05.) See WriteRegister above.
+  if (!command_processor_) {
+    return;
+  }
   command_processor_->CallInThread([&]() { command_processor_->ClearCaches(); });
 }
 
 void GraphicsSystem::InvalidateGpuMemory() {
+  // (Hunt v1.4.6 round 3, A1-R3-05.) See WriteRegister above.
+  if (!command_processor_) {
+    return;
+  }
   command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
 }
 
@@ -468,6 +489,12 @@ void GraphicsSystem::pin_command_processor_thread(uint64_t mask) {
 
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
+  // (Hunt v1.4.6 round 3, A1-R3-05, 10th site found in the same sweep.)
+  // Same null dereference class as the 9 listed sites: every path below
+  // touches command_processor_.
+  if (!command_processor_) {
+    return;
+  }
   if (!REXCVAR_GET(store_shaders)) {
     return;
   }
@@ -492,24 +519,54 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
 }
 
 void GraphicsSystem::Pause() {
+  // (Hunt v1.4.6 ronda 3, A4-R3-01.) command_processor_ is only created in
+  // SetupGuestGpu (graphics_system.cpp:137), long after Runtime::Setup
+  // assigns the graphics system — the old code dereferenced it with no
+  // null check, a native crash on the UI thread for a pause during load.
+  // No CP yet: record the pause (the vblank worker, created with the CP,
+  // reads paused_) and return; Resume() clears it again. The CP itself
+  // starts unpaused, which is harmless this early: no guest commands have
+  // been submitted yet, and the vblank worker drops its backlog while
+  // paused_ is set.
+  if (!command_processor_) {
+    paused_ = true;
+    return;
+  }
   paused_ = true;
   command_processor_->Pause();
 }
 
 void GraphicsSystem::Resume() {
+  // (Hunt v1.4.6 ronda 3, A4-R3-08 — VERIFIED real, fixed.) The old order
+  // cleared paused_ BEFORE resuming the CP, so the 1 ms vblank worker
+  // could fire MarkVblank() -> DispatchInterruptCallback() -> guest
+  // interrupt code while the CP worker was still suspended. Mirror
+  // Pause() (which sets paused_ first, then suspends): resume the CP
+  // first, then clear paused_, so no vblank dispatches until the CP runs
+  // again. No CP yet (pause during load): just clear the flag.
+  if (command_processor_) {
+    command_processor_->Resume();
+  }
   paused_ = false;
-  command_processor_->Resume();
 }
 
 bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {
   stream->Write<uint32_t>(interrupt_callback_);
   stream->Write<uint32_t>(interrupt_callback_data_);
+  // (Hunt v1.4.6 round 3, A1-R3-05.) No CP means no GPU state to save.
+  if (!command_processor_) {
+    return false;
+  }
   return command_processor_->Save(stream);
 }
 
 bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
   interrupt_callback_ = stream->Read<uint32_t>();
   interrupt_callback_data_ = stream->Read<uint32_t>();
+  // (Hunt v1.4.6 round 3, A1-R3-05.) No CP means no GPU state to restore.
+  if (!command_processor_) {
+    return false;
+  }
   return command_processor_->Restore(stream);
 }
 
