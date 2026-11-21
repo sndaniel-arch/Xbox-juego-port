@@ -50,6 +50,49 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// (Hunt v1.4.6, ronda 4, A3-R4-09.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/memset/host
+// send/recv. Same heap validation as A2-R3-01 (see xam_user.cpp for
+// the full comment).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
   XNCALLER_INVALID = 0x0,
@@ -244,6 +287,14 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
   if (!buffer_ptr) {
     return 0x271E;  // WSAEFAULT
   }
+
+  // (Hunt v1.4.6, ronda 4, A3-R4-09, hermana.) Same class as WSASendTo
+  // below: `length` is guest controlled (u32) and the old code memsets
+  // that many bytes from an unvalidated pointer. Validate the whole
+  // destination range first.
+  if (!GuestRangeWritable(buffer_ptr.guest_address(), length)) {
+    return 0x271E;  // WSAEFAULT
+  }
   // For now, constant values.
   // This makes replicating things easier.
   std::memset(buffer_ptr, 0xBB, length);
@@ -373,6 +424,17 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   for (uint32_t i = 0; i < num_buffers; i++) {
     uint8_t* combined_buffer = combined_buffer_mem.data();
 
+
+    // (Hunt v1.4.6, ronda 4, A3-R4-09.) The 16 MiB cap above bounds
+    // the TOTAL, not the position: a buffer near the end of the mapping
+    // (or a wild pointer) still reads past it. Validate each source
+    // range before the copy.
+    if (!GuestRangeReadable(static_cast<uint32_t>(buffers[i].buf_ptr),
+                            static_cast<uint32_t>(buffers[i].len))) {
+      // WSAEFAULT
+      XThread::SetLastError(0x271E);
+      return -1;
+    }
     std::memcpy(combined_buffer + combined_buffer_offset,
                 REX_KERNEL_MEMORY()->TranslateVirtual(buffers[i].buf_ptr), buffers[i].len);
     combined_buffer_offset += buffers[i].len;
@@ -569,11 +631,21 @@ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
   // TODO(gibbed): actually implement this
+  uint32_t result = 0;
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
-    auto dns = REX_KERNEL_MEMORY()->TranslateVirtual<XNDNS*>(dns_guest);
-    dns->status = 1;  // non-zero = error
-    *pdns = dns_guest;
+    // (Hunt v1.4.6, ronda 4, A3-R4-22.) SystemHeapAlloc returns 0 on
+    // failure: the old code translated 0 (membase) and wrote the status
+    // there, handing the game a DNS struct at guest address 0. Report
+    // out-of-memory instead and hand back a null pointer.
+    if (!dns_guest) {
+      *pdns = 0;
+      result = X_STATUS_NO_MEMORY;
+    } else {
+      auto dns = REX_KERNEL_MEMORY()->TranslateVirtual<XNDNS*>(dns_guest);
+      dns->status = 1;  // non-zero = error
+      *pdns = dns_guest;
+    }
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -585,7 +657,7 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
     }
     ev->Set(0, false);
   }
-  return 0;
+    return result;
 }
 
 u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
@@ -598,11 +670,19 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
 
 u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
   // Set pqos as some games will try accessing it despite non-successful result
+  uint32_t result = 0;
   if (pqos) {
     auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-    auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
-    qos->count = qos->count_pending = 0;
-    *pqos = qos_guest;
+    // (Hunt v1.4.6, ronda 4, A3-R4-22.) See XNetDnsLookup above: a
+    // failed alloc used to fabricate a QoS struct at guest address 0.
+    if (!qos_guest) {
+      *pqos = 0;
+      result = X_STATUS_NO_MEMORY;
+    } else {
+      auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+      qos->count = qos->count_pending = 0;
+      *pqos = qos_guest;
+    }
   }
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -613,7 +693,7 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
     }
     ev->Set(0, false);
   }
-  return 0;
+  return result;
 }
 
 u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
@@ -706,6 +786,16 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
     return -1;
   }
 
+
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) The host
+  // setsockopt reads optlen bytes from the guest option value; validate
+  // the source range first (an optlen of 0 needs no buffer).
+  if (optlen && !GuestRangeReadable(optval_ptr.guest_address(), optlen)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+  
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
   return XSUCCEEDED(status) ? 0 : -1;
 }
@@ -975,6 +1065,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) Same class as
+  // A3-R4-09 (WSASendTo), on the receive side: the host recv() writes
+  // buf_len bytes into a guest buffer that was never range-validated.
+  if (!GuestRangeWritable(buf_ptr.guest_address(), buf_len)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   return socket->Recv(buf_ptr, buf_len, flags);
 }
 
@@ -992,6 +1091,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     native_from = *from_ptr;
   }
   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) See recv above.
+  if (!GuestRangeWritable(buf_ptr.guest_address(), buf_len)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
 
@@ -1026,6 +1131,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
+
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) Same class as
+  // A3-R4-09: the host send() reads buf_len bytes from a guest buffer
+  // that was never range-validated.
+  if (!GuestRangeReadable(buf_ptr.guest_address(), buf_len)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   return socket->Send(buf_ptr, buf_len, flags);
 }
 
@@ -1045,6 +1160,12 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   N_XSOCKADDR_IN native_to;
   if (to_ptr) {
     native_to = *to_ptr;
+  }
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) See send above.
+  if (!GuestRangeReadable(buf_ptr.guest_address(), buf_len)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
   }
   return socket->SendTo(buf_ptr, buf_len, flags, to_ptr ? &native_to : nullptr, to_len);
 }
