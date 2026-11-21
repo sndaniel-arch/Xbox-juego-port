@@ -116,6 +116,12 @@ u32 XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait
 
 u32 XMsgCompleteIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 result,
                                 u32 extended_error, u32 length) {
+  // (Hunt v1.4.6, ronda 4, A3-R4-19.) Same guard as its sisters R3-10
+  // (XMsgCancelIORequest, XamGetOverlappedResult): a null overlapped
+  // used to complete the overlapped at guest address 0.
+  if (!overlapped_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr.guest_address(), result,
                                                     extended_error, length);
   return X_ERROR_SUCCESS;
