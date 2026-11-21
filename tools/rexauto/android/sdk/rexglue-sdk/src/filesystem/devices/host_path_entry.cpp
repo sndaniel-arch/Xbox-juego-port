@@ -91,8 +91,8 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
   if (attributes & kFileAttributeDirectory) {
     std::error_code ec;
     // (Hunt v1.4.6, A2-R4-16.) create_directories returns false with a
-// clean error_code when the directory already exists -- that is
-// success, not failure. Only a real error fails the create.
+    // clean error_code when the directory already exists -- that is
+    // success, not failure. Only a real error fails the create.
     if (!std::filesystem::create_directories(full_path, ec) && ec) {
       return nullptr;
     }
