@@ -110,6 +110,28 @@ bool SDLAudioDriver::Initialize() {
 }
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+  // (Hunt v1.4.6 ronda 4, A4-R4-08.) The frame is guest memory:
+  // TranslateVirtual never returns null, so an invalid samples_ptr used
+  // to memcpy from unmapped host memory (SIGSEGV in the audio thread).
+  // Validate the whole frame against the guest heap first, same shape as
+  // the XFile read/write guards (A2-R3-01): both ends in one heap, and
+  // the range readable. frame_samples_ is a compile-time constant, so the
+  // end computation cannot overflow past the guard below.
+  const uint32_t frame_bytes = frame_samples_ * sizeof(float);
+  if (frame_ptr == 0 || frame_ptr > UINT32_MAX - frame_bytes) {
+    REXAPU_WARN("SDLAudioDriver::SubmitFrame: invalid frame_ptr={:08X}", frame_ptr);
+    return;
+  }
+  const uint32_t frame_end = frame_ptr + frame_bytes - 1;
+  auto* start_heap = memory_->LookupHeap(frame_ptr);
+  auto* end_heap = memory_->LookupHeap(frame_end);
+  if (!start_heap || !end_heap || start_heap != end_heap ||
+      start_heap->QueryRangeAccess(frame_ptr, frame_end) ==
+          rex::memory::PageAccess::kNoAccess) {
+    REXAPU_WARN("SDLAudioDriver::SubmitFrame: frame {:08X}-{:08X} not readable", frame_ptr,
+                frame_end);
+    return;
+  }
   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
   float* output_frame;
   {
