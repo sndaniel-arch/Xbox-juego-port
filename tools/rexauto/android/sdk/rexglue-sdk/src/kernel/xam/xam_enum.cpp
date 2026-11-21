@@ -31,6 +31,35 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// (Hunt v1.4.6, ronda 4, A3-R4-03.) TranslateVirtual never validates:
+// even with the count truncated to buffer_size, a wild buffer_ptr would
+// still write outside the mapping. Same heap validation as A2-R3-01.
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    return start_heap->QueryRangeAccess(guest_address, high_address) ==
+           rex::memory::PageAccess::kReadWrite;
+  }
+  return true;
+}
+
 // https://github.com/LestaD/SourceEngine2007/blob/master/se2007/engine/xboxsystem.cpp#L518
 uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
                         uint32_t buffer_size, uint32_t* items_returned, uint32_t overlapped_ptr) {
@@ -41,13 +70,22 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
     return X_ERROR_INVALID_HANDLE;
   }
 
-  auto run = [e, buffer_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+  // (Hunt v1.4.6, ronda 4, A3-R4-03.) buffer_size used to be a phantom
+// parameter: WriteItems wrote count * item_size() with no bound
+// against it. Pass it through (WriteItems truncates) and reject a
+// destination range outside writable guest memory first.
+if (buffer_ptr && !GuestRangeWritable(buffer_ptr.guest_address(), buffer_size)) {
+  return X_ERROR_INVALID_PARAMETER;
+}
+  
+    auto run = [e, buffer_ptr, buffer_size](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result;
     uint32_t item_count = 0;
     if (!buffer_ptr) {
       result = X_ERROR_INVALID_PARAMETER;
     } else {
-      result = e->WriteItems(buffer_ptr.guest_address(), buffer_ptr.as<uint8_t*>(), &item_count);
+      result = e->WriteItems(buffer_ptr.guest_address(), buffer_ptr.as<uint8_t*>(), &item_count,
+                             buffer_size);        
     }
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = item_count;
