@@ -157,6 +157,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+    // (Hunt v1.4.6, verificación profunda, FE-06b.) Probe for the FE-06
+  // deferred render pass destruction: true only when no pipeline creation
+  // can still hold a render pass (see VulkanPipelineCache::
+  // IsCreatingPipelines -- startup loading, queued creation arguments, or
+  // a busy creation thread). DestroyDeferredRenderPasses uses it as a gate
+  // so a deferred pass is only destroyed once creation is idle; entries
+  // stay queued and are retried on the next CompletedSubmissionUpdated.
+  // Placed here, next to GetCurrentSubmission/GetCompletedSubmission (the
+  // other submission accessors the render target cache already calls):
+  // CanEndSubmissionImmediately (base R4 :426) sits in the private section of
+  // this class (private: since :271; the :331 public: belongs to the
+  // nested PipelineLayout class) and the render target cache is neither a
+  // friend nor a subclass, so a probe placed next to it would not be
+  // callable from the render target cache at all.
+  bool IsPipelineCreationIdle() const {
+       return !pipeline_cache_ || !pipeline_cache_->IsCreatingPipelines();
+  }
+
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
   // - Sent to the queue without waiting for a semaphore.
