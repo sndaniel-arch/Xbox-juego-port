@@ -33,6 +33,43 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// (Hunt v1.4.6, A2-R4-10.) info_ptr.Zero(info_length) used to memset a
+// guest-controlled length with no range check -- the same hole round 3
+// closed for data buffers in XFile::Write (A2-R3-01), on the info path
+// instead. Mirror that validation: no wrap past 4 GiB, both ends inside
+// a heap, no span across heap kinds (or across two physical heaps), and
+// write access on a physical range. A zero length has no bytes to
+// validate. The caller answers INVALID_PARAMETER, as the task directs.
+// Residual: a buffer the guest allocated outside every heap (if such a
+// region exists) is newly rejected -- the same contract the data path
+// already enforces for every NtReadFile/NtWriteFile buffer.
+static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
+  if (length == 0) {
+    return true;
+  }
+  if (UINT32_MAX - guest_address < length) {
+    return false;
+  }
+  uint32_t guest_high_address = guest_address + length - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
+  if (!start_heap ||!end_heap ||
+          (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical)!=
+              (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
+          (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical &&
+           start_heap!= end_heap)) {
+    return false;
+  }
+  if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
+    auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
+    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address)!=
+              rex::memory::PageAccess::kReadWrite) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
   // TODO(gibbed): validate path components individually.
   bool got_asterisk = false;
@@ -136,6 +173,14 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
     return fail(X_STATUS_INVALID_HANDLE);
+  }
+
+  // (Hunt v1.4.6, A2-R4-10.) info_length is a guest u32 (up to 4 GiB):
+  // zeroing past the buffer corrupts adjacent guest memory (or faults
+  // at the top of the 4 GiB space). Validate the range first; Zero()
+  // itself only null-checks the pointer, it never checks the length.
+  if (!GuestInfoBufferIsWritable(info_ptr.guest_address(), info_length)) {
+    return fail(X_STATUS_INVALID_PARAMETER);
   }
 
   info_ptr.Zero(info_length);
@@ -377,7 +422,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     }
     default:
       // Unsupported, for now.
+      // (Hunt v1.4.6, A2-R4-04.) The 5 classes GetSetFileInfoMinimumLength
+      // accepts but this switch never implemented (Mode, IoPriority,
+      // MountPartition, Link, MountPartitions) used to fall here with
+      // result still SUCCESS -- a lie: the guest believed the set took
+      // effect. The Query sibling honestly returns INVALID_PARAMETER
+      // from its default; do the same here.
       assert_always();
+      result = X_STATUS_INVALID_PARAMETER;
       out_length = 0;
       break;
   }
@@ -437,6 +489,12 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
     return fail(X_STATUS_INVALID_HANDLE);
+  }
+
+  // (Hunt v1.4.6, A2-R4-10.) Same unvalidated Zero() as
+  // NtQueryInformationFile above: validate the guest range first.
+  if (!GuestInfoBufferIsWritable(info_ptr.guest_address(), info_length)) {
+    return fail(X_STATUS_INVALID_PARAMETER);
   }
 
   info_ptr.Zero(info_length);
