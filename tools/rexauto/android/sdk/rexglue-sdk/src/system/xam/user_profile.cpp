@@ -164,6 +164,11 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
+    // (Hunt v1.4.6, ronda 4, A3-R4-21.) Same guard as LoadSetting: an
+    // OpenFile failure used to pass a null FILE* to fwrite + fclose.
+    if (!file) {
+      return;
+    }
     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
   } else {
