@@ -30,6 +30,24 @@ import java.io.File;
  */
 final class PadSettingsDialog {
 
+    // (Hunt v1.4.6 ronda 4, A4-R4-09.) A fast double-tap on the gear opened
+    // two dialogs over the same PadSettings; both wrote on OK and the last
+    // one won. One dialog at a time: the live instance is the guard, not a
+    // bare boolean — a boolean cleared only by OnDismissListener would stick
+    // if the activity is destroyed with the dialog open, since the framework
+    // does not fire OnDismissListener then; a stale instance whose activity
+    // is gone, or which is no longer showing, is dropped and the dialog can
+    // open again.
+    private static AlertDialog sDialog;
+    private static Activity sDialogActivity;
+
+    /** True when this dialog is currently up in a live activity. */
+    static boolean isShowing() {
+        return sDialog != null && sDialog.isShowing()
+                && sDialogActivity != null
+                && !sDialogActivity.isFinishing() && !sDialogActivity.isDestroyed();
+    }
+
     /** One labeled percent slider bound to a clamped settings value. */
     private static final class SliderRow {
         final TextView label;
@@ -110,6 +128,10 @@ final class PadSettingsDialog {
     }
 
     static void show(Activity activity, PadSettings settings, OnChanged onChanged) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a second instance while
+        // one is up; VirtualPadView checks isShowing() too, but show() is
+        // the choke point.
+        if (isShowing()) return;
         final float density = activity.getResources().getDisplayMetrics().density;
         final int pad = (int) (20 * density);
 
@@ -274,6 +296,17 @@ final class PadSettingsDialog {
         if (dialog.getWindow() != null) {
             dialog.getWindow().setGravity(Gravity.CENTER);
         }
+                // (Hunt v1.4.6 ronda 4, A4-R4-09.) Track the live instance for the
+        // isShowing() guard; clear it on dismiss (the == check keeps a
+        // newer dialog from being cleared by an older one's dismiss).
+        sDialog = dialog;
+        sDialogActivity = activity;
+        dialog.setOnDismissListener(d -> {
+            if (sDialog == dialog) {
+                sDialog = null;
+                sDialogActivity = null;
+            }
+        });
         dialog.show();
     }
 
