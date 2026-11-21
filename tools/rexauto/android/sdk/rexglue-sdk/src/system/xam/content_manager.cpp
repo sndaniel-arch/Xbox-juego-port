@@ -71,8 +71,23 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
 
 ContentPackage::~ContentPackage() {
   auto fs = kernel_state_->file_system();
-  fs->UnregisterSymbolicLink(root_name_ + ":");
-  fs->UnregisterDevice(device_path_);
+  // (Hunt v1.4.6, A2-R4-12.) The losing CreateContent/OpenContent racer
+  // is destroyed while the winner's package (same root_name_) is open:
+  // RegisterSymbolicLink overwrote this package's link with the winner's
+  // target (insert_or_assign), so an unconditional unregister here
+  // erased the WINNER's symlink. Only unregister the link when it still
+  // points at this package's own device. The device unregister below is
+  // already safe (device_path_ is unique per package), and gating both
+  // on device_registered_ keeps the old no-op behaviour for a package
+  // whose constructor failed before registering anything.
+  if (device_registered_) {
+    std::string current_target;
+    if (fs->FindSymbolicLink(root_name_ + ":", current_target) &&
+        rex::string::utf8_equal_case(current_target, device_path_)) {
+      fs->UnregisterSymbolicLink(root_name_ + ":");
+    }
+    fs->UnregisterDevice(device_path_);
+  }
 }
 
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
@@ -258,7 +273,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
 
   if (!std::filesystem::exists(parent_path, ec_r316_3)) {
     std::error_code ec;
-    if (!std::filesystem::create_directories(parent_path, ec)) {
+    // (Second sweep, V-A2-02.) Same already-exists class as A2-R4-16:
+// create_directories returns false with a clean error_code when the
+// directory already exists (a racing thread created it after the
+// exists() check above) -- that is success, not failure.
+    if (!std::filesystem::create_directories(parent_path, ec) && ec) {
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -372,7 +391,12 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     return X_ERROR_ALREADY_EXISTS;
   }
   std::error_code ec;
-  if (!std::filesystem::create_directories(package_path, ec)) {
+  // (Second sweep, V-A2-02.) Same already-exists class as A2-R4-16:
+// create_directories returns false with a clean error_code when the
+// directory already exists (a racing thread created it after the
+// exists() check above, which already returns ALREADY_EXISTS) -- that
+// is success, not ACCESS_DENIED.
+  if (!std::filesystem::create_directories(package_path, ec) && ec) {
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -677,7 +701,14 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
       kernel_state_->object_table()->GetObjectsByType<XFile>(XObject::Type::File);
 
   std::string resolved_path = "";
-  kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':', resolved_path);
+  // (Hunt v1.4.6, A2-R4-08.) The FindSymbolicLink return used to be
+// ignored: when the symlink is not registered, resolved_path stays
+// "" and utf8_starts_with(x, "") is true, so EVERY open XFile in the
+// process got its handle released. Nothing belongs to this content
+// when its symlink is missing -- release nothing.
+  if (!kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':', resolved_path)) {
+    return;
+  }
 
   for (const object_ref<XFile>& file : all_files_handles) {
     std::string file_path = file->entry()->absolute_path();
@@ -855,10 +886,20 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     if (std::filesystem::exists(thumb_path, thumb_ec) && !thumb_ec) {
       auto thumb_file = rex::filesystem::OpenFile(thumb_path, "rb");
       if (thumb_file) {
-        std::fseek(thumb_file, 0, SEEK_END);
-        const long thumb_size = std::ftell(thumb_file);
-        std::fseek(thumb_file, 0, SEEK_SET);
-        if (thumb_size > 0) {
+        // (Hunt v1.4.6, A2-R4-09.) Same 16 MiB cap as GetContentThumbnail
+        // in this file: the thumbnail size used to come straight from an
+        // uncapped ftell into resize(), so a multi-GB __thumbnail.png
+        // threw std::bad_alloc, uncaught, and terminated the install.
+        // An oversized (or unreadable) thumbnail is simply not
+        // preserved -- it is regenerable, and losing it must not fail
+        // the install. A failed seek leaves thumb_size at -1, same path.
+        constexpr size_t kMaxThumbnailBytes = 16 * 1024 * 1024;
+        long thumb_size = -1;
+        if (std::fseek(thumb_file, 0, SEEK_END) == 0) {
+          thumb_size = std::ftell(thumb_file);
+          std::fseek(thumb_file, 0, SEEK_SET);
+        }
+        if (thumb_size > 0 && static_cast<size_t>(thumb_size) <= kMaxThumbnailBytes) {
           preserved_thumbnail.resize(static_cast<size_t>(thumb_size));
           if (std::fread(preserved_thumbnail.data(), 1, preserved_thumbnail.size(), thumb_file) !=
               preserved_thumbnail.size()) {
