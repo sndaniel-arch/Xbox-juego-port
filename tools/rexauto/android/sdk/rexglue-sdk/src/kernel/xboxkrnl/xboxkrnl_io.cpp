@@ -214,6 +214,15 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
         static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen);
   }
 
+  // (Hunt v1.4.6, A2-R4-06.) FileDisposition only defines values 0-5; the
+  // unchecked cast below used to let any value through, and OpenFile's
+  // switches silently opened the file while leaving *out_action
+  // unwritten -- the iosb then reported kDoesNotExist for a successful
+  // open. Real NT rejects this with INVALID_PARAMETER.
+  if (creation_disposition > 5) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // Attempt open (or create).
   rex::filesystem::File* vfs_file;
   // (Hunt v1.4.6, A2-R3-05.) OpenFile used to leave this unwritten on
@@ -587,10 +596,15 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
 u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
                                mapped_void object_attribs, u32 num_concurrent_threads) {
-  auto completion = new XIOCompletion(REX_KERNEL_STATE());
-  if (out_handle) {
-    *out_handle = completion->handle();
+  // (Hunt v1.4.6, A2-R4-19.) The new used to run before this check, so a
+  // NULL out_handle leaked the object (registered in the object table,
+  // never handed out, never released). Validate first.
+  if (!out_handle) {
+    return X_STATUS_INVALID_PARAMETER;
   }
+
+auto completion = new XIOCompletion(REX_KERNEL_STATE());
+  *out_handle = completion->handle();
 
   return X_STATUS_SUCCESS;
 }
@@ -620,7 +634,10 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
   auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
   if (!port) {
-    status = X_STATUS_INVALID_HANDLE;
+    // (Hunt v1.4.6, A2-R4-01.) The old code set INVALID_HANDLE here and
+    // fell through to port->WaitForNotification below -- a null deref
+    // on a host object_ref. Return the intended status instead.
+    return X_STATUS_INVALID_HANDLE;
   }
 
   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
@@ -646,7 +663,15 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 }
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
-                                    ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+  // (Hunt v1.4.6, A2-R4-02.) A guest NULL arrives as a host null
+  // (function.h: the marshaller returns T(nullptr) for guest address 0),
+  // so dereferencing either out-pointer below used to SIGSEGV the host.
+  // Same guard NtCreateFile already has for object_attrs.
+  if (!obj_attribs ||!file_info) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
@@ -710,6 +735,13 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
     return X_STATUS_INFO_LENGTH_MISMATCH;
   }
 
+  // (Hunt v1.4.6, A2-R4-02.) A guest NULL file_info_ptr used to reach
+  // XFile::QueryDirectory, whose only guard was an assert (a no-op in
+  // Release) before the buffer was written through.
+  if (!file_info_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   X_STATUS result = X_STATUS_UNSUCCESSFUL;
   uint32_t info = 0;
 
@@ -723,12 +755,17 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 
   if (file) {
     // X_FILE_DIRECTORY_INFORMATION dir_info = {0};
-    result = file->QueryDirectory(file_info_ptr, length, name, restart_scan != 0);
+    // (Hunt v1.4.6, A2-R4-17.) The iosb used to report the caller's
+    // whole buffer length, but QueryDirectory writes a single entry:
+    // report the bytes it actually wrote.
+    size_t bytes_written = 0;
+    result = file->QueryDirectory(file_info_ptr, length, name, restart_scan!= 0, &bytes_written);
     if (XSUCCEEDED(result)) {
-      info = length;
+      info = static_cast<uint32_t>(bytes_written);
     }
   } else {
-    result = X_STATUS_NO_SUCH_FILE;
+    // (Hunt v1.4.6, A2-R4-18.) A bad handle is not a missing file.
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   if (XFAILED(result)) {
@@ -744,7 +781,19 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
+  // (Hunt v1.4.6, A2-R4-19.) This used to return SUCCESS without ever
+  // looking at the handle or flushing anything -- including for an
+  // invalid handle. Validate the handle and flush for real (HostPath
+  // files fsync; other files have nothing buffered, so their flush is
+  // a no-op -- but an invalid handle now fails honestly).
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   auto result = X_STATUS_SUCCESS;
+  if (!file) {
+    result = X_STATUS_INVALID_HANDLE;
+  } else {
+    file->Flush();
+  }
+
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
@@ -812,8 +861,16 @@ u32 NtQuerySymbolicLinkObject_entry(u32 handle, ppc_ptr_t<X_ANSI_STRING> target)
   if (!symlink) {
     return X_STATUS_NO_SUCH_FILE;
   }
+  // (Hunt v1.4.6, A2-R4-02.) A guest NULL target used to be dereferenced
+  // below (and its pointer passed to TranslateVirtual unchecked).
+  if (!target) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto length = std::min(static_cast<size_t>(target->maximum_length), symlink->target().size());
   if (length > 0) {
+    if (!target->pointer) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
     auto target_buf = REX_KERNEL_MEMORY()->TranslateVirtual(target->pointer);
     std::memcpy(target_buf, symlink->target().c_str(), length);
   }
@@ -937,6 +994,13 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
       complete_io(X_STATUS_BUFFER_TOO_SMALL, 0);
       return X_STATUS_BUFFER_TOO_SMALL;
     }
+    // (Hunt v1.4.6, A2-R4-11.) Only the length was checked: a NULL
+    // output buffer with a plausible length wrote 8 bytes to guest
+    // address 0 instead of failing.
+    if (!output_buffer) {
+      complete_io(X_STATUS_INVALID_PARAMETER, 0);
+      return X_STATUS_INVALID_PARAMETER;
+    }
     memory::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
     memory::store_and_swap<uint32_t>(output_buffer + 4, 512);
     bytes_written = 0x8;
@@ -945,6 +1009,12 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
       assert_always();
       complete_io(X_STATUS_BUFFER_TOO_SMALL, 0);
       return X_STATUS_BUFFER_TOO_SMALL;
+    }
+    // (Hunt v1.4.6, A2-R4-11.) Same NULL-output hole as the geometry
+    // branch above (16 bytes to guest address 0).
+    if (!output_buffer) {
+      complete_io(X_STATUS_INVALID_PARAMETER, 0);
+      return X_STATUS_INVALID_PARAMETER;
     }
     memory::store_and_swap<uint64_t>(output_buffer, 0);
     memory::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
@@ -973,6 +1043,13 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
 
   // 0x24 is guessed size from accesses to out_struct - likely incorrect
   auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x24);
+  // (Second sweep, V-A2-04.) An exhausted system heap returns 0, and
+  // the memset below used to write 0x24 bytes to guest address 0
+  // (TranslateVirtual never returns null). Fail honestly instead.
+  if (!out_guest) {
+    return X_STATUS_NO_MEMORY;
+  }
+
 
   auto out = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(out_guest);
   memset(out, 0, 0x24);
@@ -980,6 +1057,15 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
   // XMountUtilityDrive writes some kind of header here
   // 0x1000 bytes should be enough to store it
   auto out_guest2 = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x1000);
+  // (Second sweep, V-A2-04.) Same unchecked alloc: the store below
+  // would write the second pointer into the first buffer's header
+  // slot, and the caller would read a NULL device pointer as valid.
+  // Give the first block back -- it is already allocated, and leaking
+  // it on this already-failing path would only shrink the heap further.
+  if (!out_guest2) {
+    REX_KERNEL_MEMORY()->SystemHeapFree(out_guest);
+return X_STATUS_NO_MEMORY;
+  }
   memory::store_and_swap(out + 0x18, out_guest2);
 
   *out_struct = out_guest;
