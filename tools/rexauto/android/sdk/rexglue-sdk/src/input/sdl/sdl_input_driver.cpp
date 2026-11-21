@@ -10,6 +10,8 @@
  */
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 
@@ -30,6 +32,14 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+// (Hunt v1.4.6 ronda 4, A4-R4-11.) Cap for pending_events_: the guest
+// stops draining while paused, so a held stick / drag at 60-120 Hz grew
+// the queue without bound (~4 MB in 10 min, then a burst of stale axis
+// motion on resume). 1024 events (~56 KiB) is far above one frame's
+// worth at any poll rate; older events are dropped, the latest axis value
+// wins, and button state converges from the newest events.
+constexpr size_t kMaxPendingEvents = 1024;
 
 }  // namespace
 
@@ -121,6 +131,17 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
   if (attached_window_) {
     attached_window_->RemoveListener(this);
+    // (Hunt v1.4.6 ronda 4, A4-R4-04.) controllers_ was touched without
+    // controllers_mutex_ while the guest thread can be inside
+    // GetDeviceState/GetDeviceCapabilities holding it via DrainAndLock.
+    // Taking it here is deadlock-free: no caller of OnClosing holds it
+    // (OnClosing comes from Window::Close on the UI thread), and this
+    // function never calls DrainAndLock/FindController while holding it —
+    // it only closes the pads and clears the vector, exactly like
+    // OnControllerDeviceRemovedLocked already does under the same mutex.
+    // SDL_QuitSubSystem below cannot call back into code that takes this
+    // mutex (the event watch only takes event_queue_mutex_).
+    std::lock_guard<std::mutex> guard(controllers_mutex_);
     for (auto& controller : controllers_) {
       SDL_CloseGamepad(controller.sdl);
     }
@@ -411,6 +432,15 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
   // SDL's internal joystick lock that caused deadlocks.
   std::lock_guard<std::mutex> guard(event_queue_mutex_);
   pending_events_.push_back(event);
+  // (Hunt v1.4.6 ronda 4, A4-R4-11.) Drop the oldest events past the cap:
+  // the latest axis value wins and button state converges from the newest
+  // events. The SDL-side queue is still flushed above, so this only bounds
+  // our own buffer, not SDL's.
+  if (pending_events_.size() > kMaxPendingEvents) {
+    pending_events_.erase(pending_events_.begin(),
+                           pending_events_.begin() + static_cast<ptrdiff_t>(pending_events_.size() -
+                                                                             kMaxPendingEvents));
+  }
 }
 
 std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
@@ -704,13 +734,30 @@ void SDLInputDriver::QueueControllerUpdate() {
   // synchronous UI-thread call is the correct shape. CallInUIThreadSynchronous
   // runs inline when the caller already is the UI thread (no deadlock
   // there), and the UI thread is the SDL event loop (SDL_WaitEvent), so the
-  // pump runs promptly. If the UI thread ever stalls, the poll waits rather
-  // than reading a stale frame — no event is lost, the event watch already
-  // buffered it in pending_events_.
+  // pump runs promptly.
+  // (Hunt v1.4.6 ronda 4, A4-R4-03.) Bounded variant: the unbounded wait
+  // hung the guest poll for the whole SDL pause (the UI thread is parked
+  // on the pause semaphore, so the queued pump cannot run). A timed-out
+  // pump is safe here and only here: SDL_PumpEvents only feeds the event
+  // watch, which already buffered the events into pending_events_, and
+  // DrainAndLock drains them below; the queued pump still runs when the UI
+  // thread resumes, so no event is lost — the poll just proceeds with the
+  // buffered state instead of waiting out the pause. 1000 ms, like the
+  // A4-R3-02 pause waits. The shared CallInUIThreadSynchronous keeps its
+  // unbounded contract on purpose (its xam_ui callers delete the dialog
+  // when it returns false — a timeout there would run dialog->Then on a
+  // deleted dialog), so only this call site uses the timeout variant.
   if (!attached_window_) {
     return;
   }
-  attached_window_->app_context().CallInUIThreadSynchronous([this]() { SDL_PumpEvents(); });
+  if (!attached_window_->app_context().CallInUIThreadSynchronousWithTimeout(
+          [this]() { SDL_PumpEvents(); }, std::chrono::milliseconds(1000))) {
+    // Expected during a pause; log once so a long pause does not spam.
+    static std::atomic<int> pump_timeout_count{0};
+    if (pump_timeout_count.fetch_add(1) == 0) {
+      REXLOG_WARN("SDL input pump timed out (UI thread paused); continuing with buffered events");
+    }
+  }
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press
