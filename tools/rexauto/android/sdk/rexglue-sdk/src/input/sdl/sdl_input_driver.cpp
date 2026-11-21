@@ -438,8 +438,8 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
   // our own buffer, not SDL's.
   if (pending_events_.size() > kMaxPendingEvents) {
     pending_events_.erase(pending_events_.begin(),
-                           pending_events_.begin() + static_cast<ptrdiff_t>(pending_events_.size() -
-                                                                             kMaxPendingEvents));
+                          pending_events_.begin() + static_cast<ptrdiff_t>(pending_events_.size() -
+                                                                            kMaxPendingEvents));
   }
 }
 
