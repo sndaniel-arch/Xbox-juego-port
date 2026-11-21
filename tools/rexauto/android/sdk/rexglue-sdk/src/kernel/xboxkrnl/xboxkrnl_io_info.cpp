@@ -60,12 +60,48 @@ static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
        start_heap != end_heap)) {
     return false;
   }
-  if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
+    if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
     auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
     if (physical_heap->QueryRangeAccess(guest_address, guest_high_address) !=
         rex::memory::PageAccess::kReadWrite) {
       return false;
     }
+  }
+  return true;
+}
+
+// (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-16.)
+// Readable twin of GuestInfoBufferIsWritable above, same contract:
+// the Query sibling validates the range it WRITES with the writable
+// helper, but NtSetInformationFile below READS the info struct from
+// the guest and had no range check at all. Mirror the helper exactly
+// (heap membership for virtual heaps, kReadWrite for a physical
+// range); a readable range only needs the pages to be accessible, and
+// the physical heap is read/write in practice, so the same test
+// applies.
+static bool GuestInfoBufferIsReadable(uint32_t guest_address, uint32_t length) {
+  if (length == 0) {
+    return true;
+}
+  if (UINT32_MAX - guest_address < length) {
+    return false;
+}
+  uint32_t guest_high_address = guest_address + length - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
+  if (!start_heap ||!end_heap ||
+      (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical)!=
+          (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
+      (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical &&
+       start_heap!= end_heap)) {
+    return false;
+}
+  if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
+    auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
+    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address)!=
+        rex::memory::PageAccess::kReadWrite) {
+      return false;
+}
   }
   return true;
 }
@@ -327,6 +363,23 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
     return fail(X_STATUS_INVALID_HANDLE);
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-16.)
+  // Sibling of NtQueryInformationFile above (A2-R4-10), which validates
+  // the info range it writes: this setter READS the info struct
+  // (minimum_length bytes for the class; every case below reads its
+  // struct through info_ptr.as<T*>()) with only the NULL guard and the
+  // info_length >= minimum_length number check -- but info_length is
+  // just a number the guest passes, not the size of the buffer behind
+  // info_ptr. A struct pointer near the end of the mapping SIGSEGVs
+  // the host on the first field read. Validate the struct range first,
+  // after the handle lookup like the Query sibling does, so an invalid
+  // handle still reports INVALID_HANDLE first. (The rename case reads
+  // a second, nested guest string through info->ansi_string; that
+  // nested pointer is a separate, systemic class, not covered here.)
+  if (!GuestInfoBufferIsReadable(info_ptr.guest_address(), minimum_length)) {
+    return fail(X_STATUS_INVALID_PARAMETER);
   }
 
   X_STATUS result = X_STATUS_SUCCESS;
