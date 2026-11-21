@@ -161,13 +161,13 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_NO_SUCH_USER;
   }
 
-    // (Hunt v1.4.6, ronda 4, A3-R4-14.) Same guard as the sister
+  // (Hunt v1.4.6, ronda 4, A3-R4-14.) Same guard as the sister
   // XamUserGetGamerTag below: a NULL buffer used to write the name to
   // guest address 0.
   if (!buffer) {
     return X_E_INVALIDARG;
   }
-  
+
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -265,7 +265,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
           needed_data_size += static_cast<uint32_t>(stored_setting->DataSize());
         } else {
           needed_data_size += setting_key.size;
-        }          
+        }
         break;
       default:
         break;
@@ -423,15 +423,15 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
         // anything bigger, and validate the source range before the
         // copy. The ptr == 0 branch only zero-fills, so it needs the
         // cap but no range check. A bad setting is skipped (logged)
-        // rather than failing the whole save.        
+        // rather than failing the whole save.
         size_t binary_size = setting.data.binary.size;
-                if (binary_size > 4095) {
+        if (binary_size > 4095) {
           REXKRNL_ERROR(
               "XamUserWriteProfileSettings: binary setting {:08X} size {} exceeds the "
               "12-bit setting size field (4095); skipping",
               (uint32_t)setting.setting_id, binary_size);
           break;
-                }
+        }
         uint32_t binary_ptr_guest = static_cast<uint32_t>(setting.data.binary.ptr);
         if (setting.data.binary.ptr &&
             !GuestRangeReadable(binary_ptr_guest, binary_size)) {
@@ -662,7 +662,7 @@ class XStaticAchievementEnumerator : public XEnumerator {
 
   uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count,
                       size_t buffer_size) override {
-        // (Hunt v1.4.6, ronda 4, A3-R4-03.) Truncate the item count to what
+    // (Hunt v1.4.6, ronda 4, A3-R4-03.) Truncate the item count to what
     // fits in the buffer the game actually passed. The layout is kept
     // exactly as before — the details array holds items_per_enumerate()
     // entries and the string area starts after it — so a count that fits
@@ -689,7 +689,7 @@ class XStaticAchievementEnumerator : public XEnumerator {
     if (!count) {
       return X_ERROR_INSUFFICIENT_BUFFER;
     }
-    
+
     size_t size = count * item_size();
 
     auto details = reinterpret_cast<X_ACHIEVEMENT_DETAILS*>(buffer_data);
@@ -851,7 +851,7 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-    // (Hunt v1.4.6, ronda 4, A3-R4-08.) stride * height are both guest
+  // (Hunt v1.4.6, ronda 4, A3-R4-08.) stride * height are both guest
   // controlled: the old code memsets that many bytes from an unchecked
   // guest pointer, past the end of the mapping. Validate the whole
   // destination range before touching it.
