@@ -506,26 +506,26 @@ u32 KeTlsSetValue_entry(u32 tls_index, u32 tls_value) {
 }
 
 void KeInitializeMutant_entry(ppc_ptr_t<X_DISPATCH_HEADER> mutant_ptr, u32 initial_owner) {
- // (Hunt v1.4.6, ronda 4, A3-R4-05.) Was a bare stub: the guest's
- // mutant header was never initialized and no XMutant was ever
- // created for it, so any later wait/release on that address read an
- // uninitialized header. Mirrors KeInitializeEvent above; there is no
- // X_KMUTANT struct in this tree, so the parameter is the dispatch
- // header the KMUTANT starts with (DISP_TYPE_MUTANT = 2, verified
- // against the Windows DDK KMUTANT layout: Header.Type = 0x02,
- // SignalState 0 = not signaled / 1 = signaled). SignalState follows
- // the ReactOS KeInitializeMutant convention: InitialOwner? 0: 1.
- if (!mutant_ptr) {
- return;
- }
- mutant_ptr.Zero();
- mutant_ptr->type = 2; // MutantObject
- mutant_ptr->signal_state = initial_owner? 0: 1;
- auto mutant = XObject::GetNativeObject<XMutant>(REX_KERNEL_STATE(), mutant_ptr, 2);
- if (!mutant) {
- assert_always();
- return;
- }
+  // (Hunt v1.4.6, ronda 4, A3-R4-05.) Was a bare stub: the guest's
+  // mutant header was never initialized and no XMutant was ever
+  // created for it, so any later wait/release on that address read an
+  // uninitialized header. Mirrors KeInitializeEvent above; there is no
+  // X_KMUTANT struct in this tree, so the parameter is the dispatch
+  // header the KMUTANT starts with (DISP_TYPE_MUTANT = 2, verified
+  // against the Windows DDK KMUTANT layout: Header.Type = 0x02,
+  // SignalState 0 = not signaled / 1 = signaled). SignalState follows
+  // the ReactOS KeInitializeMutant convention: InitialOwner ? 0 : 1.
+  if (!mutant_ptr) {
+    return;
+  }
+  mutant_ptr.Zero();
+  mutant_ptr->type = 2;  // MutantObject
+  mutant_ptr->signal_state = initial_owner ? 0 : 1;
+  auto mutant = XObject::GetNativeObject<XMutant>(REX_KERNEL_STATE(), mutant_ptr, 2);
+  if (!mutant) {
+    assert_always();
+    return;
+  }
 }
 
 void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 event_type, u32 initial_state) {
@@ -819,13 +819,13 @@ u32 NtReleaseMutant_entry(u32 mutant_handle, u32 unknown) {
 
 u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u32 timer_type) {
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
- // (Hunt v1.4.6, ronda 4, A3-R4-04.) Anything else used to leave the
- // timer primitive null (XTimer::Initialize only handles 0/1), and
- // NtSetTimerEx/NtCancelTimer then dereferenced it. Reject up front;
- // assert_true alone is a no-op in Release.
- if (timer_type > 1) {
- return X_STATUS_INVALID_PARAMETER;
- }
+  // (Hunt v1.4.6, ronda 4, A3-R4-04.) Anything else used to leave the
+  // timer primitive null (XTimer::Initialize only handles 0/1), and
+  // NtSetTimerEx/NtCancelTimer then dereferenced it. Reject up front;
+  // assert_true alone is a no-op in Release.
+  if (timer_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // Check for an existing timer with the same name.
   auto existing_object =
@@ -843,14 +843,14 @@ u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u
   }
 
   auto timer = object_ref<XTimer>(new XTimer(REX_KERNEL_STATE()));
- // (Hunt v1.4.6, ronda 4, A3-R4-04.) Initialize reports failure
- // instead of leaving timer_null; drop the half-created object
- // (mirrors NtCreateSemaphore) rather than handing out a handle to
- // a timer that can never fire.
- if (!timer->Initialize(timer_type)) {
- timer->ReleaseHandle();
- return X_STATUS_INVALID_PARAMETER;
- }
+  // (Hunt v1.4.6, ronda 4, A3-R4-04.) Initialize reports failure
+  // instead of leaving timer_ null; drop the half-created object
+  // (mirrors NtCreateSemaphore) rather than handing out a handle to
+  // a timer that can never fire.
+  if (!timer->Initialize(timer_type)) {
+    timer->ReleaseHandle();
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // obj_attributes may have a name inside of it, if != NULL.
   if (obj_attributes_ptr) {
@@ -1394,12 +1394,12 @@ u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
 }
 
 u32 KeRemoveQueueDpc_entry(ppc_ptr_t<XDPC> dpc) {
- // (Hunt v1.4.6, ronda 4, A3-R4-20.) Same null-guard as its sister
- // KeInsertQueueDpc (R3-07): a null DPC used to compute a list entry
- // at guest address 4 and walk the queue with it.
- if (!dpc) {
- return 0;
- }
+  // (Hunt v1.4.6, ronda 4, A3-R4-20.) Same null-guard as its sister
+  // KeInsertQueueDpc (R3-07): a null DPC used to compute a list entry
+  // at guest address 4 and walk the queue with it.
+  if (!dpc) {
+    return 0;
+  }
   bool result = false;
 
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
