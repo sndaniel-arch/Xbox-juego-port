@@ -59,6 +59,15 @@ public class SetupActivity extends Activity {
     private Button pickBtn, pickDirBtn;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean busy;
+    // (Hunt v1.4.6 ronda 4, A4-R4-02.) Cross-instance import guard: busy
+    // is per-instance, so pressing Back mid-import and relaunching gave a
+    // fresh instance with busy=false that could start a second import over
+    // the first one's writes. This static flag is set on the UI thread
+    // before the worker starts and cleared in the worker's finally on
+    // every path; pickFile/pickFolder/onActivityResult check it as well
+    // as busy. Check+set happen on the main thread, so they cannot
+    // interleave between two instances.
+    private static volatile boolean sImportRunning;
 
     // --- palette: aurora boreal sobre negro AMOLED -------------------------
     // Azul hielo #8CCBEB, azul lavanda #6578B8, lavanda #A99ACD,
@@ -284,6 +293,10 @@ public class SetupActivity extends Activity {
 
     // --- input pickers ------------------------------------------------------
     private void pickFile() {
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) Disabled buttons were the only
+        // guard, and a fresh instance after Back has them enabled: refuse
+        // while any import runs, in this instance or another one.
+        if (busy || sImportRunning) return;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("*/*");
@@ -292,6 +305,8 @@ public class SetupActivity extends Activity {
     }
 
     private void pickFolder() {
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) Same guard as pickFile().
+        if (busy || sImportRunning) return;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         startActivityForResult(i, REQ_PICK_TREE);
@@ -301,6 +316,11 @@ public class SetupActivity extends Activity {
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
         if (res != RESULT_OK || data == null || data.getData() == null) return;
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) The picker result can arrive
+        // after Back + relaunch started another import: the buttons are
+        // gone in the new instance, but this callback is not — check the
+        // guard here too, not just in the pickers.
+        if (busy || sImportRunning) return;
         Uri uri = data.getData();
         if (req == REQ_PICK_FILE) importFile(uri);
         else if (req == REQ_PICK_TREE) importTree(uri);
@@ -326,16 +346,34 @@ public class SetupActivity extends Activity {
 
     /** ISO or bare default.xex picked with the document picker. */
     private void importFile(Uri uri) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) Defence in depth: onActivityResult
+        // already guards, but importFile is the choke point — refuse here too.
+        if (busy || sImportRunning) return;
+        sImportRunning = true;
         setBusy(true);
         String name = displayName(uri);
         post(getString(R.string.status_reading, name));
         new Thread(() -> {
             File dest = GameFiles.gameDir(this);
+            File staging = importStagingDir(dest);
             try {
+                                // (Hunt v1.4.6 ronda 4, A4-R4-02.) Everything below used to
+                // write straight into dest: a failure after default.xex
+                // landed left a partial folder that hasValidGameRoot
+                // accepted (it only checked existence), and the skip-by-size
+                // in the extractors meant a re-import never repaired it.
+                // Now the whole import lands in a fresh staging dir next
+                // to dest; dest is only replaced, atomically by rename,
+                // once the import is complete and the title is verified.
+                // A failure leaves dest untouched (previous install, or
+                // no install) and staging is deleted in the finally.
+                // A fresh staging dir also makes the skip-by-size moot:
+                // no output file exists yet, so nothing is ever skipped.
+                deleteTree(staging);
+                staging.mkdirs();
                 IsoExtractor iso = IsoExtractor.open(getContentResolver(), uri);
                 File xex;
                 if (iso != null) {
-                    dest.mkdirs();
                     // (Ronda 7, auditor F — R7-F1.) Sin try/finally, un
                     // extractAll() que tira (ISO truncado, I/O del provider)
                     // dejaba el canal + PFD del ISO abiertos: iso.close()
@@ -343,12 +381,12 @@ public class SetupActivity extends Activity {
                     // importPackage/importTree SI cierran en finally; esta
                     // era la unica que no.
                     try {
-                        xex = iso.extractAll(dest, this::postProgress);
+                        xex = iso.extractAll(staging, this::postProgress);
                     } finally {
                         iso.close();
                     }
                     if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
-                } else if ((xex = importPackage(uri, name, dest)) != null) {
+                } else if ((xex = importPackage(uri, name, staging)) != null) {
                     // CON/LIVE/PIRS handled
                 } else {
                     // not a disc: accept a raw default.xex
@@ -360,7 +398,7 @@ public class SetupActivity extends Activity {
                         if (GameFiles.xexTitleId(probe) == null)
                             throw new Exception(getString(R.string.err_not_iso, name));
                     }
-                    xex = new File(dest, "default.xex");
+                    xex = new File(staging, "default.xex");
                     try (InputStream in = getContentResolver().openInputStream(uri)) {
                         // (Ronda 5, auditor F — R5-F2.) Igual que el probe de
                         // arriba: copyStream(null, ...) tira NPE en in.read().
@@ -368,9 +406,18 @@ public class SetupActivity extends Activity {
                         IsoExtractor.copyStream(in, xex);
                     }
                 }
-                finish(xex);
+                // Validate the title BEFORE promoting: finish() would only
+                // catch a wrong game after the new files already replaced
+                // the old install, while game_root.txt still points at the
+                // same path — a wrong-title import would then boot as valid.
+                checkXexTitle(xex);
+                promoteStagedImport(staging, dest);
+                finish(promotedXex(staging, dest, xex));
             } catch (Exception e) {
                 fail(e.getMessage());
+            } finally {
+                sImportRunning = false;
+                deleteTree(staging);
             }
         }, "import").start();
     }
@@ -426,19 +473,27 @@ public class SetupActivity extends Activity {
 
     /** Already-extracted folder picked with the tree picker: copy it in. */
     private void importTree(Uri tree) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) Same guard as importFile().
+        if (busy || sImportRunning) return;
+        sImportRunning = true;
         setBusy(true);
         post(getString(R.string.status_copying));
         new Thread(() -> {
             File dest = GameFiles.gameDir(this);
+            File staging = importStagingDir(dest);
             try {
-                dest.mkdirs();
+                // (Hunt v1.4.6 ronda 4, A4-R4-02.) Staging dir, same as
+                // importFile: nothing is written into dest until the
+                // import is complete and the title verified.
+                deleteTree(staging);
+                staging.mkdirs();
                 File xex;
                 StfsExtractor.Found pkg = StfsExtractor.findInTree(getContentResolver(), tree, DocumentsContract.getTreeDocumentId(tree), 0);
                 if (pkg != null && pkg.volumeType() == StfsExtractor.VOLUME_SVOD) {
                     // Games on Demand dump: <id>/<header> + <header>.data/Data0000..
                     post(getString(R.string.status_reading, pkg.name + " (Games on Demand)"));
                     IsoExtractor god = StfsExtractor.openSvod(getContentResolver(), pkg, tree);
-                    try { xex = god.extractAll(dest, this::postProgress); } finally { god.close(); }
+                    try { xex = god.extractAll(staging, this::postProgress); } finally { god.close(); }
                     if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
                 } else if (pkg != null) {
                     post(getString(R.string.status_reading, pkg.name + " (STFS)"));
@@ -449,18 +504,23 @@ public class SetupActivity extends Activity {
                     // import por carpeta de un STFS fallaba con err_generic.
                     if (pfd == null) throw new java.io.IOException("cannot open " + pkg.headerDoc);
                     java.nio.channels.FileChannel ch = new java.io.FileInputStream(pfd.getFileDescriptor()).getChannel();
-                    try { xex = new StfsExtractor.Stfs(ch, pkg.hdr).extractAll(dest, this::postProgress); }
+                    try { xex = new StfsExtractor.Stfs(ch, pkg.hdr).extractAll(staging, this::postProgress); }
                     finally { ch.close(); pfd.close(); }
                     if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_stfs, pkg.name));
                 } else {
                     long[] counter = {0};
-                    copyTree(tree, DocumentsContract.getTreeDocumentId(tree), dest, counter, 0);
-                    xex = findXex(dest, 0);
+                    copyTree(tree, DocumentsContract.getTreeDocumentId(tree), staging, counter, 0);
+                    xex = findXex(staging, 0);
                 }
                 if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_folder));
-                finish(xex);
+                checkXexTitle(xex);
+                promoteStagedImport(staging, dest);
+                finish(promotedXex(staging, dest, xex));
             } catch (Exception e) {
                 fail(e.getMessage());
+            } finally {
+                sImportRunning = false;
+                deleteTree(staging);
             }
         }, "import-tree").start();
     }
@@ -504,13 +564,65 @@ public class SetupActivity extends Activity {
         return null;
     }
 
+    // --- staged import (Hunt v1.4.6 ronda 4, A4-R4-02) ----------------------
+
+    /** Sibling of the game dir that holds an import in progress. */
+    private static File importStagingDir(File dest) {
+        return new File(dest.getParentFile(), dest.getName() + ".import-tmp");
+    }
+
+    /** Sibling holding the previous install while a promotion runs. */
+    private static File importBackupDir(File dest) {
+        return new File(dest.getParentFile(), dest.getName() + ".old");
+    }
+
+    private static void deleteTree(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) for (File k : kids) deleteTree(k);
+        }
+        f.delete();
+    }
+
     /**
-     * Title-ID gate + write game_root.txt, then straight into the game.
-     * Official-port UX: no "installed" screen, no JUGAR button — the game
-     * starts right away. Called from import threads, so the launch runs on
-     * the UI thread.
+         /**
+     * Promote a complete staged import to the game dir. The old install
+     * (if any) is first renamed aside, then staging takes its place by
+     * rename — both renames are within the same parent, so the swap never
+     * leaves a half-written game dir behind. On failure the old install
+     * is restored when possible. A stale backup from a killed import is
+     * dropped: the new import replaces it anyway.
      */
-    private void finish(File xex) throws Exception {
+    private static void promoteStagedImport(File staging, File dest) throws java.io.IOException {
+        File backup = importBackupDir(dest);
+        deleteTree(backup);
+        boolean hadDest = dest.exists();
+        if (hadDest && !dest.renameTo(backup)) {
+            // A rename can fail on some providers; fall back to deleting
+            // the old tree — the import itself is complete in staging.
+            deleteTree(dest);
+            if (dest.exists()) throw new java.io.IOException("cannot replace old game dir");
+        }
+        if (!staging.renameTo(dest)) {
+            if (hadDest && backup.exists()) backup.renameTo(dest);
+            throw new java.io.IOException("cannot install imported game");
+        }
+        deleteTree(backup);
+    }
+    /** Same file as xex, but under dest after promotion (xex lived in staging). */
+    private static File promotedXex(File staging, File dest, File xex) {
+        String rel = staging.toURI().relativize(xex.toURI()).getPath();
+        return new File(dest, rel);
+    }
+
+    /**
+     * Title-ID gate, factored out of finish() so the imports can run it on
+     * the staged xex BEFORE promoting: a wrong game must never replace a
+     * good install. finish() runs it again on the promoted xex before
+     * writing game_root.txt.
+     */
+    private void checkXexTitle(File xex) throws Exception {
         String got = GameFiles.xexTitleId(xex);
         String want = BuildConfig.TITLE_ID;
         if (want != null && !want.isEmpty() && !want.equals("00000000")) {
@@ -523,6 +635,19 @@ public class SetupActivity extends Activity {
                         other != null ? other : ("Title ID " + got), BuildConfig.GAME_TITLE, want));
             }
         }
+    }
+
+    /**
+     * Title-ID gate + write game_root.txt, then straight into the game.
+     * Official-port UX: no "installed" screen, no JUGAR button — the game
+     * starts right away. Called from import threads, so the launch runs on
+     * the UI thread.
+     */
+    private void finish(File xex) throws Exception {
+        // Title gate runs here too (finish is also the last check before
+        // game_root.txt is written); the imports already ran it on the
+        // staged xex before promoting (A4-R4-02).
+        checkXexTitle(xex);
         File root = xex.getParentFile();
         // (Hunt v1.4.6 ronda 2, A4-R2-02.) Tmp + rename, as GpuDriver.select()
         // does for driver.txt (same reason as launchBundledAsset above: a
