@@ -77,16 +77,16 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
                                const std::string_view file_name, bool restart,
                                size_t* out_bytes_written) {
   std::lock_guard<std::mutex> lock(file_lock_);
-    // (Hunt v1.4.6, A2-R4-02.) assert_not_null is a no-op in Release; a
-    // NULL out_info used to be dereferenced at the end of this function.
-    // The NtQueryDirectoryFile caller guards too, but this is the choke
-    // point -- fail here rather than trusting every caller.
-    if (!out_info) {
-        return X_STATUS_INVALID_PARAMETER;
-    }
-    if (out_bytes_written) {
-        *out_bytes_written = 0;
-    }
+  // (Hunt v1.4.6, A2-R4-02.) assert_not_null is a no-op in Release; a
+  // NULL out_info used to be dereferenced at the end of this function.
+  // The NtQueryDirectoryFile caller guards too, but this is the choke
+  // point -- fail here rather than trusting every caller.
+  if (!out_info) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (out_bytes_written) {
+    *out_bytes_written = 0;
+  }
 
   rex::filesystem::Entry* entry = nullptr;
 
@@ -136,12 +136,12 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
   out_info->file_name_length = static_cast<uint32_t>(entry_name.size());
   std::memcpy(out_info->file_name, entry_name.data(), entry_name.size());
 
-    // (Hunt v1.4.6, A2-R4-17.) One entry was written: fixed header up to
-    // file_name plus the name bytes -- not the caller's whole buffer.
-    if (out_bytes_written) {
-        *out_bytes_written =
-            offsetof(X_FILE_DIRECTORY_INFORMATION, file_name) + entry_name.size();
-    }
+  // (Hunt v1.4.6, A2-R4-17.) One entry was written: fixed header up to
+  // file_name plus the name bytes -- not the caller's whole buffer.
+  if (out_bytes_written) {
+    *out_bytes_written =
+        offsetof(X_FILE_DIRECTORY_INFORMATION, file_name) + entry_name.size();
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -471,10 +471,10 @@ X_STATUS XFile::SetLength(size_t length) {
 // a default-constructed XFile whose Restore failed to re-open the file
 // (see the destructor); a null file has nothing to flush.
 void XFile::Flush() {
-    std::lock_guard<std::mutex> lock(file_lock_);
-    if (file_) {
-        file_->Flush();
-    }
+  std::lock_guard<std::mutex> lock(file_lock_);
+  if (file_) {
+    file_->Flush();
+  }
 }
 
 X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
