@@ -894,7 +894,6 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     XThread::SetLastError(0x271E);
     return -1;
   }
-
   // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
   // Same class as FE-05 (recvfrom/sendto): R3-01 above only covered the
   // NULL case, but the N_XSOCKADDR_IN constructor below reads
@@ -932,7 +931,6 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
     XThread::SetLastError(0x271E);
     return -1;
   }
-
   // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
   // Same class as FE-05 and bind above: only NULL was covered, but the
   // N_XSOCKADDR constructor below copies address_family + sa_data
@@ -981,7 +979,6 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
     XThread::SetLastError(0x271E);
     return -1;
   }
-
   // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
   // Same class as FE-05 (recvfrom): R6-06 above only covered NULL, but
   // the N_XSOCKADDR constructor below reads 16 bytes from `addr_ptr`,
