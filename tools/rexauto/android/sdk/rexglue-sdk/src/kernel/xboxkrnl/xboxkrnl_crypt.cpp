@@ -450,6 +450,15 @@ void XeCryptDes3Cbc_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 in
   if (!state_ptr || !inp || !out || !feed) {
     return;
   }
+  // (Hunt v1.4.6, ronda 4, A3-R4-25.) The loop below processes exactly
+  // 8 bytes per iteration and inp_size / 8 silently drops the tail:
+  // the caller believes inp_size bytes were encrypted, but the last
+  // inp_size % 8 bytes were left as plaintext. DES3-CBC is only
+  // defined on whole blocks; refuse the call (consistent with
+  // XeCryptAesCbc above) instead of silently producing wrong output.
+  if (inp_size % 8 != 0) {
+    return;
+  }
   DES3 des3((ui64*)state_ptr->des_state[0].keytab, (ui64*)state_ptr->des_state[1].keytab,
             (ui64*)state_ptr->des_state[2].keytab);
 
@@ -569,6 +578,14 @@ void XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) feed[j] ^= inp[j] and the
   // memcpy(out, feed, 16) below all dereference these pointers.
   if (!state_ptr || !inp_ptr || !out_ptr || !feed_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 4, A3-R4-10.) Both loops below process exactly
+  // 16 bytes per iteration: a non-multiple inp_size reads/writes past
+  // the end of the buffers on the final partial block. Real AES-CBC
+  // (without padding) is only defined on whole blocks; refuse the call
+  // instead of corrupting memory.
+  if (inp_size % 16 != 0) {
     return;
   }
   const uint8_t* keytab = reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
