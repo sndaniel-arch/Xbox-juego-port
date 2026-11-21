@@ -115,6 +115,14 @@ u32 XAudioUnregisterRenderDriverClient_entry(mapped_void driver_ptr) {
 u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samples_ptr) {
   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
 
+  // (Hunt v1.4.6 ronda 4, A4-R4-08.) A null samples_ptr used to reach
+  // SubmitFrame and memcpy from guest address 0; the sibling entries
+  // already reject null pointers the same way (R6-06). The full range
+  // check lives in SDLAudioDriver::SubmitFrame, at the memcpy site.
+  if (!samples_ptr) {
+    return X_E_INVALIDARG;
+  }
+
   static uint32_t submit_krnl_count = 0;
   if (submit_krnl_count < 10) {
     REXKRNL_DEBUG("XAudioSubmitRenderDriverFrame: driver={:08X} samples={:08X}",
