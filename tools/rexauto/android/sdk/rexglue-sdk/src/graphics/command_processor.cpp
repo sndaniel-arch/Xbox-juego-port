@@ -762,6 +762,23 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  // (Caza v1.4.6, verificación profunda, FE-02.) RingBuffer::set_write_offset
+  // divides by capacity_: a zero count builds a zero-capacity ring, and
+  // the do...while below would still execute one packet even though
+  // read_count() == 0 (with capacity 0 it wraps to a huge value as
+  // read_offset_ grows), decoding guest dwords as packets until the
+  // reads leave the mapping. Twin of the primary buffer guard (ronda 4,
+  // A1-R4-05): refuse the empty indirect buffer instead. list_length
+  // comes guest-controlled from the INDIRECT_BUFFER packet (only masked
+  // to 20 bits), so 0 is a possible value. Placed before the depth
+  // check so the counter is never touched for a no-op call.
+  if (!count) {
+    REXGPU_ERROR(
+          "CommandProcessor::ExecuteIndirectBuffer: indirect buffer has zero length; refusing to "
+          "execute");
+      return;
+  }
+
   // (Caza v1.4.6 ronda 4, A1-R4-03.) Indirect buffers recurse through
   // ExecutePacketType3_INDIRECT_BUFFER -> ExecuteIndirectBuffer, with
   // no depth limit: a cyclic indirect buffer (A -> B -> A, or one
@@ -796,6 +813,16 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+  // (Caza v1.4.6, verificación profunda, FE-02.) Same zero-count guard
+  // as ExecuteIndirectBuffer above: a zero count builds a zero-capacity
+  // ring and the do...while below would still execute one packet
+  // (read_count() wraps with capacity 0). This overload has no callers
+  // in the tree today, but the guard costs nothing and keeps any future
+  // caller from hitting the same runaway loop.
+  if (!count) {
+    return;
+  }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
