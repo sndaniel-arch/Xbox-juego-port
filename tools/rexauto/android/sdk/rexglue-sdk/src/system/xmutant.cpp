@@ -33,8 +33,17 @@ void XMutant::Initialize(bool initial_owner) {
 void XMutant::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
   assert_false(mutant_);
 
-  // Haven't seen this yet, but it's possible.
-  assert_always();
+  // (Hunt v1.4.6, ronda 4, A3-R4-05.) This used to be a no-op (copied
+  // from upstream Xenia): a mutant initialized through the inline path
+  // never got a host primitive, and ReleaseMutant dereferenced the null
+  // mutant_ — a host SIGSEGV — while waits on it silently succeeded
+  // without waiting. Create the primitive like XEvent/XSemaphore do in
+  // their InitializeNative. The header's signal_state is 1 when the
+  // mutant is signaled (not owned) and 0 when it is owned, so an owned
+  // mutant is created owned by the calling thread, matching
+  // Initialize(true).
+  mutant_ = rex::thread::Mutant::Create(header->signal_state ? false : true);
+  assert_not_null(mutant_);
 }
 
 X_STATUS XMutant::ReleaseMutant(uint32_t priority_increment, bool abandon, bool wait) {
@@ -45,6 +54,12 @@ X_STATUS XMutant::ReleaseMutant(uint32_t priority_increment, bool abandon, bool 
 
   // TODO(benvanik): abandoning.
   assert_false(abandon);
+  // (Hunt v1.4.6, ronda 4, A3-R4-05.) Defense in depth: a mutant with
+  // no primitive (e.g. restored or created before this fix) cannot be
+  // owned by anyone, so releasing it is NOT_OWNED, not a null deref.
+  if (!mutant_) {
+    return X_STATUS_MUTANT_NOT_OWNED;
+  }
   if (mutant_->Release()) {
     return X_STATUS_SUCCESS;
   } else {
