@@ -400,6 +400,20 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  // (Caza v1.4.6 ronda 4, A1-R4-05.) size_log2 comes from the guest
+  // (VdInitializeRingBuffer_entry, i32 widened to u32, so a negative
+  // guest value arrives huge). size_log2 + 3 >= 32 is shift UB in C++,
+  // and a bogus size would desync the ring. Real rings are ~2 MiB
+  // (size_log2 18); accept 10..24 (8 KiB..128 MiB) and reject the rest,
+  // keeping the previous valid size. The never-initialized case
+  // (primary_buffer_size_ == 0) is guarded in ExecutePrimaryBuffer.
+  if (size_log2 < 10 || size_log2 > 24) {
+    REXGPU_ERROR(
+          "CommandProcessor::InitializeRingBuffer: invalid size_log2 {} (expected 10..24); "
+          "keeping previous ring buffer size {}",
+          size_log2, primary_buffer_size_);
+    return;
+  }
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
@@ -412,6 +426,18 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
+  // (Caza v1.4.6 ronda 4, A1-R4-05.) block_size_log2 comes from the
+  // guest (VdEnableRingBufferRPtrWriteBack_entry, "6, usually — <=19").
+  // A value >= 32 is shift UB; a negative guest i32 arrives as a huge
+  // u32, so one upper-bound check rejects both. Out of range: keep the
+  // previous update frequency.
+  if (block_size_log2 > 19) {
+    REXGPU_ERROR(
+          "CommandProcessor::EnableReadPointerWriteBack: invalid block_size_log2 {} (expected "
+          "0..19); keeping previous read pointer update frequency {}",
+          block_size_log2, read_ptr_update_freq_);
+    return;
+  }
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
 }
 
@@ -703,6 +729,18 @@ void CommandProcessor::ReturnFromWait() {}
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
 
+  // (Caza v1.4.6 ronda 4, A1-R4-05.) RingBuffer::set_read_offset /
+  // set_write_offset divide by capacity_: a zero capacity (ring never
+  // initialized, or an invalid size rejected by InitializeRingBuffer
+  // with no valid size yet, or a zero size restored from a save) would
+  // SIGFPE on the command processor thread. Refuse to execute instead.
+  if (!primary_buffer_size_) {
+    REXGPU_ERROR(
+        "CommandProcessor::ExecutePrimaryBuffer: primary ring buffer has zero size; refusing to "
+        "execute");
+    return write_index;
+  }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
@@ -723,6 +761,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  // (Caza v1.4.6 ronda 4, A1-R4-03.) Indirect buffers recurse through
+  // ExecutePacketType3_INDIRECT_BUFFER -> ExecuteIndirectBuffer, with
+  // no depth limit: a cyclic indirect buffer (A -> B -> A, or one
+  // pointing at itself) recursed until the 128 KiB command processor
+  // thread stack overflowed. Real games nest at most 1-2 deep, so cap
+  // the nesting at 8 and fail the packet instead of recursing further.
+  // The counter is a plain member: indirect-buffer execution is
+  // synchronous on the single command processor worker thread.
+  static constexpr uint32_t kMaxIndirectBufferDepth = 8;
+  if (indirect_buffer_depth_ >= kMaxIndirectBufferDepth) {
+    REXGPU_ERROR(
+        "**** INDIRECT RINGBUFFER: indirect buffer nesting depth {} reached; refusing to "
+        "recurse (cyclic indirect buffer?)",
+        kMaxIndirectBufferDepth);
+    return;
+  }
+  ++indirect_buffer_depth_;
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -1669,9 +1725,41 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   uint32_t start_size = dword1;
   uint32_t start = start_size >> 16;
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
-  assert_true(start == 0);
-  assert_true(reader->read_count() >= size_dwords * 4);
-  assert_true(count - 2 >= size_dwords);
+  // (Caza v1.4.6 ronda 4, A1-R4-02.) The three bounds below used to be
+  // assert_true only, which is a no-op in Release (NDEBUG): a malformed
+  // packet with size_dwords larger than the packet would make LoadShader
+  // hash and copy up to 256 KiB linearly from read_ptr() — past the end
+  // of the packet, across the ring wrap, and possibly past the ring
+  // allocation (host SIGSEGV) — and AdvanceRead would then skip over
+  // the next packet, desyncing the ring. Validate for real and fail
+  // the packet. ExecutePacketType3 already checked read_count() >=
+  // count * 4 on entry, and the two dwords above were consumed, so the
+  // shader bytes must fit in the remaining count - 2 dwords of this
+  // packet (count < 2 underflows the subtraction, hence the explicit
+  // check) and in the bytes left in the ring.
+  if (start != 0) {
+    REXGPU_ERROR(
+        "ExecutePacketType3_IM_LOAD_IMMEDIATE: unsupported non-zero start {} (packet count {})",
+        start, count);
+    return false;
+  }
+  // count < 2 would underflow the subtraction, so compute the payload
+  // with the guard instead of inlining count - 2.
+  const uint32_t payload_dwords = count >= 2 ? count - 2 : 0;
+  if (size_dwords > payload_dwords) {
+    REXGPU_ERROR(
+        "ExecutePacketType3_IM_LOAD_IMMEDIATE: shader size {} dwords exceeds packet payload {} "
+        "dwords (packet count {})",
+        size_dwords, payload_dwords, count);
+    return false;
+  }
+  if (reader->read_count() < size_dwords * sizeof(uint32_t)) {
+    REXGPU_ERROR(
+        "ExecutePacketType3_IM_LOAD_IMMEDIATE: shader size {} dwords exceeds {} bytes left in "
+        "ring",
+        size_dwords, reader->read_count());
+    return false;
+  }
   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
   switch (shader_type) {
