@@ -80,10 +80,19 @@ XObject::Type XObject::type() const {
 }
 
 void XObject::RetainHandle() {
+  // (Hunt v1.4.6, ronda 4, A3-R4-24.) No handle yet (Restore path):
+  // nothing to retain.
+  if (handles_.empty()) {
+    return;
+  }
   kernel_state_->object_table()->RetainHandle(handles_[0]);
 }
 
 bool XObject::ReleaseHandle() {
+  // (Hunt v1.4.6, ronda 4, A3-R4-24.) See RetainHandle above.
+  if (handles_.empty()) {
+    return false;
+  }
   // FIXME: Return true when handle is actually released.
   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
 }
@@ -106,6 +115,11 @@ X_STATUS XObject::Delete() {
     if (!name_.empty()) {
       kernel_state_->object_table()->RemoveNameMapping(name_);
     }
+    // (Hunt v1.4.6, ronda 4, A3-R4-24.) No handle yet (Restore path):
+    // nothing to remove.
+    if (handles_.empty()) {
+      return X_STATUS_INVALID_HANDLE;
+    }
     return kernel_state_->object_table()->RemoveHandle(handles_[0]);
   }
 }
@@ -115,7 +129,11 @@ bool XObject::SaveObject(stream::ByteStream* stream) {
   stream->Write<uint32_t>(guest_object_ptr_);
 
   stream->Write(uint32_t(handles_.size()));
-  stream->Write(&handles_[0], handles_.size() * sizeof(X_HANDLE));
+  // (Hunt v1.4.6, ronda 4, A3-R4-24.) &handles_[0] on an empty vector
+  // is out-of-bounds; with zero handles there are zero bytes to write.
+  if (!handles_.empty()) {
+    stream->Write(&handles_[0], handles_.size() * sizeof(X_HANDLE));
+  }
 
   return true;
 }
@@ -125,7 +143,11 @@ bool XObject::RestoreObject(stream::ByteStream* stream) {
   guest_object_ptr_ = stream->Read<uint32_t>();
 
   handles_.resize(stream->Read<uint32_t>());
-  stream->Read(&handles_[0], handles_.size() * sizeof(X_HANDLE));
+  // (Hunt v1.4.6, ronda 4, A3-R4-24.) Same guard as SaveObject, on the
+  // read side: zero handles means zero bytes to read.
+  if (!handles_.empty()) {
+    stream->Read(&handles_[0], handles_.size() * sizeof(X_HANDLE));
+  }
 
   // Restore our pointer to our handles in the object table.
   for (size_t i = 0; i < handles_.size(); i++) {
@@ -189,9 +211,22 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
 uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.
-    // TODO(benvanik): convert time to relative time.
-    assert_always();
-    return 0;
+    // (Hunt v1.4.6, ronda 4, A3-R4-23.) The old code returned 0 here —
+    // an immediate timeout — for any absolute deadline. Convert to a
+    // relative wait against the guest clock, the same base KeQuerySystemTime
+    // reports (Clock::QueryGuestSystemTime, FILETIME). A deadline already
+    // in the past is genuinely 0 ms; anything further out is clamped to
+    // the uint32_t range instead of wrapping.
+    uint64_t now = chrono::Clock::QueryGuestSystemTime();
+    uint64_t deadline = static_cast<uint64_t>(timeout_ticks);
+    if (deadline <= now) {
+      return 0;
+    }
+    uint64_t remaining_ms = (deadline - now) / 10000;  // Ticks -> MS
+    if (remaining_ms > UINT32_MAX) {
+      return UINT32_MAX;
+    }
+    return static_cast<uint32_t>(remaining_ms);
   } else if (timeout_ticks < 0) {
     // Relative time.
     return (uint32_t)(-timeout_ticks / 10000);  // Ticks -> MS
