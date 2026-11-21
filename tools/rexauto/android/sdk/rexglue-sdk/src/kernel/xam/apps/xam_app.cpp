@@ -79,7 +79,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // (Hunt v1.4.6, ronda 4, A3-R4-07.) The message struct itself is
       // read from the guest buffer before anything else: validate its
       // 32 bytes first. The old code then read extra->handle BEFORE the
-      // (dead)!extra check — TranslateVirtual never returns null — and
+      // (dead) !extra check — TranslateVirtual never returns null — and
       // memsets buffer_size bytes from an unvalidated pointer. Validate
       // the extra struct and the destination range before touching
       // either, and pass buffer_size to WriteItems so the enumerator
