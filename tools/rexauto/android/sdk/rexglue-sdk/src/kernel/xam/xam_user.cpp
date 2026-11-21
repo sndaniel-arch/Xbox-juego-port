@@ -36,6 +36,55 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// (Hunt v1.4.6, ronda 4, A3-R4-01.) TranslateVirtual never validates and
+// never returns null, so a guest pointer + length that runs past the end
+// of the mapping SIGSEGVs the host on the memcpy/memset. Mirror the
+// XFile::ReadInternal/Write validation (A2-R3-01): reject a range that
+// wraps past 4 GiB, starts or ends outside any heap, or spans heaps of
+// different kinds (or two physical heaps). When the range lies inside a
+// single heap, additionally require the pages to be accessible — the
+// MmIsAddressValid precedent (xboxkrnl_memory.cpp) — readable for a
+// source, read/write for a destination (and always read/write for a
+// physical heap, as XFile does). A range spanning two virtual heaps can
+// only be checked at heap granularity; that is the same limit XFile has.
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
               type_mask == 7);
@@ -112,6 +161,13 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_NO_SUCH_USER;
   }
 
+    // (Hunt v1.4.6, ronda 4, A3-R4-14.) Same guard as the sister
+  // XamUserGetGamerTag below: a NULL buffer used to write the name to
+  // guest address 0.
+  if (!buffer) {
+    return X_E_INVALIDARG;
+  }
+  
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -197,7 +253,19 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     switch (static_cast<UserProfile::Setting::Type>(setting_key.type)) {
       case UserProfile::Setting::Type::WSTRING:
       case UserProfile::Setting::Type::BINARY:
-        needed_data_size += setting_key.size;
+        // (Hunt v1.4.6, ronda 4, A3-R4-02.) Count the STORED value, not
+        // the 12-bit `size` field of the requested key: Append writes
+        // the stored value in full, so counting only the key size made
+        // the first (size-query) call report a buffer too small for the
+        // second (fill) call, which then wrote past it. Unknown
+        // settings keep the old key-size count (Append writes nothing
+        // for them).
+        if (auto* stored_setting =
+                REX_KERNEL_STATE()->user_profile()->GetSetting(static_cast<uint32_t>(setting_ids[i]))) {
+          needed_data_size += static_cast<uint32_t>(stored_setting->DataSize());
+        } else {
+          needed_data_size += setting_key.size;
+        }          
         break;
       default:
         break;
@@ -346,8 +414,34 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     switch (setting_type) {
       case UserProfile::Setting::Type::CONTENT:
       case UserProfile::Setting::Type::BINARY: {
-        uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
+        // (Hunt v1.4.6, ronda 4, A3-R4-01.) binary.size is guest
+        // controlled (u32, up to 4 GiB): the old code resized a vector
+        // to it and memcpy'd from an unvalidated guest pointer — a
+        // SIGSEGV past the end of the mapping, or bad_alloc/terminate
+        // on the resize. The setting-id `size` field is 12 bits, so no
+        // legitimate binary setting is larger than 4095 bytes; reject
+        // anything bigger, and validate the source range before the
+        // copy. The ptr == 0 branch only zero-fills, so it needs the
+        // cap but no range check. A bad setting is skipped (logged)
+        // rather than failing the whole save.        
         size_t binary_size = setting.data.binary.size;
+                if (binary_size > 4095) {
+          REXKRNL_ERROR(
+              "XamUserWriteProfileSettings: binary setting {:08X} size {} exceeds the "
+              "12-bit setting size field (4095); skipping",
+              (uint32_t)setting.setting_id, binary_size);
+          break;
+                }
+        uint32_t binary_ptr_guest = static_cast<uint32_t>(setting.data.binary.ptr);
+        if (setting.data.binary.ptr &&
+            !GuestRangeReadable(binary_ptr_guest, binary_size)) {
+          REXKRNL_ERROR(
+              "XamUserWriteProfileSettings: binary setting {:08X} source range {:08X}+{} "
+              "is outside readable guest memory; skipping",
+              (uint32_t)setting.setting_id, binary_ptr_guest, binary_size);
+          break;
+        }
+        uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(binary_ptr_guest);
         std::vector<uint8_t> bytes;
         if (setting.data.binary.ptr) {
           // Copy provided data
@@ -566,12 +660,36 @@ class XStaticAchievementEnumerator : public XEnumerator {
 
   void AppendItem(AchievementDetails item) { items_.push_back(std::move(item)); }
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
-    size_t count = std::min(items_.size() - current_item_, items_per_enumerate());
+  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count,
+                      size_t buffer_size) override {
+        // (Hunt v1.4.6, ronda 4, A3-R4-03.) Truncate the item count to what
+    // fits in the buffer the game actually passed. The layout is kept
+    // exactly as before — the details array holds items_per_enumerate()
+    // entries and the string area starts after it — so a count that fits
+    // writes byte-identical output; only an over-large count is cut.
+    // With strings, one item costs sizeof(details) in the details array
+    // plus kStringBufferSize in the string area; without them, only the
+    // details array matters.
+    size_t remaining = items_.size() - current_item_;
+    size_t count = std::min(remaining, items_per_enumerate());
     if (!count) {
       return X_ERROR_NO_MORE_FILES;
     }
-
+    if (flags_ & 7) {
+      size_t details_size = items_per_enumerate() * sizeof(X_ACHIEVEMENT_DETAILS);
+      if (buffer_size < details_size) {
+        return X_ERROR_INSUFFICIENT_BUFFER;
+      }
+      size_t string_capacity =
+          (buffer_size - details_size) / X_ACHIEVEMENT_DETAILS::kStringBufferSize;
+      count = std::min(count, string_capacity);
+    } else {
+      count = std::min(count, buffer_size / sizeof(X_ACHIEVEMENT_DETAILS));
+    }
+    if (!count) {
+      return X_ERROR_INSUFFICIENT_BUFFER;
+    }
+    
     size_t size = count * item_size();
 
     auto details = reinterpret_cast<X_ACHIEVEMENT_DETAILS*>(buffer_data);
@@ -733,7 +851,17 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
     return X_ERROR_INVALID_PARAMETER;
   }
 
+    // (Hunt v1.4.6, ronda 4, A3-R4-08.) stride * height are both guest
+  // controlled: the old code memsets that many bytes from an unchecked
+  // guest pointer, past the end of the mapping. Validate the whole
+  // destination range before touching it.
+  if (!buffer_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   size_t size = size_t(stride) * size_t(height);
+  if (!GuestRangeWritable(buffer_ptr.guest_address(), size)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   std::memset(buffer_ptr, 0xFF, size);
 
   if (overlapped_ptr) {
