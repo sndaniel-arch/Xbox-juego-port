@@ -53,17 +53,17 @@ static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
   uint32_t guest_high_address = guest_address + length - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
   const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
-  if (!start_heap ||!end_heap ||
-          (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical)!=
-              (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
-          (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical &&
-           start_heap!= end_heap)) {
+  if (!start_heap || !end_heap ||
+      (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) !=
+          (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
+      (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical &&
+       start_heap != end_heap)) {
     return false;
   }
   if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
     auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
-    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address)!=
-              rex::memory::PageAccess::kReadWrite) {
+    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address) !=
+        rex::memory::PageAccess::kReadWrite) {
       return false;
     }
   }
