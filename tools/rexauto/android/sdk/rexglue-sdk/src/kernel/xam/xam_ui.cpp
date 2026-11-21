@@ -376,7 +376,7 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   // 1-3 buttons (the modern equivalent takes at most three); cap at 16
   // -- 5x that -- so the loop is bounded, and validate the whole
   // button_ptrs array (button_count * 4 bytes) before the first read:
-  // an array crossing the end of the mapping SIGSEGVs the host, and a
+  // an array crossing the end of the mapping SIGSEGVd the host, and a
   // huge count with a valid array would grow the host button vector
   // without bound. The cap is checked first so the validated length
   // can never overflow. (Each button *string* is still read
