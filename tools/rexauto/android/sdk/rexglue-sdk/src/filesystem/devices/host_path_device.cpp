@@ -39,10 +39,10 @@ bool HostPathDevice::Initialize() {
       std::error_code ec;
       // Create the path.
       // (Hunt v1.4.6, A2-R4-15.) The old code ignored the result: a
-// failed create still built a root entry over a nonexistent path
-// and returned true, mounting an empty device. Fail instead. A
-// clean error_code with no directory created (a file in the way)
-// is caught by the exists() re-check below.
+      // failed create still built a root entry over a nonexistent path
+      // and returned true, mounting an empty device. Fail instead. A
+      // clean error_code with no directory created (a file in the way)
+      // is caught by the exists() re-check below.
       std::filesystem::create_directories(host_path_, ec);
       if (ec || !std::filesystem::exists(host_path_, ec)) {
         REXFS_ERROR("Host path could not be created");
