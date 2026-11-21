@@ -37,6 +37,49 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 
+// (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-14.)
+// TranslateVirtual never validates and never returns null, so a guest
+// pointer + length that runs past the end of the mapping SIGSEGVs the
+// host on the read. Same heap validation as A2-R3-01 (see xam_user.cpp
+// for the full comment), copied here because XamShowMessageBoxUI reads
+// a guest button-pointer array: reject a range that wraps past 4 GiB,
+// starts or ends outside any heap, or spans heaps of different kinds
+// (or two physical heaps); inside a single heap, require the pages to
+// be accessible (readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
 // TODO(gibbed): This is all one giant WIP that seems to work better than the
 // previous immediate synchronous completion of dialogs.
 //
@@ -326,6 +369,24 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-14.)
+  // Same shape as FE-08 (WriteProfileSettings): `button_count` is
+  // guest-controlled (u32) with no upper bound, and the loop below
+  // reads button_ptrs[i] for i < button_count. A real message box has
+  // 1-3 buttons (the modern equivalent takes at most three); cap at 16
+  // -- 5x that -- so the loop is bounded, and validate the whole
+  // button_ptrs array (button_count * 4 bytes) before the first read:
+  // an array crossing the end of the mapping SIGSEGVs the host, and a
+  // huge count with a valid array would grow the host button vector
+  // without bound. The cap is checked first so the validated length
+  // can never overflow. (Each button *string* is still read
+  // NUL-terminated like title_ptr/text_ptr above; that is the systemic
+  // string-read class, not this array/count fix.)
+  constexpr uint32_t kMaxMessageBoxButtons = 16;
+  if (button_count > kMaxMessageBoxButtons) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   REXKRNL_DEBUG(
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
@@ -349,6 +410,15 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   // and text_ptr all have one): button_count > 0 with a NULL array
   // SIGSEGVd the host on the first iteration.
   if (button_count && !button_ptrs) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-14.)
+  // NULL is covered above; validate the array range itself before the
+  // loop reads button_ptrs[i]. button_count <= 16 here (cap above),
+  // so the validated length is at most 64 bytes.
+  if (button_count &&
+      !GuestRangeReadable(button_ptrs.guest_address(),
+                          static_cast<size_t>(button_count) * sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
   for (uint32_t i = 0; i < button_count; ++i) {
