@@ -405,6 +405,32 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     XThread::SetLastError(0x271E);
     return -1;
   }
+  // (Hunt v1.4.6, verificación profunda, FE-04.) `num_buffers` is
+  // guest-controlled (u32) and both loops below index `buffers[i]`
+  // directly, but nothing validated the XWSABUF array itself: an array
+  // crossing the end of the mapping SIGSEGVd the host on the first read,
+  // before the 16 MiB cap below could abort (that cap bounds total
+  // bytes, not the array position), and with len == 0 in every entry the
+  // cap never trips, so the loops could spin up to 2^32 iterations.
+  // Validate the whole array first, and cap the entry count: the host
+  // combines the buffers into a single vector and the normal game
+  // pattern is 1-2 entries (VDP: buffer 0 = length, buffer 1 = data),
+  // so 1024 entries -- 512x that, 8 KiB of array -- bounds the loop
+  // without touching legitimate use. The cap is checked first so the
+  // validated length below can never overflow.
+  constexpr uint32_t kMaxSendToBuffers = 1024;
+  if (num_buffers > kMaxSendToBuffers) {
+    // WSAEMSGSIZE, same as the 16 MiB total cap below.
+    XThread::SetLastError(0x2738);
+    return -1;
+  }
+  if (num_buffers &&
+      !GuestRangeReadable(buffers.guest_address(),
+                          static_cast<size_t>(num_buffers) * sizeof(XWSABUF))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
   uint64_t combined_buffer_size = 0;
   for (uint32_t i = 0; i < num_buffers; i++) {
     combined_buffer_size += buffers[i].len;
@@ -438,6 +464,28 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     combined_buffer_offset += buffers[i].len;
   }
 
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-09.)
+  // Same class as FE-05 (sendto/recvfrom): `to_ptr` is read below
+  // (N_XSOCKADDR_IN copies sin_family/sin_port/sin_addr, 16 bytes) and
+  // `num_bytes_sent` is written back after SendTo, but neither range was
+  // validated -- only the NULL case was covered (A3-R3-01 for `to_ptr`,
+  // A3-R3-16 for the out-param write). A non-NULL pointer outside the
+  // mapping SIGSEGVs the host on the read or the write-back. Validate
+  // both up front, before SendTo runs, so a bad out-param fails before
+  // the packet is sent. NULL stays legitimate for `to_ptr` (connected
+  // socket) and for `num_bytes_sent` (caller does not want the count).
+  if (to_ptr && !GuestRangeReadable(to_ptr.guest_address(), sizeof(XSOCKADDR_IN))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+  if (num_bytes_sent &&
+      !GuestRangeWritable(num_bytes_sent.guest_address(), sizeof(uint32_t))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   // (Hunt v1.4.6, ronda 3, A3-R3-01.) A NULL destination is legitimate
   // Winsock use (send on the connected socket); the old unconditional
   // N_XSOCKADDR_IN constructor dereferenced it and SIGSEGVd the host.
@@ -465,6 +513,20 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
                                           u32 timeout, u32 alertable) {
   if (num_events > 64) {
     XThread::SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return ~0u;
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-12.)
+  // Same shape as FE-04 (WSASendTo): the count is capped at 64 above,
+  // but the events array itself (num_events * 4 bytes) was never
+  // range-validated -- xeNtWaitForMultipleObjectsEx reads handles[n]
+  // for n < count. An array crossing the end of the mapping SIGSEGVs
+  // the host on that read. The cap above bounds the validated length
+  // to 256 bytes, so it cannot overflow.
+  if (num_events &&
+      !GuestRangeReadable(events.guest_address(),
+                          static_cast<size_t>(num_events) * sizeof(uint32_t))) {
+    XThread::SetLastError(0x271E);  // WSAEFAULT
     return ~0u;
   }
 
@@ -833,6 +895,17 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     return -1;
   }
 
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
+  // Same class as FE-05 (recvfrom/sendto): R3-01 above only covered the
+  // NULL case, but the N_XSOCKADDR_IN constructor below reads
+  // sin_family/sin_port/sin_addr (16 bytes) from the guest struct. A
+  // non-NULL name outside the mapping SIGSEGVs the host on that read.
+  if (!GuestRangeReadable(name.guest_address(), sizeof(XSOCKADDR_IN))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   N_XSOCKADDR_IN native_name(name);
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
@@ -855,6 +928,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   // N_XSOCKADDR constructor dereferences a NULL name. connect with no
   // address is invalid input -- WSAEFAULT.
   if (!name) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
+  // Same class as FE-05 and bind above: only NULL was covered, but the
+  // N_XSOCKADDR constructor below copies address_family + sa_data
+  // (16 bytes) from the guest struct. A non-NULL name outside the
+  // mapping SIGSEGVs the host on that read.
+  if (!GuestRangeReadable(name.guest_address(), sizeof(XSOCKADDR))) {
     // WSAEFAULT
     XThread::SetLastError(0x271E);
     return -1;
@@ -893,6 +977,24 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
   // written back, but only addr_ptr was checked; a NULL addrlen_ptr
   // used to read/write guest address 0.
   if (!addr_ptr || !addrlen_ptr) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-10.)
+  // Same class as FE-05 (recvfrom): R6-06 above only covered NULL, but
+  // the N_XSOCKADDR constructor below reads 16 bytes from `addr_ptr`,
+  // *addrlen_ptr is read for native_len, and on success both are
+  // written back (address_family/sa_data + the length). A non-NULL
+  // pointer outside the mapping SIGSEGVs the host on the first read.
+  if (!GuestRangeReadable(addr_ptr.guest_address(), sizeof(XSOCKADDR)) ||
+      !GuestRangeWritable(addr_ptr.guest_address(), sizeof(XSOCKADDR))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+  if (!GuestRangeWritable(addrlen_ptr.guest_address(), sizeof(uint32_t))) {
     // WSAEFAULT
     XThread::SetLastError(0x271E);
     return -1;
@@ -1001,6 +1103,28 @@ struct host_set {
 i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                         ppc_ptr_t<x_fd_set> writefds, ppc_ptr_t<x_fd_set> exceptfds,
                         mapped_void timeout_ptr) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-11.)
+  // Same shape as FE-04 (WSASendTo): R2-01 capped fd_count at 64 inside
+  // host_set::Load, but the x_fd_set structs themselves (fd_count +
+  // 64 entries, 260 bytes) were never range-validated -- Load reads
+  // fd_count/fd_array and Store/UpdateFrom write them back -- and the
+  // timeout is read as 2 x int32 below. A struct pointer near the end
+  // of the mapping SIGSEGVs the host on the first read. Validate each
+  // non-NULL set readable AND writable (they are read and written back)
+  // and the timeout readable before any Load runs. NULL stays legitimate
+  // (no set / no timeout) and is still covered by the `if` checks below.
+  auto fd_set_range_ok = [](ppc_ptr_t<x_fd_set> set) {
+    return !set || (GuestRangeReadable(set.guest_address(), sizeof(x_fd_set)) &&
+                    GuestRangeWritable(set.guest_address(), sizeof(x_fd_set)));
+  };
+  if (!fd_set_range_ok(readfds) || !fd_set_range_ok(writefds) ||
+      !fd_set_range_ok(exceptfds)) {
+    return -1;
+  }
+  if (timeout_ptr &&
+      !GuestRangeReadable(timeout_ptr.guest_address(), 2 * sizeof(int32_t))) {
+    return -1;
+  }
   host_set host_readfds = {};
   fd_set native_readfds = {};
   if (readfds) {
@@ -1083,6 +1207,28 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     return -1;
   }
 
+  // (Hunt v1.4.6, verificación profunda, FE-05.) `buf` is validated
+  // below, but the address out-params were read/written unvalidated:
+  // `from_ptr` is read here and written back after RecvFrom
+  // (sin_family/sin_port/sin_addr + x_sin_zero), and `fromlen_ptr` is
+  // read and written back too. A non-NULL pointer outside the mapping
+  // SIGSEGVs the host either way. Validate both before their first use;
+  // NULL stays legitimate (no address wanted) and is still covered by
+  // the `if` checks below.
+  if (from_ptr &&
+      (!GuestRangeReadable(from_ptr.guest_address(), sizeof(XSOCKADDR_IN)) ||
+       !GuestRangeWritable(from_ptr.guest_address(), sizeof(XSOCKADDR_IN)))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+  if (fromlen_ptr &&
+      !GuestRangeWritable(fromlen_ptr.guest_address(), sizeof(uint32_t))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
   N_XSOCKADDR_IN native_from;
   if (from_ptr) {
     native_from = *from_ptr;
@@ -1149,6 +1295,16 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
     return -1;
   }
 
+  // (Hunt v1.4.6, verificación profunda, FE-05.) Same class as recvfrom
+  // above: `to_ptr` was dereferenced without a range check (only the
+  // NULL case was covered by A3-R3-01). A non-NULL pointer outside the
+  // mapping SIGSEGVs the host on the read below. NULL stays legitimate
+  // (send on the connected socket).
+  if (to_ptr && !GuestRangeReadable(to_ptr.guest_address(), sizeof(XSOCKADDR_IN))) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
   // (Hunt v1.4.6, ronda 3, A3-R3-01.) A NULL destination is legitimate
   // Winsock use (send on the connected socket); XSocket::SendTo
   // already takes a null `to` -- pass it through instead of crashing
@@ -1170,6 +1326,13 @@ u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
   // (Hunt v1.4.6, ronda 3, A3-R3-04.) A NULL fd_set used to be
   // dereferenced for fd_count below. Not a member -> not in the set.
   if (!fd_set) {
+    return 0;
+  }
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-11.)
+  // Same as select above: only NULL was covered, but fd_count and up to
+  // 64 fd_array entries (260 bytes) are read below. A non-NULL fd_set
+  // outside the mapping SIGSEGVs the host on the first read.
+  if (!GuestRangeReadable(fd_set.guest_address(), sizeof(x_fd_set))) {
     return 0;
   }
   const uint8_t max_fd_count = std::min((uint32_t)fd_set->fd_count, uint32_t(64));
