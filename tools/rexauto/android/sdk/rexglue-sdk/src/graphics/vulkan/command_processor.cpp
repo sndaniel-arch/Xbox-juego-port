@@ -3352,7 +3352,7 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
   size_t binding_count = texture_count + sampler_count;
   if (!binding_count) {
     return descriptor_set_layout_empty_;
-  } 
+  }
 
   TextureDescriptorSetLayoutKey texture_descriptor_set_layout_key;
   texture_descriptor_set_layout_key.texture_count = uint32_t(texture_count);
