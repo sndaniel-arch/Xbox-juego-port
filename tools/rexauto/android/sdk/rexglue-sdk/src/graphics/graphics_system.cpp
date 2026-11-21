@@ -130,16 +130,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // provider just for the command processor.
   if (!provider_) {
     CreateProvider(false);
-      // (Caza v1.4.6 ronda 4, A1-R4-04.) Same guard as SetupPresentation
-      // above: VulkanProvider::Create returns nullptr when there is no
-      // Vulkan instance / physical device / compatible device, and the
-      // command processor worker would otherwise dereference the null
-      // provider in SetupContext (GetVulkanDevice) instead of failing
-      // cleanly here with X_STATUS_UNSUCCESSFUL.
-      if (!provider_) {
-          REXGPU_ERROR("Unable to create graphics provider");
-          return X_STATUS_UNSUCCESSFUL;
-      }
+    // (Caza v1.4.6 ronda 4, A1-R4-04.) Same guard as SetupPresentation
+    // above: VulkanProvider::Create returns nullptr when there is no
+    // Vulkan instance / physical device / compatible device, and the
+    // command processor worker would otherwise dereference the null
+    // provider in SetupContext (GetVulkanDevice) instead of failing
+    // cleanly here with X_STATUS_UNSUCCESSFUL.
+    if (!provider_) {
+      REXGPU_ERROR("Unable to create graphics provider");
+      return X_STATUS_UNSUCCESSFUL;
+    }
     provider_supports_presentation_ = false;
   }
 
@@ -515,29 +515,29 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
       // race condition.
       command_processor_->InitializeShaderStorage(cache_root, title_id, true);
     } else {
-        // (Caza v1.4.6 ronda 4, A4-R4-10, aplicado por A1 por colisión de
-        // archivo — el agente A4 no toca este archivo.) The old
-        // fence.Wait() had no bound: if the command processor worker never
-        // drains the queued init (stuck in a long draw batch / shader
-        // compile), the calling thread hung in startup forever. Wait at
-        // most 1000 ms, like the three bounded waits of A4-R3-02. On
-        // timeout the shader-storage init still runs on the worker when it
-        // drains — blocking degrades to asynchronous, which is safe (the
-        // preload only seeds caches; later pipeline creation just runs
-        // without the preloaded entries) — and the caller returns instead
-        // of hanging. The fence is heap-owned (shared_ptr) on purpose: a
-        // stack fence captured by reference would be destroyed on the
-        // timeout return while the queued lambda may still signal it.
-        auto fence = std::make_shared<rex::thread::Fence>();
-        command_processor_->CallInThread([this, cache_root, title_id, fence]() {
-            command_processor_->InitializeShaderStorage(cache_root, title_id, true);
-            fence->Signal();
-        });
-        if (!fence->WaitFor(std::chrono::milliseconds(1000))) {
-            REXGPU_WARN(
+      // (Caza v1.4.6 ronda 4, A4-R4-10, aplicado por A1 por colisión de
+      // archivo — el agente A4 no toca este archivo.) The old
+      // fence.Wait() had no bound: if the command processor worker never
+      // drains the queued init (stuck in a long draw batch / shader
+      // compile), the calling thread hung in startup forever. Wait at
+      // most 1000 ms, like the three bounded waits of A4-R3-02. On
+      // timeout the shader-storage init still runs on the worker when it
+      // drains — blocking degrades to asynchronous, which is safe (the
+      // preload only seeds caches; later pipeline creation just runs
+      // without the preloaded entries) — and the caller returns instead
+      // of hanging. The fence is heap-owned (shared_ptr) on purpose: a
+      // stack fence captured by reference would be destroyed on the
+      // timeout return while the queued lambda may still signal it.
+      auto fence = std::make_shared<rex::thread::Fence>();
+      command_processor_->CallInThread([this, cache_root, title_id, fence]() {
+        command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+        fence->Signal();
+      });
+      if (!fence->WaitFor(std::chrono::milliseconds(1000))) {
+        REXGPU_WARN(
             "GraphicsSystem::InitializeShaderStorage: command processor did not run the shader "
             "storage init within 1000 ms; continuing without waiting for it");
-        }
+      }
     }
   } else {
     command_processor_->CallInThread([this, cache_root, title_id]() {
