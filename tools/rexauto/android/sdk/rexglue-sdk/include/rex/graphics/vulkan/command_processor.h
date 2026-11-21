@@ -157,7 +157,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
-    // (Hunt v1.4.6, verificación profunda, FE-06b.) Probe for the FE-06
+  // (Hunt v1.4.6, verificación profunda, FE-06b.) Probe for the FE-06
   // deferred render pass destruction: true only when no pipeline creation
   // can still hold a render pass (see VulkanPipelineCache::
   // IsCreatingPipelines -- startup loading, queued creation arguments, or
@@ -172,7 +172,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // friend nor a subclass, so a probe placed next to it would not be
   // callable from the render target cache at all.
   bool IsPipelineCreationIdle() const {
-       return !pipeline_cache_ || !pipeline_cache_->IsCreatingPipelines();
+    return !pipeline_cache_ || !pipeline_cache_->IsCreatingPipelines();
   }
 
   // Sparse binds are:
