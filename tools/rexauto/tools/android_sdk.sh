@@ -4,20 +4,64 @@
 # from hells-gate-recomp-android (deivid22srk), stage SDL3's Java glue.
 #
 #   tools/android_sdk.sh [dest=android/sdk/rexglue-sdk]
+#
+# (A5-R4-03, ronda 4.) SDK_TAG is a MUTABLE tag: pin the exact commit
+# below (SDK_COMMIT, resolved with `git ls-remote` 2026-11-20) and assert
+# after the clone that HEAD equals it, so a moved/deleted tag can never
+# change the build silently. The workflow SDK-cache key hashes this file,
+# so changing the pin invalidates the cache automatically.
+# (A5-R4-04, ronda 4.) Known, accepted skew: the desktop codegen runs the
+# 0.10.1 repack bundle while this runtime builds from 0.10.0 + patches.
+# Do NOT bump SDK_TAG to 0.10.1: the patches were written against 0.10.0.
+# A workflow gate fails the run if major.minor ever diverge.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK_DIR="${1:-$ROOT/android/sdk/rexglue-sdk}"
 SDK_REPO="https://github.com/rexglue/rexglue-sdk.git"
 SDK_TAG="v0.10.0"
+SDK_COMMIT="f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
 PATCHES="$ROOT/android/patches"
+
+# (A5-R4-03.) Retry helper for network commands: transient failures used
+# to kill the run with no retry, unlike the apt/sdkmanager steps in the
+# workflow, which all retry 3x. Returns 1 after $1 attempts (set -e kills
+# the script at the call site); the guarded `if` keeps set -e from firing
+# inside the helper itself.
+retry() { # retry <attempts> <delay-seconds> <command...>
+  local _attempts="$1" _delay="$2" _i=1
+  shift 2
+  while true; do
+    if "$@"; then return 0; fi
+    if [ "$_i" -ge "$_attempts" ]; then
+      echo "[android_sdk] ERROR: command failed after $_attempts attempts: $*" >&2
+      return 1
+    fi
+    echo "[android_sdk] WARNING: attempt $_i failed, retrying in ${_delay}s: $*"
+    _i=$((_i + 1))
+    sleep "$_delay"
+  done
+}
 
 if [ -f "$SDK_DIR/.patches-applied" ]; then
   echo "[android_sdk] SDK already set up at $SDK_DIR"
 else
   rm -rf "$SDK_DIR"; mkdir -p "$(dirname "$SDK_DIR")"
-  echo "[android_sdk] cloning $SDK_REPO@$SDK_TAG"
-  git clone --depth 1 --branch "$SDK_TAG" "$SDK_REPO" "$SDK_DIR"
-  git -C "$SDK_DIR" submodule update --init --depth 1
+  echo "[android_sdk] cloning $SDK_REPO@$SDK_TAG ($SDK_COMMIT)"
+  # (A5-R4-03.) The clone is retried (a partial clone is wiped before
+  # each attempt: git refuses to clone into a non-empty directory).
+  _cloned=0
+  for _attempt in 1 2 3; do
+    rm -rf "$SDK_DIR"
+    if git clone --depth 1 --branch "$SDK_TAG" "$SDK_REPO" "$SDK_DIR"; then _cloned=1; break; fi
+    echo "[android_sdk] WARNING: clone attempt $_attempt failed, retrying in 30s..."
+    if [ "$_attempt" -lt 3 ]; then sleep 30; fi
+  done
+  [ "$_cloned" = "1" ] || { echo "[android_sdk] ERROR: git clone failed after 3 attempts"; exit 1; }
+  # (A5-R4-03.) Pin check: the tag must still point at SDK_COMMIT.
+  _sdk_head="$(git -C "$SDK_DIR" rev-parse HEAD)"
+  [ "$_sdk_head" = "$SDK_COMMIT" ] || { echo "[android_sdk] ERROR: SDK tag $SDK_TAG resolved to $_sdk_head, expected pinned commit $SDK_COMMIT (tag moved?)"; exit 1; }
+  echo "[android_sdk] SDK commit OK: $_sdk_head"
+  retry 3 30 git -C "$SDK_DIR" submodule update --init --depth 1
   for p in rexglue-sdk-v0.10.0.patch rexglue-sdk-v0.10.0-android.patch rexglue-sdk-v0.10.0-android-perf.patch rexglue-sdk-v0.10.0-tolerant-dispatch.patch rexglue-sdk-v0.10.0-android-custom-vulkan.patch rexglue-sdk-v0.10.0-fps-cap.patch rexglue-sdk-v0.10.0-android-quiet.patch rexglue-sdk-v0.10.0-signal-chain.patch rexglue-sdk-v0.10.0-join-once.patch rexglue-sdk-v0.10.0-mali-vertex-stores.patch rexglue-sdk-v0.10.0-dlc-extract-errors.patch; do
     echo "[android_sdk] applying $p"
     git -C "$SDK_DIR" apply "$PATCHES/$p"
@@ -39,12 +83,12 @@ if [ ! -f "$AT_DIR/CMakeLists.txt" ]; then
   # Fallback if fetch-by-SHA ever fails: drop `--depth 1` (full clone).
   git init -q "$AT_DIR"
   git -C "$AT_DIR" remote add origin https://github.com/bylaws/libadrenotools.git
-  git -C "$AT_DIR" fetch -q --depth 1 origin "$AT_REV"
+  retry 3 30 git -C "$AT_DIR" fetch -q --depth 1 origin "$AT_REV"
   git -C "$AT_DIR" checkout -q FETCH_HEAD
   mkdir -p "$AT_DIR/lib"
   git init -q "$AT_DIR/lib/linkernsbypass"
   git -C "$AT_DIR/lib/linkernsbypass" remote add origin https://github.com/bylaws/liblinkernsbypass.git
-  git -C "$AT_DIR/lib/linkernsbypass" fetch -q --depth 1 origin "$LNB_REV"
+  retry 3 30 git -C "$AT_DIR/lib/linkernsbypass" fetch -q --depth 1 origin "$LNB_REV"
   git -C "$AT_DIR/lib/linkernsbypass" checkout -q FETCH_HEAD
   echo "[android_sdk] libadrenotools -> $AT_DIR"
 fi
