@@ -66,43 +66,65 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // Set to a valid value when a remote debugger is attached.
   // Offset 0x18 is a 4b pointer to a handler function that seems to take two
   // arguments. If we wanted to see what would happen we could fake that.
+  // (Hunt v1.4.6, ronda 4, A3-R4-22.) SystemHeapAlloc returns 0 on
+  // failure: the old code translated 0 (guest membase) and wrote the
+  // variable's initial value there, and mapped the export to guest 0.
+  // Each site below only writes/maps when its alloc succeeded, and
+  // logs the failure otherwise; the guest then reads the unmapped
+  // export instead of a fabricated value at address 0.
   uint32_t pKeDebugMonitorData;
   if (!REXCVAR_GET(kernel_debug_monitor)) {
     pKeDebugMonitorData = memory_->SystemHeapAlloc(4);
-    auto lpKeDebugMonitorData = memory_->TranslateVirtual(pKeDebugMonitorData);
-    memory::store_and_swap<uint32_t>(lpKeDebugMonitorData, 0);
+    if (pKeDebugMonitorData) {
+      auto lpKeDebugMonitorData = memory_->TranslateVirtual(pKeDebugMonitorData);
+      memory::store_and_swap<uint32_t>(lpKeDebugMonitorData, 0);
+    }
   } else {
     pKeDebugMonitorData = memory_->SystemHeapAlloc(4 + sizeof(X_KEDEBUGMONITORDATA));
-    memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(pKeDebugMonitorData),
-                                     pKeDebugMonitorData + 4);
-    auto lpKeDebugMonitorData =
-        memory_->TranslateVirtual<X_KEDEBUGMONITORDATA*>(pKeDebugMonitorData + 4);
-    std::memset(lpKeDebugMonitorData, 0, sizeof(X_KEDEBUGMONITORDATA));
+    if (pKeDebugMonitorData) {
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(pKeDebugMonitorData),
+                                       pKeDebugMonitorData + 4);
+      auto lpKeDebugMonitorData =
+          memory_->TranslateVirtual<X_KEDEBUGMONITORDATA*>(pKeDebugMonitorData + 4);
+      std::memset(lpKeDebugMonitorData, 0, sizeof(X_KEDEBUGMONITORDATA);
+    }
     // TODO: JIT - GenerateTrampoline requires JIT
     // lpKeDebugMonitorData->callback_fn =
     //     GenerateTrampoline("KeDebugMonitorCallback", KeDebugMonitorCallback);
   }
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0059, pKeDebugMonitorData);
+  if (pKeDebugMonitorData) {
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0059, pKeDebugMonitorData);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for KeDebugMonitorData");
+  }
 
   // KeCertMonitorData (?*)
   // Always set to zero, ignored.
   uint32_t pKeCertMonitorData;
   if (!REXCVAR_GET(kernel_cert_monitor)) {
     pKeCertMonitorData = memory_->SystemHeapAlloc(4);
-    auto lpKeCertMonitorData = memory_->TranslateVirtual(pKeCertMonitorData);
-    memory::store_and_swap<uint32_t>(lpKeCertMonitorData, 0);
+    if (pKeCertMonitorData) {
+      auto lpKeCertMonitorData = memory_->TranslateVirtual(pKeCertMonitorData);
+      memory::store_and_swap<uint32_t>(lpKeCertMonitorData, 0);
+    }
   } else {
     pKeCertMonitorData = memory_->SystemHeapAlloc(4 + sizeof(X_KECERTMONITORDATA));
-    memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(pKeCertMonitorData),
-                                     pKeCertMonitorData + 4);
-    auto lpKeCertMonitorData =
-        memory_->TranslateVirtual<X_KECERTMONITORDATA*>(pKeCertMonitorData + 4);
-    std::memset(lpKeCertMonitorData, 0, sizeof(X_KECERTMONITORDATA));
+    if (pKeCertMonitorData) {
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(pKeCertMonitorData),
+                                       pKeCertMonitorData + 4);
+      auto lpKeCertMonitorData =
+          memory_->TranslateVirtual<X_KECERTMONITORDATA*>(pKeCertMonitorData + 4);
+      std::memset(lpKeCertMonitorData, 0, sizeof(X_KECERTMONITORDATA);
+    }
     // TODO: JIT - GenerateTrampoline requires JIT
     // lpKeCertMonitorData->callback_fn =
     //     GenerateTrampoline("KeCertMonitorCallback", KeCertMonitorCallback);
   }
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0266, pKeCertMonitorData);
+  if (pKeCertMonitorData) {
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0266, pKeCertMonitorData);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for KeCertMonitorData");
+  }
 
   // XboxHardwareInfo (XboxHardwareInfo_t, 16b)
   // flags       cpu#  ?     ?     ?     ?           ?       ?
@@ -116,18 +138,26 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // From kernel dissasembly, after storage is initialized
   // XboxHardwareInfo flags is set with flag 5 (0x20).
   uint32_t pXboxHardwareInfo = memory_->SystemHeapAlloc(16);
-  auto lpXboxHardwareInfo = memory_->TranslateVirtual(pXboxHardwareInfo);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0156, pXboxHardwareInfo);
-  memory::store_and_swap<uint32_t>(lpXboxHardwareInfo + 0, 0x20);  // flags
-  memory::store_and_swap<uint8_t>(lpXboxHardwareInfo + 4, 0x06);   // cpu count
-  // Remaining 11b are zeroes?
+  if (pXboxHardwareInfo) {
+    auto lpXboxHardwareInfo = memory_->TranslateVirtual(pXboxHardwareInfo);
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0156, pXboxHardwareInfo);
+    memory::store_and_swap<uint32_t>(lpXboxHardwareInfo + 0, 0x20);  // flags
+    memory::store_and_swap<uint8_t>(lpXboxHardwareInfo + 4, 0x06);   // cpu count
+    // Remaining 11b are zeroes?
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for XboxHardwareInfo");
+  }
 
   // ExConsoleGameRegion, probably same values as keyvault region uses?
   // Just return all 0xFF, should satisfy anything that checks it
   uint32_t pExConsoleGameRegion = memory_->SystemHeapAlloc(4);
-  auto lpExConsoleGameRegion = memory_->TranslateVirtual(pExConsoleGameRegion);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x000C, pExConsoleGameRegion);
-  memory::store<uint32_t>(lpExConsoleGameRegion, 0xFFFFFFFF);
+  if (pExConsoleGameRegion) {
+    auto lpExConsoleGameRegion = memory_->TranslateVirtual(pExConsoleGameRegion);
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x000C, pExConsoleGameRegion);
+    memory::store<uint32_t>(lpExConsoleGameRegion, 0xFFFFFFFF);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for ExConsoleGameRegion");
+  }
 
   // XexExecutableModuleHandle (?**)
   // Games try to dereference this to get a pointer to some module struct.
@@ -139,7 +169,11 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // 0x80101058 <- pointer to xex header
   // 0x80101100 <- xex header base
   uint32_t ppXexExecutableModuleHandle = memory_->SystemHeapAlloc(4);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0193, ppXexExecutableModuleHandle);
+  if (ppXexExecutableModuleHandle) {
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0193, ppXexExecutableModuleHandle);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for XexExecutableModuleHandle");
+  }
 
   // ExLoadedImageName (char*)
   // The full path to loaded image/xex including its name.
@@ -147,7 +181,11 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // Todo(Gliniak): Confirm that official kernel always allocate space for this
   // variable.
   uint32_t ppExLoadedImageName = memory_->SystemHeapAlloc(kExLoadedImageNameSize);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x01AF, ppExLoadedImageName);
+  if (ppExLoadedImageName) {
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x01AF, ppExLoadedImageName);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for ExLoadedImageName");
+  }
 
   // ExLoadedCommandLine (char*)
   // The name of the xex. Not sure this is ever really used on real devices.
@@ -161,39 +199,51 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   uint32_t command_line_length =
       rex::align(static_cast<uint32_t>(command_line.length()) + 1, 1024u);
   uint32_t pExLoadedCommandLine = memory_->SystemHeapAlloc(command_line_length);
-  auto lpExLoadedCommandLine = memory_->TranslateVirtual(pExLoadedCommandLine);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x01AE, pExLoadedCommandLine);
-  std::memset(lpExLoadedCommandLine, 0, command_line_length);
-  std::memcpy(lpExLoadedCommandLine, command_line.c_str(), command_line.length());
+  if (pExLoadedCommandLine) {
+    auto lpExLoadedCommandLine = memory_->TranslateVirtual(pExLoadedCommandLine);
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x01AE, pExLoadedCommandLine);
+    std::memset(lpExLoadedCommandLine, 0, command_line_length);
+    std::memcpy(lpExLoadedCommandLine, command_line.c_str(), command_line.length());
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for ExLoadedCommandLine");
+  }
 
   // XboxKrnlVersion (8b)
   // Kernel version, looks like 2b.2b.2b.2b.
   // I've only seen games check >=, so we just fake something here.
   uint32_t pXboxKrnlVersion = memory_->SystemHeapAlloc(8);
-  auto lpXboxKrnlVersion = memory_->TranslateVirtual(pXboxKrnlVersion);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0158, pXboxKrnlVersion);
-  memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 0, 2);
-  memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 2, 0xFFFF);
-  memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 4, 0xFFFF);
-  memory::store_and_swap<uint8_t>(lpXboxKrnlVersion + 6, 0x80);
-  memory::store_and_swap<uint8_t>(lpXboxKrnlVersion + 7, 0x00);
+  if (pXboxKrnlVersion) {
+    auto lpXboxKrnlVersion = memory_->TranslateVirtual(pXboxKrnlVersion);
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x0158, pXboxKrnlVersion);
+    memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 0, 2);
+    memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 2, 0xFFFF);
+    memory::store_and_swap<uint16_t>(lpXboxKrnlVersion + 4, 0xFFFF);
+    memory::store_and_swap<uint8_t>(lpXboxKrnlVersion + 6, 0x80);
+    memory::store_and_swap<uint8_t>(lpXboxKrnlVersion + 7, 0x00);
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for XboxKrnlVersion");
+  }
 
   // KeTimeStampBundle (24b)
   // This must be updated during execution, at 1ms intevals.
   // We setup a system timer here to do that.
   uint32_t pKeTimeStampBundle = memory_->SystemHeapAlloc(24);
-  auto lpKeTimeStampBundle = memory_->TranslateVirtual(pKeTimeStampBundle);
-  export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x00AD, pKeTimeStampBundle);
-  memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 0, 0);
-  memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 8, 0);
-  memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
-                                   chrono::Clock::QueryGuestUptimeMillis());
-  memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
-  timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
-      std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
-        memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
-                                         chrono::Clock::QueryGuestUptimeMillis());
-      });
+  if (pKeTimeStampBundle) {
+    auto lpKeTimeStampBundle = memory_->TranslateVirtual(pKeTimeStampBundle);
+    export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x00AD, pKeTimeStampBundle);
+    memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 0, 0);
+    memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 8, 0);
+    memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
+                                     chrono::Clock::QueryGuestUptimeMillis));
+    memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
+    timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
+        std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
+          memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
+                                           chrono::Clock::QueryGuestUptimeMillis));
+        });
+  } else {
+    REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for KeTimeStampBundle");
+  }
 
   // Wire kernel object type variables to KernelGuestGlobals.
   // KernelGuestGlobals is allocated in KernelState ctor, which runs before this.
