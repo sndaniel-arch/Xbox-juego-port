@@ -111,4 +111,13 @@ X_STATUS HostPathFile::SetLength(size_t length) {
   }
 }
 
+void HostPathFile::Flush() {
+  // (Hunt v1.4.6, A2-R4-19.) The one real flush path in the VFS:
+  // PosixFileHandle::Flush fsyncs the host fd. Writes already go
+  // through unbuffered pwrite, so this only forces OS buffers to disk.
+  if (file_handle_) {
+    file_handle_->Flush();
+  }
+}
+
 }  // namespace rex::filesystem
