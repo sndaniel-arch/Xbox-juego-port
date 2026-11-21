@@ -409,9 +409,9 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   // (primary_buffer_size_ == 0) is guarded in ExecutePrimaryBuffer.
   if (size_log2 < 10 || size_log2 > 24) {
     REXGPU_ERROR(
-          "CommandProcessor::InitializeRingBuffer: invalid size_log2 {} (expected 10..24); "
-          "keeping previous ring buffer size {}",
-          size_log2, primary_buffer_size_);
+        "CommandProcessor::InitializeRingBuffer: invalid size_log2 {} (expected 10..24); "
+        "keeping previous ring buffer size {}",
+        size_log2, primary_buffer_size_);
     return;
   }
   read_ptr_index_ = 0;
@@ -433,9 +433,9 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // previous update frequency.
   if (block_size_log2 > 19) {
     REXGPU_ERROR(
-          "CommandProcessor::EnableReadPointerWriteBack: invalid block_size_log2 {} (expected "
-          "0..19); keeping previous read pointer update frequency {}",
-          block_size_log2, read_ptr_update_freq_);
+        "CommandProcessor::EnableReadPointerWriteBack: invalid block_size_log2 {} (expected "
+        "0..19); keeping previous read pointer update frequency {}",
+        block_size_log2, read_ptr_update_freq_);
     return;
   }
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
@@ -791,6 +791,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+
+  --indirect_buffer_depth_;
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
