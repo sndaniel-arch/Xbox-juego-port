@@ -33,6 +33,54 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 
+// (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+// TranslateVirtual never validates and never returns null, so a guest
+// pointer + length that runs past the end of the mapping SIGSEGVs the
+// host on the memset/memcpy. Same heap validation as A2-R3-01 (see
+// xam_user.cpp for the full comment), copied here because this file's
+// format/loader entries write guest buffers sized by a guest count:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (readable
+// for a source, read/write for a destination).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 u32 XamFeatureEnabled_entry(u32 unk) {
   return 0;
 }
@@ -83,6 +131,21 @@ static SYSTEMTIME xeGetLocalSystemTime(uint64_t filetime) {
 #endif
 
 void XamFormatDateString_entry(u32 unk, u64 filetime, mapped_void output_buffer, u32 output_count) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+  // Same shape as A3-R4-08 (XamReadTileToTexture, xam_user.cpp):
+  // output_count is guest-controlled (u32) and the memset below writes
+  // output_count * 2 bytes from an unvalidated pointer -- up to ~8 GiB
+  // past the end of the mapping, or to guest address 0 for a NULL
+  // buffer. The memset runs on every platform (the formatting itself
+  // is Win32-only), so validate the whole destination range first.
+  // The count is in UTF-16 code units, so the range is output_count *
+  // sizeof(char16_t) bytes; computed in size_t, it cannot wrap, and
+  // the helper rejects any length that cannot lie inside a heap.
+  if (!output_buffer ||
+      !GuestRangeWritable(output_buffer.guest_address(),
+                          static_cast<size_t>(output_count) * sizeof(char16_t))) {
+    return;
+  }
   std::memset(output_buffer, 0, output_count * sizeof(char16_t));
 
 // TODO: implement this for other platforms
@@ -97,6 +160,14 @@ void XamFormatDateString_entry(u32 unk, u64 filetime, mapped_void output_buffer,
 }
 
 void XamFormatTimeString_entry(u32 unk, u64 filetime, mapped_void output_buffer, u32 output_count) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+  // Same as XamFormatDateString_entry above: guest-controlled count,
+  // unvalidated destination, memset runs on every platform.
+  if (!output_buffer ||
+      !GuestRangeWritable(output_buffer.guest_address(),
+                          static_cast<size_t>(output_count) * sizeof(char16_t))) {
+    return;
+  }
   std::memset(output_buffer, 0, output_count * sizeof(char16_t));
 
 // TODO: implement this for other platforms
@@ -113,6 +184,17 @@ void XamFormatTimeString_entry(u32 unk, u64 filetime, mapped_void output_buffer,
 u32 keXamBuildResourceLocator(uint64_t module, std::u16string_view container,
                               std::u16string_view resource, mapped_void buffer_ptr,
                               uint32_t buffer_count) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+  // copy_and_swap_truncating below writes up to buffer_count UTF-16
+  // code units (count * 2 bytes) into buffer_ptr, which was never
+  // validated -- a non-NULL pointer outside the mapping SIGSEGVs the
+  // host. Validate the whole destination range first. buffer_count is
+  // in code units, like output_count in the format entries above.
+  if (!buffer_ptr ||
+      !GuestRangeWritable(buffer_ptr.guest_address(),
+                          static_cast<size_t>(buffer_count) * sizeof(char16_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   std::u16string path;
   if (!module) {
     path = fmt::format(u"file://media:/{}.xzp#{}", container, resource);
@@ -239,6 +321,17 @@ u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
 }
 
 u32 XamLoaderSetLaunchData_entry(mapped_void data, u32 size) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+  // Same shape as A3-R4-08: `size` is guest-controlled (u32) and `data`
+  // was never validated, but resize(size) allocates that many host
+  // bytes and the memcpy reads that many guest bytes. A wild pointer
+  // SIGSEGVs the host, and a huge size (up to 4 GiB) exhausts the host
+  // heap (bad_alloc -> terminate). Validate the whole source range
+  // first: the range must lie inside readable guest memory, which
+  // bounds the size by the mapping itself without inventing a cap.
+  if (size && (!data || !GuestRangeReadable(data.guest_address(), size))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   loader_data.launch_data_present = size ? true : false;
@@ -271,6 +364,13 @@ u32 XamLoaderGetLaunchData_entry(mapped_void buffer_ptr, u32 buffer_size) {
   }
 
   uint32_t copy_size = std::min(uint32_t(loader_data.launch_data.size()), uint32_t(buffer_size));
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-15.)
+  // Same as the setter above: buffer_ptr was never validated, and the
+  // memcpy writes copy_size bytes into it. Validate the destination
+  // range first (a zero copy_size needs no buffer).
+  if (copy_size && (!buffer_ptr || !GuestRangeWritable(buffer_ptr.guest_address(), copy_size))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   std::memcpy(buffer_ptr, loader_data.launch_data.data(), copy_size);
   return X_ERROR_SUCCESS;
 }
