@@ -303,6 +303,18 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   assert_not_null(driver);
 
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
+  // (Hunt v1.4.6 ronda 4, segundo barrido, V-A4-01.) Same unchecked
+  // SystemHeapAlloc class as A3-R4-22, different site: a failed alloc
+  // returns 0 and the store below would write the callback arg to guest
+  // address 0. Fail cleanly instead — the caller
+  // (XAudioRegisterRenderDriverClient) propagates the failure — and
+  // destroy the driver that was just created, since it was never
+  // registered into clients_[].
+  if (!ptr) {
+    REXAPU_ERROR("AudioSystem::RegisterClient: SystemHeapAlloc failed");
+    DestroyDriver(driver);
+    return X_STATUS_NO_MEMORY;
+  }
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
@@ -529,6 +541,19 @@ void AudioSystem::Pause() {
     return;
   }
   paused_ = true;
+
+  // (Hunt v1.4.6 ronda 4, A4-R4-06.) Drain a stale resume signal before
+  // parking, the Event half of the XMA fix: resume_event_ is auto-reset,
+  // so a Resume() that ran before the worker reached its park point
+  // leaves the signal set, and the next Wait(resume_event_) would return
+  // at once and skip this park. Reset() is a no-op when nothing is
+  // pending, and the worker cannot be parked here (Pause early-returns
+  // when paused_ is already true), so nothing a waiter needs is cleared.
+  // Pause/Resume are driven by the SDL lifecycle on one thread, so no
+  // Resume can land between the drain and the shutdown wake below.
+  if (resume_event_) {
+    resume_event_->Reset();
+  }
 
   // Kind of a hack, but it works.
   shutdown_event_->Set();
