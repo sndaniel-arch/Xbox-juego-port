@@ -92,7 +92,25 @@ class Fence {
   }
   bool WaitFor(std::chrono::milliseconds timeout) { return WaitForImpl(timeout); }
 
- private:
+// Consume a pending signal without waiting, if one is present and no
+// thread is currently registered as a waiter. Returns true when a signal
+// was consumed. (Hunt v1.4.6 ronda 4, A4-R4-06.) Fence has no Reset():
+// a Resume() that runs before the worker reaches its park point leaves a
+// sticky signal that would skip the NEXT park, so Pause() drains it with
+// this before parking the worker. Only the unobserved case is drained —
+// if a waiter is already registered, it consumes the signal itself and
+// re-parks (paused_ is set), so nothing is stolen from it.
+bool TryConsume() {
+ std::unique_lock<std::mutex> lock(mutex_);
+auto signal_state = signal_state_.load();
+if (!(signal_state & SIGMASK_) || (signal_state & ~SIGMASK_) != 0) {
+ return false;
+}
+ signal_state_.store(0, std::memory_order_release);
+return true;
+}
+
+private:
   bool WaitForImpl(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     assert_true((signal_state_.load() & ~SIGMASK_) < (SIGMASK_ - 1) && "Too many threads?");
