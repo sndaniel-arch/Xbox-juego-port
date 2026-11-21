@@ -48,11 +48,20 @@ u32 XamGetOnlineSchema_entry() {
   static uint32_t schema_guest = 0;
 
   if (!schema_guest) {
-    schema_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(8 + sizeof(schema_bin));
-    auto schema = REX_KERNEL_MEMORY()->TranslateVirtual(schema_guest);
-    std::memcpy(schema + 8, schema_bin, sizeof(schema_bin));
-    memory::store_and_swap<uint32_t>(schema + 0, schema_guest + 8);
-    memory::store_and_swap<uint32_t>(schema + 4, sizeof(schema_bin));
+    // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-01.) SystemHeapAlloc
+    // returns 0 on failure: the old code translated 0 and memcpied the
+    // schema onto guest address 0, then cached schema_guest = 0, so
+    // every later call retried the same corrupting write. Only write
+    // and cache on success; on failure return 0 (a null schema pointer
+    // the caller already has to handle).
+    uint32_t alloc = REX_KERNEL_MEMORY()->SystemHeapAlloc(8 + sizeof(schema_bin));
+    if (alloc) {
+      schema_guest = alloc;
+      auto schema = REX_KERNEL_MEMORY()->TranslateVirtual(schema_guest);
+      std::memcpy(schema + 8, schema_bin, sizeof(schema_bin));
+      memory::store_and_swap<uint32_t>(schema + 0, schema_guest + 8);
+      memory::store_and_swap<uint32_t>(schema + 4, sizeof(schema_bin));
+    }
   }
 
   // return pointer to the schema ptr/schema size struct
@@ -311,6 +320,15 @@ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
   // Allocate from the heap. Not sure why XAM does this specially, perhaps
   // it keeps stuff in a separate heap?
   uint32_t ptr = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
+  // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-01.) The old code
+  // wrote the (possibly 0) result to *out_ptr and returned SUCCESS:
+  // the game believed it owned a buffer at guest address 0. Fail
+  // honestly instead — X_STATUS_NO_MEMORY is the NTSTATUS out-of-memory
+  // value; note the NTSTATUS-vs-X_RESULT domain mix in this file
+  // (XamQueryLiveHiveW already returns an X_STATUS value).
+  if (!ptr) {
+    return X_STATUS_NO_MEMORY;
+  }
   *out_ptr = ptr;
 
   return X_ERROR_SUCCESS;
