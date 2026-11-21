@@ -13,10 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
@@ -237,7 +239,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   static void GetEdramBufferUsageMasks(EdramBufferUsage usage, VkPipelineStageFlags& stage_mask_out,
                                        VkAccessFlags& access_mask_out);
   bool IsColor16FormatFloatLike(xenos::ColorRenderTargetFormat format) const;
-  void UseEdramBuffer(EdramBufferUsage new_usage);
+  // (Hunt v1.4.6, verificación profunda, FE-06.) Destroys render passes
+   // ClearCache deferred (see deferred_destroy_render_passes_ below).
+     // Command processor thread only. With force_all=false, only entries
+     // whose stamp submission has completed are destroyed; with
+     // force_all=true (Shutdown, creation threads already joined) all of
+     // them are.
+     void DestroyDeferredRenderPasses(bool force_all);
+     void UseEdramBuffer(EdramBufferUsage new_usage);
   void MarkEdramBufferModified(EdramBufferModificationStatus modification_status =
                                    EdramBufferModificationStatus::kViaUnordered);
   void CommitEdramBufferShaderWrites(
@@ -840,7 +849,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // VK_NULL_HANDLE if failed to create.
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher> render_passes_;
 
-  std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
+  // (Hunt v1.4.6, verificación profunda, FE-06.) <Submission index,
+   // render pass> pairs removed from render_passes_ by ClearCache and
+     // awaiting destruction -- the same deferred-destroy shape as
+     // VulkanPipelineCache::deferred_destroy_pipelines_ (and the command
+     // processor's destroy_* queues). The index is the submission after
+     // which the render pass may be destroyed; entries are stamped in
+     // non-decreasing submission order. Guarded by render_pass_cache_mutex_
+     // like render_passes_ (all three users -- ClearCache,
+     // CompletedSubmissionUpdated, Shutdown -- run on the command processor
+     // thread; the getter never touches this queue).
+     std::deque<std::pair<uint64_t, VkRenderPass>> deferred_destroy_render_passes_;
+   
+     std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
 
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants
