@@ -86,7 +86,16 @@ public final class GameFiles {
             }
             return false;
         }
-        return new File(root, "default.xex").isFile();
+        File xex = new File(root, "default.xex");
+        if (!xex.isFile()) return false;
+        // (Hunt v1.4.6 ronda 4, A4-R4-02.) Existence alone declared a
+        // half-imported folder valid: a failed import that already wrote
+        // default.xex (even truncated) booted straight into a broken game
+        // with no re-import UI reachable. Reuse the header read finish()
+        // already trusts: a valid XEX2 header with a title-ID entry must
+        // parse, not just exist. Reads at most 16 KiB. The asset: branch
+        // above is untouched.
+        return xexTitleId(xex) != null;
     }
 
     /** True when game_root.txt points at a bundled asset instead of a folder. */
