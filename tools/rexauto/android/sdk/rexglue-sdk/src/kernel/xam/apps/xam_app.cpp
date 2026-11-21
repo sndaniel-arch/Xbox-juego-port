@@ -112,15 +112,22 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       if (data->buffer_size) {
         std::memset(buffer, 0, data->buffer_size);
       }
+      // (Verificacion profunda, FE-03.) length_ptr used to be validated
+      // AFTER WriteItems had already advanced the enumerator cursor:
+      // an invalid length_ptr returned X_E_INVALIDARG having consumed
+      // the items, desynchronising the enumeration. Validate the
+      // 4-byte writable range first, like the other validations above;
+      // the write itself still happens only on success below.
+      if (data->length_ptr &&
+            !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->length_ptr),
+                                  sizeof(uint32_t), true)) {
+          return X_E_INVALIDARG;
+      }
       uint32_t item_count = 0;
       auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count, data->buffer_size);
 
       if (result == X_ERROR_SUCCESS && item_count >= 1) {
         if (data->length_ptr) {
-          if (!GuestRangeAccessible(memory_, static_cast<uint32_t>(data->length_ptr),
-                                    sizeof(uint32_t), true)) {
-            return X_E_INVALIDARG;
-          }
           auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
           *length_ptr = 1;
         }
@@ -136,9 +143,20 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         rex::be<uint32_t> unk_48;  // ? overlapped_ptr ?
       }* data = reinterpret_cast<message_data*>(buffer);
       assert_true(buffer_length == sizeof(message_data));
+      // (Verificacion profunda, FE-07.) Like 0x2000E above, this message
+      // struct is read from the guest buffer: validate its 76 bytes
+      // before touching any field. AppManager::DispatchMessageSync
+      // forwards buffer_ptr/buffer_length with no validation upstream.
+      if (!GuestRangeAccessible(memory_, buffer_ptr, sizeof(message_data), false)) {
+          return X_E_INVALIDARG;
+      }
       // (Audit A3, ronda 6, R6-06, sweep.) unk_44 is a guest pointer
       // field; a zero value used to write to guest address 0.
       if (data->unk_44) {
+        if (!GuestRangeAccessible(memory_, static_cast<uint32_t>(data->unk_44),
+                                    sizeof(uint32_t), true)) {
+            return X_E_INVALIDARG;
+        }
         auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_44);
         *unk = 0;
       }
@@ -156,6 +174,19 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         rex::be<uint32_t> unk_04;  // ? value/jump to? ?
       }* data = reinterpret_cast<message_data*>(buffer);
       assert_true(buffer_length == sizeof(message_data));
+      // (Verificacion profunda, FE-07.) Same as 0x2000E/0x200021: the
+      // struct is read from the guest buffer without validation, and
+      // unk_00 is dereferenced a second time (double indirection).
+      // Validate the 8-byte struct first, then the pointed-to u32
+      // (a zero unk_00 has no legitimate target here).
+      if (!GuestRangeAccessible(memory_, buffer_ptr, sizeof(message_data), false)) {
+          return X_E_INVALIDARG;
+      }
+      if (!data->unk_00 ||
+            !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->unk_00),
+                                  sizeof(uint32_t), false)) {
+          return X_E_INVALIDARG;
+      }
       auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_00);
       auto adr = *unk;
       REXKRNL_DEBUG("XamApp(0x00022005)(%.8X, %.8X)", (uint32_t)data->unk_00,
