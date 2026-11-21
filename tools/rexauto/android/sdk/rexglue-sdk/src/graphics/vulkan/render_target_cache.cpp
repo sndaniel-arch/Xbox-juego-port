@@ -1057,20 +1057,20 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   framebuffers_.clear();
 
   last_update_render_pass_ = VK_NULL_HANDLE;
-{
-  // (Caza v1.4.6 ronda 4, V-A1-02, second sweep.) render_passes_ is
-  // also read/written by GetHostRenderTargetsRenderPass on the
-  // creation threads: destroy it only under the same mutex. (Shutdown
-  // normally runs after the creation threads were joined, but the
-  // lock is uncontended then and keeps the invariant in one place.)
-  std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
-      for (const auto& render_pass_pair : render_passes_) {
-        if (render_pass_pair.second != VK_NULL_HANDLE) {
-          dfn.vkDestroyRenderPass(device, render_pass_pair.second, nullptr);
-        }
+  {
+    // (Caza v1.4.6 ronda 4, V-A1-02, second sweep.) render_passes_ is
+    // also read/written by GetHostRenderTargetsRenderPass on the
+    // creation threads: destroy it only under the same mutex. (Shutdown
+    // normally runs after the creation threads were joined, but the
+    // lock is uncontended then and keeps the invariant in one place.)
+    std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
+    for (const auto& render_pass_pair : render_passes_) {
+      if (render_pass_pair.second != VK_NULL_HANDLE) {
+        dfn.vkDestroyRenderPass(device, render_pass_pair.second, nullptr);
       }
-      render_passes_.clear();
-}
+    }
+    render_passes_.clear();
+  }
 
   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_copy_pipeline);
@@ -1112,21 +1112,21 @@ void VulkanRenderTargetCache::ClearCache() {
   framebuffers_.clear();
 
   last_update_render_pass_ = VK_NULL_HANDLE;
-{
-  // (Caza v1.4.6 ronda 4, V-A1-02, second sweep.) ClearCache runs on
-  // the command processor thread during EndSubmission, while the
-  // pipeline creation threads are still alive and may be inside
-  // GetHostRenderTargetsRenderPass: iterating and clearing
-  // render_passes_ here without the mutex would race their find /
-  // emplace (UB on unordered_map). Guarded with the same mutex as
-  // the getter. (framebuffers_ above needs no lock: it is only
-  // touched on the command processor thread.)
-  std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
+  {
+    // (Caza v1.4.6 ronda 4, V-A1-02, second sweep.) ClearCache runs on
+    // the command processor thread during EndSubmission, while the
+    // pipeline creation threads are still alive and may be inside
+    // GetHostRenderTargetsRenderPass: iterating and clearing
+    // render_passes_ here without the mutex would race their find /
+    // emplace (UB on unordered_map). Guarded with the same mutex as
+    // the getter. (framebuffers_ above needs no lock: it is only
+    // touched on the command processor thread.)
+    std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
     for (const auto& render_pass_pair : render_passes_) {
       dfn.vkDestroyRenderPass(device, render_pass_pair.second, nullptr);
     }
     render_passes_.clear();
-}
+  }
 
   RenderTargetCache::ClearCache();
 }
