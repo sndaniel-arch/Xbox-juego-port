@@ -43,6 +43,49 @@ namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
 
+// (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-12.)
+// TranslateVirtual never validates and never returns null, so a guest
+// pointer + length that runs past the end of the mapping SIGSEGVs the
+// host on the read. Same heap validation as A2-R3-01 (see xam_user.cpp
+// for the full comment), copied here because the wait-multiple entries
+// below read a guest handle array: reject a range that wraps past
+// 4 GiB, starts or ends outside any heap, or spans heaps of different
+// kinds (or two physical heaps); inside a single heap, require the
+// pages to be accessible (readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
 //   0x058: kernel time
@@ -999,6 +1042,19 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   if (count > 64) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-12.)
+  // Same shape as FE-04 (WSASendTo): the count is capped at 64 above,
+  // but the objects array itself (count * 4 bytes) was never
+  // range-validated -- the loop below reads objects_ptr[n] for
+  // n < count. An array crossing the end of the mapping SIGSEGVs the
+  // host on that read. The cap above bounds the validated length to
+  // 256 bytes, so it cannot overflow. Validated here, in the entry
+  // that still knows the guest address: xeNtWaitForMultipleObjectsEx
+  // below only receives the translated host pointer.
+  if (count && !GuestRangeReadable(objects_ptr.guest_address(),
+                                   static_cast<size_t>(count) * sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
@@ -1060,6 +1116,19 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-12.)
+  // Same as KeWaitForMultipleObjects_entry above and the WSA wrapper in
+  // xam_net.cpp: the count is capped at 64 inside
+  // xeNtWaitForMultipleObjectsEx, but the handles array itself was never
+  // range-validated. Validate it here, where the guest address is still
+  // known, before the callee reads handles[n]. count == 0 with a NULL
+  // handles is already rejected inside the callee; a NULL handles with
+  // count > 0 fails the range check below (guest address 0 is not a
+  // readable range).
+  if (count && !GuestRangeReadable(handles.guest_address(),
+                                   static_cast<size_t>(count) * sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);
