@@ -71,21 +71,21 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
   }
 
   // (Hunt v1.4.6, ronda 4, A3-R4-03.) buffer_size used to be a phantom
-// parameter: WriteItems wrote count * item_size() with no bound
-// against it. Pass it through (WriteItems truncates) and reject a
-// destination range outside writable guest memory first.
-if (buffer_ptr && !GuestRangeWritable(buffer_ptr.guest_address(), buffer_size)) {
-  return X_ERROR_INVALID_PARAMETER;
-}
-  
-    auto run = [e, buffer_ptr, buffer_size](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+  // parameter: WriteItems wrote count * item_size() with no bound
+  // against it. Pass it through (WriteItems truncates) and reject a
+  // destination range outside writable guest memory first.
+  if (buffer_ptr && !GuestRangeWritable(buffer_ptr.guest_address(), buffer_size)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto run = [e, buffer_ptr, buffer_size](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result;
     uint32_t item_count = 0;
     if (!buffer_ptr) {
       result = X_ERROR_INVALID_PARAMETER;
     } else {
       result = e->WriteItems(buffer_ptr.guest_address(), buffer_ptr.as<uint8_t*>(), &item_count,
-                             buffer_size);        
+                             buffer_size);
     }
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = item_count;
