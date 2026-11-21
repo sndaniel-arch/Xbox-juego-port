@@ -1837,6 +1837,16 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
         shader.GetTextureBindingsAfterTranslation();
     size_t texture_binding_count = texture_bindings.size();
     if (texture_binding_count) {
+      // (Caza v1.4.6 ronda 4, V-A1-01, second sweep.) layouts_mutex_
+      // was declared but never taken, while this block reads and
+      // mutates texture_binding_layout_map_ / texture_binding_layouts_.
+      // Both are only touched on the command processor thread today
+      // (TranslateAnalyzedShader callers: shader-storage preload and
+      // EnsureShadersTranslated), so this is latent, not a live race —
+      // but the D3D12 twin already takes its layouts_mutex_ here, and
+      // taking it makes the declared intent true if translation ever
+      // moves off the processor thread.
+      std::lock_guard<std::mutex> layouts_lock(layouts_mutex_);
       size_t texture_binding_layout_bytes =
           texture_binding_count * sizeof(*texture_bindings.data());
       uint64_t texture_binding_layout_hash =
@@ -2271,6 +2281,10 @@ uint32_t VulkanPipelineCache::GetTessellationPatchControlPointCount(
 }
 
 VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
+  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
+  // as on the command processor thread: serialize the attempted_ /
+  // shader_module_ pair, which two threads could otherwise write at once.
+  std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   bool& attempted = adaptive ? tessellation_adaptive_vertex_shader_attempted_
                              : tessellation_indexed_vertex_shader_attempted_;
   VkShaderModule& shader_module =
@@ -2290,6 +2304,14 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
         "VulkanPipelineCache: Failed to compile tessellation {} vertex "
         "shader: {}",
         adaptive ? "adaptive" : "indexed", compile_error);
+    // (Caza v1.4.6 ronda 4, A1-R4-07, third site found on verification.)
+    // A failed creation must not be remembered: clear `attempted` so the
+    // next pipeline that needs this shader retries instead of returning
+    // the cached VK_NULL_HANDLE forever (e.g. after a transient driver
+    // OOM). The GLSL source is fixed, so a deterministic compile failure
+    // just retries and fails again, at the same bounded rate as any other
+    // failing pipeline creation.
+    attempted = false;
     shader_module = VK_NULL_HANDLE;
     return shader_module;
   }
@@ -2302,6 +2324,8 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
         "VulkanPipelineCache: Failed to create tessellation {} vertex "
         "shader module",
         adaptive ? "adaptive" : "indexed");
+  // (A1-R4-07, same as above: do not cache a transient failure.)
+    attempted = false;
   }
   return shader_module;
 }
@@ -2309,6 +2333,10 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
 VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
     Shader::HostVertexShaderType host_vertex_shader_type,
     xenos::TessellationMode tessellation_mode) {
+  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
+  // as on the command processor thread: serialize the find + emplace
+  // below, which two threads could otherwise race (UB on unordered_map).
+  std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   TessellationControlShaderKey key;
   key.host_vertex_shader_type = host_vertex_shader_type;
   key.tessellation_mode = tessellation_mode;
@@ -2344,7 +2372,11 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
         "VulkanPipelineCache: Failed to compile tessellation control shader "
         "0x{:08X}: {}",
         key.key, compile_error);
-    tessellation_control_shaders_.emplace(key, VK_NULL_HANDLE);
+    // (Caza v1.4.6 ronda 4, A1-R4-07.) Do NOT cache the failure: a
+    // transient failure (e.g. driver OOM) would otherwise poison this key
+    // with VK_NULL_HANDLE forever. The next pipeline that needs this
+    // shader retries the creation. Only the deterministic invalid-counts
+    // case above stays cached.
     return VK_NULL_HANDLE;
   }
 
@@ -2356,6 +2388,9 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
         "VulkanPipelineCache: Failed to create tessellation control shader "
         "module 0x{:08X}",
         key.key);
+  // (A1-R4-07, same as above: a failed vkCreateShaderModule — e.g.
+    // transient driver OOM — must not be cached as VK_NULL_HANDLE.)
+    return VK_NULL_HANDLE;
   }
   tessellation_control_shaders_.emplace(key, shader_module);
   return shader_module;
@@ -2393,6 +2428,10 @@ bool VulkanPipelineCache::GetGeometryShaderKey(
 }
 
 VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
+  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
+  // as on the command processor thread: serialize the find + emplace
+  // below, which two threads could otherwise race (UB on unordered_map).
+  std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   auto it = geometry_shaders_.find(key);
   if (it != geometry_shaders_.end()) {
     return it->second;
@@ -3473,8 +3512,15 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   std::vector<unsigned int> shader_code;
   builder.dump(shader_code);
 
-  // Create the shader module, and store the handle even if creation fails not
-  // to try to create it again later.
+  // (Caza v1.4.6 ronda 4, A1-R4-07, third site found on verification:
+  // the round-4 evidence claimed this function "only emplaces on
+  // success", but it emplaced unconditionally, including VK_NULL_HANDLE
+  // on failure.) Do NOT cache a failed creation: a transient failure
+  // (e.g. driver OOM) would otherwise poison this key with
+  // VK_NULL_HANDLE forever. Only a successfully created module is
+  // stored; the next pipeline that needs this shader retries. The
+  // retry rate is bounded by the pipeline-creation cooldown (R8-C1),
+  // so a deterministically failing shader cannot spin the creation.
   VkShaderModule shader_module = ui::vulkan::util::CreateShaderModule(
       command_processor_.GetVulkanDevice(), reinterpret_cast<const uint32_t*>(shader_code.data()),
       sizeof(uint32_t) * shader_code.size());
@@ -3482,7 +3528,8 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     REXGPU_ERROR(
         "VulkanPipelineCache: Failed to create the primitive type geometry "
         "shader 0x{:08X}",
-        key.key);
+      key.key);
+    return VK_NULL_HANDLE;
   }
   geometry_shaders_.emplace(key, shader_module);
   return shader_module;
