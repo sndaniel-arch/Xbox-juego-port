@@ -261,6 +261,12 @@ public final class StfsExtractor {
             vd = ByteBuffer.allocate(0x800).order(ByteOrder.LITTLE_ENDIAN);
             while (vd.hasRemaining()) { if (f0.read(vd, magicOff + vd.position()) <= 0) break; }
             vd.flip();
+            // (Hunt v1.4.6 ronda 4, A4-R4-12.) Same truncated-descriptor
+            // hole as IsoExtractor.list(): a GoD cut short after the 20
+            // magic bytes left vd short, and the getInt(0x14/0x18) calls
+            // in list() threw BufferUnderflowException (unchecked). Fail
+            // here, at open time, with a clean IOException instead.
+            if (vd.limit() < 0x1C) throw new IOException("GoD: truncated volume descriptor");
         }
 
         private static boolean magicAt(FileChannel f, long off) throws IOException {
