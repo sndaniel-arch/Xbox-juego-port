@@ -181,17 +181,29 @@ void XmaDecoder::Shutdown() {
 
   // Wait up to 2 seconds for worker thread to exit gracefully.
   auto result = rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
-  if (result == rex::thread::WaitResult::kTimeout) {
+  const bool worker_exited = (result != rex::thread::WaitResult::kTimeout);
+  if (!worker_exited) {
     REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
   }
   worker_thread_.reset();
 
-  if (context_data_first_ptr_) {
-    memory()->SystemHeapFree(context_data_first_ptr_);
-  }
+  // (Hunt v1.4.6 ronda 4, A4-R4-05.) When the worker did not exit, it may
+  // still be inside XmaContext::Work() reading the context heap through
+  // TranslateVirtual(guest_ptr()). Freeing that heap here would hand it
+  // freed memory (UAF in the audio thread during shutdown). Leak it
+  // deliberately instead: the process is shutting down (the quit path
+  // _Exit(0)s right after), and the block is small (320 x 64 B). The
+  // pointers are left intact so a late GetContextId still bounds-checks
+  // against the live range. A decoder abandoned this way must not be
+  // re-Setup; no caller does — Setup runs once per process.
+  if (worker_exited) {
+    if (context_data_first_ptr_) {
+      memory()->SystemHeapFree(context_data_first_ptr_);
+    }
 
-  context_data_first_ptr_ = 0;
-  context_data_last_ptr_ = 0;
+    context_data_first_ptr_ = 0;
+    context_data_last_ptr_ = 0;
+  }
 }
 
 int XmaDecoder::GetContextId(uint32_t guest_ptr) {
@@ -218,6 +230,15 @@ uint32_t XmaDecoder::AllocateContext() {
 
 void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
   auto context_id = GetContextId(guest_ptr);
+  // (Hunt v1.4.6 ronda 4, A4-R4-07.) assert_true is a no-op in Release:
+  // an out-of-range guest pointer makes GetContextId return -1 and the
+  // code below indexed contexts_[-1]. Fail cleanly instead; the only
+  // caller (XMAReleaseContext) ignores the return, and a context the
+  // guest never allocated is simply not released.
+  if (context_id < 0) {
+    REXAPU_WARN("XMA: ReleaseContext called with out-of-range context {:08X}", guest_ptr);
+    return;
+  }
   assert_true(context_id >= 0);
 
   XmaContext& context = contexts_[context_id];
@@ -228,6 +249,13 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
 
 bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
   auto context_id = GetContextId(guest_ptr);
+  // (Hunt v1.4.6 ronda 4, A4-R4-07.) Same -1 guard as ReleaseContext:
+  // XMADisableContext treats false as X_E_FALSE, which is the honest
+  // answer for a context that does not exist.
+  if (context_id < 0) {
+    REXAPU_WARN("XMA: BlockOnContext called with out-of-range context {:08X}", guest_ptr);
+    return false;
+  }
   assert_true(context_id >= 0);
 
   XmaContext& context = contexts_[context_id];
@@ -365,6 +393,16 @@ void XmaDecoder::Pause() {
   if (!worker_thread_ || !worker_running_) {
     return;
   }
+  // (Hunt v1.4.6 ronda 4, A4-R4-06.) Drain a stale resume signal before
+  // parking: Resume() signals resume_fence_ even when the worker has not
+  // reached its park point yet (pause -> resume -> pause in quick
+  // succession), and Fence has no Reset() — the sticky signal would make
+  // the Wait() below return at once and skip this park. TryConsume only
+  // takes a signal no waiter has registered for; if the worker is already
+  // parked it consumes the signal itself and re-parks (paused_ is set).
+  // Pause/Resume are driven by the SDL lifecycle on one thread, so no
+  // Resume can land between the drain and the paused_ store below.
+  resume_fence_.TryConsume();
   paused_ = true;
 
   if (work_event_) {
