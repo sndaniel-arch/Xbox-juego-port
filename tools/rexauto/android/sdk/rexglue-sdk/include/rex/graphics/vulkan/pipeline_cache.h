@@ -509,15 +509,20 @@ class VulkanPipelineCache {
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, VulkanShader*, rex::IdentityHasher<uint64_t>> shaders_;
 
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) GetTessellationVertexShader,
-  // GetTessellationControlShader and GetGeometryShader below run on the
-  // pipeline creation threads as well as on the command processor thread
-  // (EnsurePipelineCreated), so the lazy caches they mutate must be
-  // serialized: concurrent insertion into std::unordered_map is UB. One
-  // mutex for the three caches: the getters never call each other, and
-  // the shader compile / module creation inside does not call back into
-  // this cache, so holding it across the creation is deadlock-free.
-  // (V-A1-01, same round, second sweep: layouts_mutex_ below is also
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.)
+  // GetTessellationVertexShader, GetTessellationControlShader and
+  // GetGeometryShader below only run on the command processor thread
+  // today: they are reached from TryGetPipelineCreationArgumentsForDescription
+  // (ConfigurePipeline / IssueDraw, and InitializeShaderStorage), never
+  // from the pipeline creation threads — EnsurePipelineCreated only
+  // consumes the pre-looked-up arguments, so the race A1-R4-01 assumed
+  // never existed. The mutex stays as defense in depth: it serializes the
+  // lazy caches if these getters ever move off the processor thread, and
+  // it is never contended today. One mutex for the three caches: the
+  // getters never call each other, and the shader compile / module
+  // creation inside does not call back into this cache, so holding it
+  // across the creation is deadlock-free.
+// (V-A1-01, same round, second sweep: layouts_mutex_ below is also
   // taken for the texture-binding-layout map in TranslateAnalyzedShader.)
   std::mutex lazy_shader_cache_mutex_;
 
