@@ -32,7 +32,51 @@ public final class GraphicsDialog {
     private GraphicsDialog() {
     }
 
+    // (Hunt v1.4.6 ronda 4, A4-R4-09.) One live instance per dialog, same
+    // pattern as PadSettingsDialog: the dialog object is the guard, so a
+    // destroy-without-dismiss cannot stick a boolean (see there). The
+    // graphics, driver and restart dialogs are different dialogs and may
+    // stack over each other by design (restart follows graphics OK); each
+    // is only guarded against a duplicate of itself.
+    private static AlertDialog sDialog;
+    private static Activity sDialogActivity;
+    private static AlertDialog sDriverDialog;
+    private static Activity sDriverActivity;
+    private static AlertDialog sRestartDialog;
+    private static Activity sRestartActivity;
+
+    private static boolean isShowing(AlertDialog dialog, Activity activity) {
+        return dialog != null && dialog.isShowing()
+                && activity != null && !activity.isFinishing() && !activity.isDestroyed();
+    }
+
+    private static void trackGraphicsDialog(Activity activity, AlertDialog dialog) {
+        sDialog = dialog;
+        sDialogActivity = activity;
+        dialog.setOnDismissListener(d -> {
+            if (sDialog == dialog) { sDialog = null; sDialogActivity = null; }
+        });
+    }
+
+    private static void trackDriverDialog(Activity activity, AlertDialog dialog) {
+        sDriverDialog = dialog;
+        sDriverActivity = activity;
+        dialog.setOnDismissListener(d -> {
+            if (sDriverDialog == dialog) { sDriverDialog = null; sDriverActivity = null; }
+        });
+    }
+
+    private static void trackRestartDialog(Activity activity, AlertDialog dialog) {
+        sRestartDialog = dialog;
+        sRestartActivity = activity;
+        dialog.setOnDismissListener(d -> {
+            if (sRestartDialog == dialog) { sRestartDialog = null; sRestartActivity = null; }
+        });
+    }
+
     public static void show(Activity activity) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
+        if (isShowing(sDialog, sDialogActivity)) return;
         GraphicsSettings gs = new GraphicsSettings(activity);
         float dp = activity.getResources().getDisplayMetrics().density;
         int pad = (int) (16 * dp);
@@ -135,7 +179,7 @@ public final class GraphicsDialog {
 
         ScrollView sv = new ScrollView(activity);
         sv.addView(box);
-        new AlertDialog.Builder(activity)
+        AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle(R.string.graphics)
                 .setView(sv)
                 .setPositiveButton(android.R.string.ok, (d, w) -> {
@@ -172,17 +216,24 @@ public final class GraphicsDialog {
                     } catch (Exception e) { Toast.makeText(activity, e.toString(), Toast.LENGTH_LONG).show(); }
                 })
                 .setNegativeButton(android.R.string.cancel, null)
-                .show();
+                .create();
+        trackGraphicsDialog(activity, dialog);
+        dialog.show();
     }
 
     /** After a successful write, offer the restart the settings need. */
     private static void showRestartDialog(Activity activity) {
         if (activity.isFinishing() || activity.isDestroyed()) return;
-        new AlertDialog.Builder(activity)
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) A double-tap on OK ran the
+        // handler twice and stacked two restart offers.
+        if (isShowing(sRestartDialog, sRestartActivity)) return;
+        AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setMessage(R.string.gfx_restart_required)
                 .setPositiveButton(R.string.gfx_restart_now, (d, w) -> restartGame(activity))
                 .setNegativeButton(R.string.gfx_restart_later, null)
-                .show();
+                .create();
+        trackRestartDialog(activity, dialog);
+        dialog.show();
     }
 
     /**
@@ -216,19 +267,29 @@ public final class GraphicsDialog {
     // --- custom GPU driver (Turnip on Adreno, PanVK on Mali) ----------------
 
     public static void showDriverDialog(Activity activity) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
+        if (isShowing(sDriverDialog, sDriverActivity)) return;
         // Experimental gate (user rule: risky core changes behind a switch).
         // The switch lives in the graphics dialog; offer to turn it on here.
         GraphicsSettings gs = new GraphicsSettings(activity);
         if (!gs.experimentalGpuDriver()) {
-            new AlertDialog.Builder(activity)
+            AlertDialog prompt = new AlertDialog.Builder(activity)
                     .setTitle(R.string.gpu_driver)
                     .setMessage(R.string.gpu_driver_experimental_off)
                     .setPositiveButton(R.string.gpu_driver_experimental_enable, (dd, ww) -> {
                         gs.setExperimentalGpuDriver(true);
+                        // The prompt is still showing when this listener
+                        // runs (AlertDialog dismisses after the listener):
+                        // clear its guard entry first, or the recursive
+                        // call below would see it and refuse to open.
+                        sDriverDialog = null;
+                        sDriverActivity = null;
                         showDriverDialog(activity);
                     })
                     .setNegativeButton(android.R.string.cancel, null)
-                    .show();
+                    .create();
+            trackDriverDialog(activity, prompt);
+            prompt.show();
             return;
         }
         GpuDriver gd = new GpuDriver(activity);
@@ -270,6 +331,7 @@ public final class GraphicsDialog {
         AlertDialog dlg = b.create();
         // getListView() is null until the dialog is shown (the ListView is
         // created in onCreate): show first, then attach the listener.
+        trackDriverDialog(activity, dlg);
         dlg.show();
         dlg.getListView().setOnItemLongClickListener((p, v, pos, id) -> {
             if (pos == 0) return true;
