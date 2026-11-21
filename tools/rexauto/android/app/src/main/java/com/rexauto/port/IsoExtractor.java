@@ -116,6 +116,15 @@ public final class IsoExtractor {
         if (vd == null) vd = readSector(32, SECTOR);
         vd.order(ByteOrder.LITTLE_ENDIAN);
         if (!isGdfxMagic(vd)) throw new IOException("no GDFX volume (unsupported layout)");
+        // (Hunt v1.4.6 ronda 4, A4-R4-12.) A truncated GoD volume
+        // descriptor (magic present, fewer than 0x1C bytes) made the two
+        // getInt() calls below throw BufferUnderflowException (unchecked)
+        // instead of a clean "truncated file" error. The plain-ISO path
+        // already throws IOException on a short sector read (R7-F3); the
+        // SVOD descriptor is built with a break-on-short-read loop, so
+        // guard the length here too (Svod's constructor guards its own
+        // build as well).
+        if (vd.remaining() < 0x1C) throw new IOException("truncated volume descriptor");
         long rootSector = vd.getInt(0x14) & 0xFFFFFFFFL;
         long rootSize = vd.getInt(0x18) & 0xFFFFFFFFL;
         List<Entry> out = new ArrayList<>();
