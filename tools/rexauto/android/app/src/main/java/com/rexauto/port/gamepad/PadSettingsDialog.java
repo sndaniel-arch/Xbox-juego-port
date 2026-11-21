@@ -296,7 +296,7 @@ final class PadSettingsDialog {
         if (dialog.getWindow() != null) {
             dialog.getWindow().setGravity(Gravity.CENTER);
         }
-                // (Hunt v1.4.6 ronda 4, A4-R4-09.) Track the live instance for the
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Track the live instance for the
         // isShowing() guard; clear it on dismiss (the == check keeps a
         // newer dialog from being cleared by an older one's dismiss).
         sDialog = dialog;
