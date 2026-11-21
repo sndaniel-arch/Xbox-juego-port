@@ -398,13 +398,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         *out_action = FileAction::kOverwritten;
         break;
       default:
-      // (Hunt v1.4.6, A2-R4-06.) Backstop: NtCreateFile now rejects a
-      // disposition outside 0-5 before calling here, so this is
-      // unreachable from the guest. If a future caller ever passes
-      // one, the file is opened as-is -- but the action is still
-      // written, so the iosb never carries a stale value again.
-      *out_action = FileAction::kOpened;
-      break;
+        // (Hunt v1.4.6, A2-R4-06.) Backstop: NtCreateFile now rejects a
+        // disposition outside 0-5 before calling here, so this is
+        // unreachable from the guest. If a future caller ever passes
+        // one, the file is opened as-is -- but the action is still
+        // written, so the iosb never carries a stale value again.
+        *out_action = FileAction::kOpened;
+        break;
     }
   }
   if (!entry) {
