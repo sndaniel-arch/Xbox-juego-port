@@ -774,9 +774,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // check so the counter is never touched for a no-op call.
   if (!count) {
     REXGPU_ERROR(
-          "CommandProcessor::ExecuteIndirectBuffer: indirect buffer has zero length; refusing to "
-          "execute");
-      return;
+        "CommandProcessor::ExecuteIndirectBuffer: indirect buffer has zero length; refusing to "
+        "execute");
+    return;
   }
 
   // (Caza v1.4.6 ronda 4, A1-R4-03.) Indirect buffers recurse through
