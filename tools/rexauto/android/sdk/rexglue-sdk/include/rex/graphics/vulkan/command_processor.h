@@ -595,14 +595,18 @@ class VulkanCommandProcessor : public CommandProcessor {
       descriptor_set_layouts_single_transient_{};
   VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram_ = VK_NULL_HANDLE;
 
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) GetTextureDescriptorSetLayout and
-  // GetPipelineLayout are called from
-  // TryGetPipelineCreationArgumentsForDescription, which runs on the
-  // pipeline creation threads (via
-  // EnsurePipelineCreated) as well as on the command processor thread,
-  // so both lazy caches must be serialized: concurrent insertion into
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.)
+  // GetTextureDescriptorSetLayout and GetPipelineLayout are called from
+  // TryGetPipelineCreationArgumentsForDescription, which only runs on the
+  // command processor thread today (ConfigurePipeline / IssueDraw, and
+  // InitializeShaderStorage) — never on the pipeline creation threads,
+  // which only consume the pre-looked-up arguments in
+  // EnsurePipelineCreated. The recursive mutex stays as defense in depth:
+  // it serializes both lazy caches (concurrent insertion into
   // std::unordered_map is UB, and GetTextureDescriptorSetLayout also
-  // mutates the shared scratch vector descriptor_set_layout_bindings_.
+  // mutates the shared scratch vector descriptor_set_layout_bindings_) if
+  // this path ever moves off the processor thread, and it is never
+  // contended today.
   // Recursive: GetPipelineLayout calls GetTextureDescriptorSetLayout for
   // the vertex and pixel stages while holding the lock. Neither function
   // is called with the lock already held anywhere else (IssueDraw never
