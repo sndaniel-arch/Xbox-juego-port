@@ -725,6 +725,18 @@ u32 XeKeysAesCbcUsingKey_entry(mapped_void obscured_key, mapped_void inp_ptr, u3
   if (!obscured_key || !inp_ptr || !out_ptr || !feed_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Caza v1.4.6, verificación profunda, FE-01.) XeCryptAesCbc_entry
+  // silently refuses a non-multiple-of-16 inp_size (ronda 4,
+  // A3-R4-10): both loops below process exactly 16 bytes per
+  // iteration, so a partial final block would read/write past the end
+  // of the buffers. Without a guard here this entry would still return
+  // SUCCESS with the output buffer untouched, and the guest would
+  // carry on with stale key material. Real AES-CBC (without padding)
+  // is only defined on whole blocks, so reject the call like the NULL
+  // guard above instead of lying to the guest.
+  if (inp_size % 16 != 0) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint8_t key[16];
 
   // Deobscure key
