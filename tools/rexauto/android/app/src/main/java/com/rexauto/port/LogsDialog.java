@@ -21,6 +21,21 @@ public final class LogsDialog {
     private LogsDialog() {
     }
 
+    // (Hunt v1.4.6 ronda 4, A4-R4-09.) One live instance, same pattern as
+    // PadSettingsDialog: the dialog object is the guard, so a
+    // destroy-without-dismiss cannot stick a boolean (see there). The
+    // crash-report / driver-guard dialogs below are one-shot startup
+    // gates, not double-tappable buttons, so they keep their own flow.
+    private static AlertDialog sDialog;
+    private static Activity sDialogActivity;
+
+    /** True when the log viewer is currently up in a live activity. */
+    private static boolean isShowing() {
+        return sDialog != null && sDialog.isShowing()
+                && sDialogActivity != null
+                && !sDialogActivity.isFinishing() && !sDialogActivity.isDestroyed();
+    }
+
     private static File logsDir(Activity activity) {
         // (Ronda 3, auditor G.) getExternalFilesDir() returns null when
         // external storage is not mounted; GameFiles and DlcAssets already
@@ -164,6 +179,8 @@ public final class LogsDialog {
     }
 
     public static void show(Activity activity) {
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
+        if (isShowing()) return;
         String prev = tail(new File(logsDir(activity), "crash.prev.txt"), 4000);
         String cur = tail(crashFile(activity), 4000);
         String log = tail(gameLog(activity), 200000);
@@ -182,13 +199,24 @@ public final class LogsDialog {
         tv.setPadding(p, p, p, p);
         ScrollView sv = new ScrollView(activity);
         sv.addView(tv);
-        new AlertDialog.Builder(activity)
+        AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle(R.string.logs)
                 .setView(sv)
                 .setPositiveButton(R.string.share, (d, w) -> shareText(activity, BuildConfig.PROJECT + " log", all))
                 .setNeutralButton(R.string.copy, (d, w) -> copyText(activity, all))
                 .setNegativeButton(android.R.string.ok, null)
-                .show();
+                .create();
+        // (Hunt v1.4.6 ronda 4, A4-R4-09.) Track the live instance for the
+        // isShowing() guard; clear it on dismiss.
+        sDialog = dialog;
+        sDialogActivity = activity;
+        dialog.setOnDismissListener(d -> {
+            if (sDialog == dialog) {
+                sDialog = null;
+                sDialogActivity = null;
+            }
+        });
+        dialog.show();
     }
 
     private static void shareText(Activity activity, String subject, String text) {
