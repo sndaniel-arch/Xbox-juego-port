@@ -3341,10 +3341,18 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
 VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool is_vertex,
                                                                             size_t texture_count,
                                                                             size_t sampler_count) {
+  // (Caza v1.4.6 ronda 4, A1-R4-01.) Called from GetPipelineLayout,
+  // which runs on the pipeline creation threads as well as on the
+  // command processor thread: serialize the find + emplace on
+  // descriptor_set_layouts_textures_ and the use of the shared scratch
+  // vector descriptor_set_layout_bindings_ below, which two threads
+  // could otherwise race (UB on unordered_map / vector). Recursive
+  // mutex: GetPipelineLayout holds it while calling this function.
+  std::lock_guard<std::recursive_mutex> layout_lock(pipeline_layout_cache_mutex_);
   size_t binding_count = texture_count + sampler_count;
   if (!binding_count) {
     return descriptor_set_layout_empty_;
-  }
+  } 
 
   TextureDescriptorSetLayoutKey texture_descriptor_set_layout_key;
   texture_descriptor_set_layout_key.texture_count = uint32_t(texture_count);
@@ -3418,6 +3426,18 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
 const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPipelineLayout(
     size_t texture_count_pixel, size_t sampler_count_pixel, size_t texture_count_vertex,
     size_t sampler_count_vertex) {
+  // (Caza v1.4.6 ronda 4, A1-R4-01.) Called from
+  // TryGetPipelineCreationArgumentsForDescription, which runs on the
+  // pipeline creation threads (via EnsurePipelineCreated) as well as on
+  // the command processor thread: serialize the find + emplace on
+  // pipeline_layouts_ below, which two threads could otherwise race (UB
+  // on unordered_map). Held across the GetTextureDescriptorSetLayout
+  // calls below, so the recursive mutex also covers the descriptor set
+  // layout cache and the shared scratch vector; this also closes the
+  // check-then-create TOCTOU (two threads creating the same layout and
+  // one leaking its vkCreatePipelineLayout on the losing emplace).
+  // IssueDraw never takes this lock, so no lock-ordering issue there.
+  std::lock_guard<std::recursive_mutex> layout_lock(pipeline_layout_cache_mutex_);
   PipelineLayoutKey pipeline_layout_key;
   pipeline_layout_key.texture_count_pixel = uint16_t(texture_count_pixel);
   pipeline_layout_key.sampler_count_pixel = uint16_t(sampler_count_pixel);
