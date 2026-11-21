@@ -2324,7 +2324,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
         "VulkanPipelineCache: Failed to create tessellation {} vertex "
         "shader module",
         adaptive ? "adaptive" : "indexed");
-  // (A1-R4-07, same as above: do not cache a transient failure.)
+    // (A1-R4-07, same as above: do not cache a transient failure.)
     attempted = false;
   }
   return shader_module;
@@ -2388,7 +2388,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
         "VulkanPipelineCache: Failed to create tessellation control shader "
         "module 0x{:08X}",
         key.key);
-  // (A1-R4-07, same as above: a failed vkCreateShaderModule — e.g.
+    // (A1-R4-07, same as above: a failed vkCreateShaderModule — e.g.
     // transient driver OOM — must not be cached as VK_NULL_HANDLE.)
     return VK_NULL_HANDLE;
   }
@@ -3528,7 +3528,7 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     REXGPU_ERROR(
         "VulkanPipelineCache: Failed to create the primitive type geometry "
         "shader 0x{:08X}",
-      key.key);
+        key.key);
     return VK_NULL_HANDLE;
   }
   geometry_shaders_.emplace(key, shader_module);
