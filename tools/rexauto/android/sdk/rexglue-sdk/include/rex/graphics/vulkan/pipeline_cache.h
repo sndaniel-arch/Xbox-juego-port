@@ -508,6 +508,7 @@ class VulkanPipelineCache {
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, VulkanShader*, rex::IdentityHasher<uint64_t>> shaders_;
+
   // (Caza v1.4.6 ronda 4, A1-R4-01.) GetTessellationVertexShader,
   // GetTessellationControlShader and GetGeometryShader below run on the
   // pipeline creation threads as well as on the command processor thread
