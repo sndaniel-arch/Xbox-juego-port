@@ -214,6 +214,21 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   if ((xuid_count && !xuids) || !setting_ids) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-13.)
+  // Direct sibling of FE-08 (WriteProfileSettings, same file): R3-22
+  // above only NULL-checked the three guest arrays this function reads
+  // and writes, but none of their ranges was validated. The pointers
+  // arrive here already translated to host pointers, so recover the
+  // guest address with HostToGuestVirtual (same call this function
+  // already uses for the output header below). Only xuids[0] is ever
+  // read (the count is clamped to 1 just below), so 8 bytes is what
+  // this guard covers; the setting_ids array and the out-params are
+  // covered by the guards after the count cap below.
+  if (xuid_count && xuids &&
+      !GuestRangeReadable(REX_KERNEL_MEMORY()->HostToGuestVirtual(xuids),
+                          sizeof(uint64_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   if (!xuid_count) {
     assert_null(xuids);
   } else {
@@ -233,8 +248,28 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-13.)
+  // The setting_ids array (setting_count * 4 bytes) is read in three
+  // loops below. The cap above bounds it to 128 bytes, so the size
+  // cannot overflow; validate the whole array before the first loop.
+  if (!GuestRangeReadable(REX_KERNEL_MEMORY()->HostToGuestVirtual(setting_ids),
+                          static_cast<size_t>(setting_count) * sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   // buffer size pointer must be valid
   if (!buffer_size_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-13.)
+  // *buffer_size_ptr is read just below and written back on the
+  // insufficient-buffer path: validate the 4 bytes readable AND
+  // writable before touching it.
+  if (!GuestRangeReadable(REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer_size_ptr),
+                          sizeof(uint32_t)) ||
+      !GuestRangeWritable(REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer_size_ptr),
+                          sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -283,6 +318,17 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
       *buffer_size_ptr = needed_size;
     }
     return X_ERROR_INSUFFICIENT_BUFFER;
+  }
+
+  // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-13.)
+  // The fill below writes the header + settings into `buffer`
+  // (buffer_size bytes; the size check above guarantees
+  // buffer_size >= needed_size). Validate the whole destination range
+  // first -- placed here, after the insufficient-buffer early return,
+  // so the size-query path (buffer NULL or too small, buffer never
+  // touched) keeps returning X_ERROR_INSUFFICIENT_BUFFER unchanged.
+  if (!GuestRangeWritable(REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer), buffer_size)) {
+    return X_ERROR_INVALID_PARAMETER;
   }
 
   // Title ID = 0 means us.
@@ -381,7 +427,15 @@ u32 XamUserReadProfileSettingsEx_entry(u32 title_id, u32 user_index, u32 xuid_co
 u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_count,
                                       ppc_ptr_t<X_USER_PROFILE_SETTING> settings,
                                       ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
-  if (!setting_count || !settings) {
+  if (!settings) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  // (Verificacion profunda, FE-08.) setting_count is guest-controlled
+  // (u32) and had no upper bound, while the sister read
+  // XamUserReadProfileSettingsEx caps it at 1..32 in this same file
+  // (:232). Apply the same cap here: the game passes only a few
+  // settings.
+  if (setting_count < 1 || setting_count > 32) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -397,6 +451,18 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
 
   // Update and save settings.
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+
+  // (Verificacion profunda, FE-08.) Validate the whole settings array
+  // (setting_count * 40 bytes; X_USER_PROFILE_SETTING is 40 bytes per
+  // static_assert_size in user_profile.h) before the loop reads
+  // settings[n]: a short array crossing the end of the mapping used to
+  // SIGSEGV the host. setting_count <= 32 here, so the size cannot
+  // overflow. Checked here, after the user_index early return, so the
+  // NO_SUCH_USER path is unchanged.
+  if (!GuestRangeReadable(settings.guest_address(),
+                          setting_count * sizeof(X_USER_PROFILE_SETTING))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
