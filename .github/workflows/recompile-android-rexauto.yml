@@ -160,7 +160,18 @@ jobs:
   recompile:
     name: "codegen + static heal (windows)"
     runs-on: windows-2022
-    timeout-minutes: 350
+    # (A5-R4-05, ronda 4.) Job timeout is the platform ceiling: GitHub
+    # documents 360 min as the job default and the GitHub-hosted execution
+    # limit is 6 h, so 360 is the most this job can ever get. The six step
+    # timeouts below sum to 350 (10 + 10 + 30 + 60 + 60 + 180), so every
+    # step budget is honourable inside the job budget, with 10 min left
+    # for the untimed steps (checkouts, manifest/functions injection,
+    # localize, pack -- typically ~10 min in a normal run). Previously the
+    # steps summed to 510 against a 350-min job (phase 1 + phase 2 alone
+    # were 360 > 350), so the 240-min phase-2 budget could never be
+    # honoured in full. (V-A5-01 added the Python-deps timeout to the
+    # count: it was untimed before, so the old sum missed it.)
+    timeout-minutes: 360
     outputs:
       title: ${{ steps.meta.outputs.title }}
       title_id: ${{ steps.meta.outputs.title_id }}
@@ -213,12 +224,38 @@ jobs:
           Copy-Item tools/rexauto/tools/ci_fetch.py rexauto/tools/ci_fetch.py
           if (-not (Select-String -Path rexauto/tools/ci_fetch.py -Pattern "downloaded_sha256" -Quiet)) { Write-Host "::error::tracked ci_fetch.py does not emit downloaded_sha256"; exit 1 }
 
+      - name: Gate codegen/runtime SDK version skew (A5-R4-04)
+        shell: pwsh
+        run: |
+          # (A5-R4-04, ronda 4.) Codegen runs the 0.10.1 repack bundle
+          # while the Android runtime builds from SDK 0.10.0 + patches: a
+          # major.minor skew would compile generated code against a
+          # different SDK than the one that generated it. Patch-level skew
+          # (0.10.1 vs 0.10.0) is a KNOWN, ACCEPTED divergence: the Android
+          # patches were written against 0.10.0 and must NOT be rebased to
+          # 0.10.1 without re-verifying every patch (see also the comment
+          # on SDK_TAG in tools/rexauto/tools/android_sdk.sh). Fail only
+          # when major.minor differ.
+          $bundleUrl = "${{ env.REXGLUE_BUNDLE_URL }}"
+          $m = [regex]::Match($bundleUrl, "rexglue-sdk-(\d+)\.(\d+)\.\d+-")
+          if (-not $m.Success) { Write-Host "::error::could not parse codegen SDK version from REXGLUE_BUNDLE_URL: $bundleUrl"; exit 1 }
+          $codegen = "$($m.Groups[1].Value).$($m.Groups[2].Value)"
+          $tagLine = Select-String -Path tools/rexauto/tools/android_sdk.sh -Pattern '^SDK_TAG="v\d+\.\d+\.\d+"' | Select-Object -First 1
+          if (-not $tagLine) { Write-Host "::error::SDK_TAG not found in tools/rexauto/tools/android_sdk.sh"; exit 1 }
+          $t = [regex]::Match($tagLine.Line, 'v(\d+)\.(\d+)\.\d+')
+          if (-not $t.Success) { Write-Host "::error::could not parse SDK_TAG from: $($tagLine.Line)"; exit 1 }
+          $runtime = "$($t.Groups[1].Value).$($t.Groups[2].Value)"
+          Write-Host "codegen SDK (bundle): $codegen; runtime SDK (android_sdk.sh SDK_TAG): $runtime"
+          if ($codegen -ne $runtime) { Write-Host "::error::SDK major.minor skew: codegen bundle is $codegen but the Android runtime builds from $runtime -- generated code would be compiled against a different SDK than the one that generated it"; exit 1 }
+          Write-Host "SDK major.minor match ($codegen); patch-level skew is known and accepted"
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Python deps
         shell: pwsh
+        timeout-minutes: 10
         run: |
           # gdown: rexauto tools/ci_fetch.py calls gdown.download(..., fuzzy=True)
           # and installs gdown itself with plain `pip install gdown` (no
@@ -228,7 +265,14 @@ jobs:
           # REMOVED fuzzy (run #3 died on the same TypeError). Verified
           # against the real wheels: 6.5.1 has no fuzzy, 5.2.0 has it.
           python -m pip install -q --upgrade pip "pillow==13.0.0" "gdown==5.2.0"
-          python -c "import gdown; print('gdown version:', gdown.__version__)"
+          # (A5-R4-02, ronda 4.) pwsh only reports the LAST native
+          # command's exit code ($LASTEXITCODE): a failed pip install used
+          # to be masked by the import below succeeding against the
+          # runner's stale pre-installed gdown (runs #2/#3 died later on
+          # the fuzzy TypeError). Fail here on a bad pip exit, and assert
+          # the exact pinned version instead of only printing it.
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pip install failed (exit $LASTEXITCODE) -- refusing to continue with a possibly stale pre-installed gdown"; exit 1 }
+          python -c "import gdown; assert gdown.__version__ == '5.2.0', gdown.__version__; print('gdown version:', gdown.__version__)"
 
       - name: Toolchain
         shell: pwsh
@@ -278,7 +322,7 @@ jobs:
       - name: Verify ReXGlue SDK bundle SHA-256
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        timeout-minutes: 30
+        timeout-minutes: 10
         run: |
           # (A-2.) The install step downloads the zip into a temp file and
           # DELETES it (gui/setup.py), so the hash cannot be checked after
@@ -301,7 +345,7 @@ jobs:
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         working-directory: rexauto
-        timeout-minutes: 60
+        timeout-minutes: 30
         env:
           REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
         run: |
@@ -328,7 +372,27 @@ jobs:
         timeout-minutes: 60
         shell: pwsh
         working-directory: rexauto
-        run: python tools/ci_fetch.py "${{ inputs.iso_url }}" "${{ runner.temp }}\input"
+        run: |
+          # (V-A5-02, ronda 4.) ci_fetch.py is single-attempt on all three
+          # fetch paths (gdown / mega.py / urllib -- no retry inside), so a
+          # transient network blip used to kill the whole run. Retry up to
+          # 3 times, wiping the input dir between attempts: a partial
+          # download must never be mistaken for a complete one on retry
+          # (the direct-URL path truncates with "wb", but gdown's
+          # existing-file behaviour is unverified). The step timeout (60)
+          # still bounds the total: retries only help fast failures.
+          # ci_fetch.py writes its GITHUB_OUTPUT only on success, so a
+          # failed attempt leaves no stale outputs behind.
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            python tools/ci_fetch.py "${{ inputs.iso_url }}" "${{ runner.temp }}\input"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -ge 3) { Write-Host "::error::game input download failed after 3 attempts"; exit 1 }
+            Write-Host "::warning::game input download attempt $attempt failed, wiping partial input and retrying in 30s..."
+            Remove-Item -Recurse -Force "${{ runner.temp }}\input" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 30
+          }
 
       - name: Verify ISO SHA-256 (if provided)
         if: inputs.iso_sha256 != ''
@@ -370,7 +434,7 @@ jobs:
 
       - name: Recompile (extract + init)
         shell: pwsh
-        timeout-minutes: 120
+        timeout-minutes: 60
         working-directory: rexauto
         run: |
           # Phase 1 of the two-phase recompile: run rexauto only up to the
@@ -589,7 +653,7 @@ jobs:
 
       - name: Recompile (codegen + static heal + build check)
         shell: pwsh
-        timeout-minutes: 240
+        timeout-minutes: 180
         working-directory: rexauto
         run: |
           # Phase 2: resume from setjmp with the injected manifest.
@@ -815,6 +879,7 @@ jobs:
 
       - name: ReXGlue SDK (v0.10.0 + Android patches)
         working-directory: rexauto
+        timeout-minutes: 30
         run: tools/android_sdk.sh
 
       - name: Re-overlay tracked SDK files (after SDK setup)
@@ -835,6 +900,14 @@ jobs:
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_device.cpp
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_entry.cpp
           test -f rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_file.cpp
+          # (Ronda 4, A4-R4-01.) SDLActivity.java is a tracked overlay file,
+          # but android_sdk.sh re-stages the STOCK SDL3 Java glue over
+          # rexauto/android/app/src/main/java/org/libsdl/app/ AFTER the
+          # port-tree overlay (cp *.java) — without this line every build
+          # would silently lose the onDestroy fix. Tracked file wins over
+          # the stock glue by design, same as the SDK files above.
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java
 
       - name: Guard tracked SDK files carry their patch hunks (M-5)
         run: |
@@ -919,6 +992,7 @@ jobs:
           done
 
       - name: Stage assets (title DB, cover, launcher icon)
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           mkdir -p rexauto/android/app/src/main/assets
@@ -1000,6 +1074,19 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      - name: Guard CI versionCode stays below the FULL range (A5-R4-01)
+        run: |
+          set -euo pipefail
+          # (A5-R4-01, ronda 4.) CI versionCode is github.run_number and
+          # FULL releases use 1_000_000 + major*10000 + minor*100 + patch
+          # (v1.4.6 FULL = 1010406). Android orders updates by versionCode
+          # only, so a CI run_number >= 1_000_000 would ship a CI APK that
+          # no FULL release can update over (downgrade). Fail here, before
+          # Gradle, if the run number ever reaches the FULL range. The CI
+          # versionName stays "1.<run_number>" by design.
+          if [ "${{ github.run_number }}" -ge 1000000 ]; then echo "::error::github.run_number ${{ github.run_number }} reached the FULL versionCode range (>= 1000000) -- CI codes must stay below 1_000_000; see the FULL versionCode scheme"; exit 1; fi
+          echo "CI versionCode ${{ github.run_number }} < 1000000 (FULL range starts at 1000000)"
+
       - name: Gradle assembleRelease
         timeout-minutes: 120
         env:
@@ -1039,9 +1126,10 @@ jobs:
           # libadrenotools the loader compiles to a no-op (the app
           # CMakeLists only warns when the checkout is missing) and the
           # whole driver UI stays live but dead — import/select would
-          # silently do nothing. Both .so files are in the current APK
-          # (verified in the local Nov 13 build: libadrenotools.so +
-          # libmain_hook.so), so this gate passes on a healthy build and
+          # silently do nothing. All five .so files ship in the current APK
+          # (the first two verified in the local Nov 13 build:
+          # libadrenotools.so + libmain_hook.so), so this gate passes on a
+          # healthy build and
           # only fires when the driver sources never reached the build
           # (the android_sdk.sh clone) or CMake skipped them.
           # (Ronda 5, auditor A — R5-A1.) The old message pointed at
@@ -1051,7 +1139,14 @@ jobs:
           # by the 'ReXGlue SDK' step (tools/android_sdk.sh clones
           # bylaws/libadrenotools at the pinned rev); the repo checkout
           # does not carry them (nested .git, no .gitmodules at the root).
-          grep -q "lib/arm64-v8a/libadrenotools.so" /tmp/apk.txt && grep -q "lib/arm64-v8a/libmain_hook.so" /tmp/apk.txt || { echo "::error::libadrenotools not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
+          # (A5-R4-10, ronda 4.) Check ALL FIVE adrenotools libs, not just
+          # the first two: the app CMakeLists (app/src/main/cpp/CMakeLists.txt)
+          # ships libadrenotools.so + libmain_hook.so + libhook_impl.so +
+          # libfile_redirect_hook.so + libgsl_alloc_hook.so, and the driver
+          # loader needs libhook_impl.so at runtime (hook_android_dlopen_ext).
+          for _lib in libadrenotools.so libmain_hook.so libhook_impl.so libfile_redirect_hook.so libgsl_alloc_hook.so; do
+            grep -q "lib/arm64-v8a/$_lib" /tmp/apk.txt || { echo "::error::$_lib not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
+          done
           # Hunt 2, P2-5: el verify es el ultimo control antes de subir el
           # artefacto y debe validar la firma (que la APK se pueda instalar).
           # Con pipefail (arriba) un verify fallido mata el paso.
@@ -1106,15 +1201,18 @@ jobs:
         if: always()
         run: |
           # (Ronda 4, G-F3.) set -e: a failed rsync used to leave a partial
-          # source-... artifact with exit 0. The guarded commands below
-          # already tolerate failure ([ -d ... ] && ... and ... || true),
-          # so -e only kills the step on a real copy failure.
+          # source-... artifact with exit 0. Only the optional port rsync
+          # below tolerates failure ([ -d ... ] && ...); the two cp's are
+          # required -- the README written in this step tells the user to
+          # build with ./android_sdk.sh, so a failed cp must fail the step
+          # (A5-R4-07: the old `2>/dev/null || true` swallowed both).
           set -euo pipefail
           OUT="${{ runner.temp }}/source-${{ env.REX_PROJECT }}"
           mkdir -p "$OUT"
           rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' rexauto/android/ "$OUT/android/"
           [ -d "autoports/${{ env.REX_PROJECT }}/port" ] && rsync -a --exclude build "autoports/${{ env.REX_PROJECT }}/port/" "$OUT/port/"
-          cp rexauto/tools/android_sdk.sh "$OUT/" && cp -r rexauto/android/patches "$OUT/android/" 2>/dev/null || true
+          cp rexauto/tools/android_sdk.sh "$OUT/"
+          cp -r rexauto/android/patches "$OUT/android/"
           cat > "$OUT/README.txt" <<EOF2
           ${{ env.REX_PROJECT }} -- Android project sources
 
