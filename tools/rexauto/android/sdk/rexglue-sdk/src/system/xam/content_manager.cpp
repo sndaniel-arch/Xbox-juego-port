@@ -274,9 +274,9 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   if (!std::filesystem::exists(parent_path, ec_r316_3)) {
     std::error_code ec;
     // (Second sweep, V-A2-02.) Same already-exists class as A2-R4-16:
-// create_directories returns false with a clean error_code when the
-// directory already exists (a racing thread created it after the
-// exists() check above) -- that is success, not failure.
+    // create_directories returns false with a clean error_code when the
+    // directory already exists (a racing thread created it after the
+    // exists() check above) -- that is success, not failure.
     if (!std::filesystem::create_directories(parent_path, ec) && ec) {
       return X_ERROR_ACCESS_DENIED;
     }
@@ -392,10 +392,10 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   }
   std::error_code ec;
   // (Second sweep, V-A2-02.) Same already-exists class as A2-R4-16:
-// create_directories returns false with a clean error_code when the
-// directory already exists (a racing thread created it after the
-// exists() check above, which already returns ALREADY_EXISTS) -- that
-// is success, not ACCESS_DENIED.
+  // create_directories returns false with a clean error_code when the
+  // directory already exists (a racing thread created it after the
+  // exists() check above, which already returns ALREADY_EXISTS) -- that
+  // is success, not ACCESS_DENIED.
   if (!std::filesystem::create_directories(package_path, ec) && ec) {
     return X_ERROR_ACCESS_DENIED;
   }
@@ -702,10 +702,10 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
 
   std::string resolved_path = "";
   // (Hunt v1.4.6, A2-R4-08.) The FindSymbolicLink return used to be
-// ignored: when the symlink is not registered, resolved_path stays
-// "" and utf8_starts_with(x, "") is true, so EVERY open XFile in the
-// process got its handle released. Nothing belongs to this content
-// when its symlink is missing -- release nothing.
+  // ignored: when the symlink is not registered, resolved_path stays
+  // "" and utf8_starts_with(x, "") is true, so EVERY open XFile in the
+  // process got its handle released. Nothing belongs to this content
+  // when its symlink is missing -- release nothing.
   if (!kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':', resolved_path)) {
     return;
   }
