@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <memory>
+
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -81,25 +84,36 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto run = [dialog, close_callback]() -> X_RESULT {
-    // (Hunt v1.4.6, ronda 3, A3-R3-18.) result was uninitialised: it
-    // is only assigned inside the close callback, which never runs
-    // when there is no UI thread (the else branch below just deletes
-    // the dialog). The caller then returned stack garbage.
-    X_RESULT result = X_ERROR_FUNCTION_FAILED;
+    // (Hunt v1.4.6, ronda 4, A3-R4-16.) The result lives in a shared_ptr
+    // so the close callback stays valid if the fence wait below times
+    // out and run() returns while the dialog is still open: the old
+    // code captured a stack `result` by reference, which would dangle
+    // the moment run() returned early.
+    auto result_state = std::make_shared<X_RESULT>(X_ERROR_FUNCTION_FAILED);
     dialog->set_close_callback(
-        [&dialog, &result, &close_callback]() { result = close_callback(dialog); });
+        [dialog, result_state, close_callback]() { *result_state = close_callback(dialog); });
     rex::thread::Fence fence;
     rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
     if (app_context &&
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
-      fence.Wait();
+      // (Hunt v1.4.6, ronda 4, A3-R4-16.) The old unbounded fence.Wait()
+      // hung the guest thread forever if the UI thread stalled with the
+      // dialog up. Wait at most 1000 ms (same timeout as the A4-R3-02
+      // pause fences); on timeout the dialog is left open for the user
+      // to dismiss later and the guest thread gets FUNCTION_FAILED
+      // instead of hanging. The dialog deletes itself on Close, and the
+      // close callback above owns result_state, so nothing dangles.
+      if (!fence.WaitFor(std::chrono::milliseconds(1000))) {
+        REXKRNL_WARN("xeXamDispatchDialog: dialog fence timed out after 1000 ms; returning "
+                     "FUNCTION_FAILED, dialog left open");
+      }
       --xam_dialogs_shown_;
     } else {
       delete dialog;
     }
     // dialog should be deleted at this point!
-    return result;
+    return *result_state;
   };
   auto post = []() {
     rex::thread::Sleep(std::chrono::milliseconds(100));
@@ -130,23 +144,35 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     // (Hunt v1.4.6, ronda 3, A3-R3-18.) As in xeXamDispatchDialog:
     // result/extended_error/length are only assigned inside the close
     // callback, which never runs when there is no UI thread.
-    X_RESULT result = X_ERROR_FUNCTION_FAILED;
-    extended_error = X_ERROR_FUNCTION_FAILED;
-    length = 0;
-    dialog->set_close_callback([&dialog, &result, &extended_error, &length, &close_callback]() {
-      result = close_callback(dialog, extended_error, length);
+    // (Hunt v1.4.6, ronda 4, A3-R4-16.) The outcome lives in shared
+    // state for the same reason as in xeXamDispatchDialog: the fence
+    // wait below can time out and return early while the dialog is
+    // still open.
+    struct DialogExOutcome {
+      X_RESULT result = X_ERROR_FUNCTION_FAILED;
+      uint32_t extended_error = X_ERROR_FUNCTION_FAILED;
+      uint32_t length = 0;
+  };
+    auto outcome = std::make_shared<DialogExOutcome>();
+    dialog->set_close_callback([dialog, outcome, close_callback]() {
+      outcome->result = close_callback(dialog, outcome->extended_error, outcome->length);
     });
     rex::thread::Fence fence;
     if (app_context &&
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
-      fence.Wait();
+      if (!fence.WaitFor(std::chrono::milliseconds(1000))) {
+        REXKRNL_WARN("xeXamDispatchDialogEx: dialog fence timed out after 1000 ms; returning "
+                     "FUNCTION_FAILED, dialog left open");
+      }
       --xam_dialogs_shown_;
     } else {
       delete dialog;
     }
     // dialog should be deleted at this point!
-    return result;
+    extended_error = outcome->extended_error;
+    length = outcome->length;
+    return outcome->result;
   };
   auto post = []() {
     rex::thread::Sleep(std::chrono::milliseconds(100));
@@ -205,7 +231,12 @@ X_RESULT xeXamDispatchHeadlessEx(std::function<X_RESULT(uint32_t&, uint32_t&)> r
   };
   if (!overlapped) {
     pre();
-    uint32_t extended_error, length;
+    // (Hunt v1.4.6, ronda 4, A3-R4-17.) Same class as R3-18 in the
+    // dispatchers with callers: these were passed to the callback
+    // uninitialised. This dispatcher currently has no callers, but the
+    // fix is the same one-liner as R3-18.
+    uint32_t extended_error = X_ERROR_FUNCTION_FAILED;
+    uint32_t length = 0;
     auto result = run_callback(extended_error, length);
     post();
     // TODO(gibbed): do something with extended_error/length?
@@ -287,7 +318,15 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  REXKRNL_DEBUG(
+// (Hunt v1.4.6, ronda 4, A3-R4-16.) A message box with no buttons
+  // can never be closed: the guest thread would wait on its fence
+  // forever. And active_button must name one of the buttons — the
+  // headless path and the close callback both return it as the result.
+  if (!button_count || active_button >= button_count) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  
+      REXKRNL_DEBUG(
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
       uint32_t(button_count), button_ptrs.guest_address(), uint32_t(active_button), uint32_t(flags),
@@ -455,6 +494,45 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 4, A3-R4-06.) buffer_length is guest controlled
+  // (u32): the old code memset buffer_length * 2 bytes from it — up to
+  // ~8 GiB past the end of the mapping — and built a dialog with a
+  // buffer_length + 1 vector, which wrapped to 0 at 0xFFFFFFFF and
+  // could resize to 4 GiB. Keyboard input is short text: reject
+  // anything over 4096 UTF-16 code units, and validate the destination
+  // range before the memset below runs. The +1 below is computed in
+  // size_t, so it cannot wrap.
+  if (buffer_length > 4096) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  {
+    size_t buffer_size_check = static_cast<size_t>(buffer_length) * 2;
+    uint32_t buffer_guest = buffer.guest_address();
+    bool range_ok = true;
+    if (buffer_size_check > UINT32_MAX - buffer_guest) {
+      range_ok = false;
+    } else if (buffer_size_check) {
+      uint32_t high_address = buffer_guest + static_cast<uint32_t>(buffer_size_check) - 1;
+      rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(buffer_guest);
+      const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+      range_ok = start_heap && end_heap;
+      if (range_ok) {
+        bool start_physical =
+            start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+        bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+        range_ok = start_physical == end_physical &&
+                   !(start_physical && start_heap != end_heap);
+      }
+      if (range_ok && start_heap == end_heap) {
+        range_ok = start_heap->QueryRangeAccess(buffer_guest, high_address) ==
+                   rex::memory::PageAccess::kReadWrite;
+      }
+    }
+    if (!range_ok) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+  }
+  
   assert_true(overlapped.guest_address() != 0);
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
@@ -505,7 +583,9 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                      : "";
 
     if (imgui_drawer) {
-      uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
+      // (Hunt v1.4.6, ronda 4, A3-R4-06.) +1 in size_t: the old u32
+      // arithmetic wrapped 0xFFFFFFFF + 1 to 0.
+      size_t buffer_length_safe = static_cast<size_t>(buffer_length) + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
           new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,
                                   buffer_length_safe),
@@ -585,12 +665,17 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
 
 uint32_t XamShowMessageBoxUIEx_entry() {
   // TODO(tomc): implement properly
+  // (Hunt v1.4.6, ronda 4, A3-R4-15.) The old code returned 0 (success)
+  // without doing anything: the game believed the dialog had been shown
+  // and answered. The honest answer until this is implemented is the
+  // same FUNCTION_FAILED the other unimplemented UI stubs in this file
+  // return (XamShowPartyUI, XamShowCommunitySessionsUI).
   static bool warned = false;
   if (!warned) {
     REXKRNL_WARN("[STUB] XamShowMessageBoxUIEx - not implemented");
     warned = true;
   }
-  return 0;
+  return X_ERROR_FUNCTION_FAILED;
 }
 
 }  // namespace xam
