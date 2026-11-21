@@ -86,7 +86,7 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
                                        pKeDebugMonitorData + 4);
       auto lpKeDebugMonitorData =
           memory_->TranslateVirtual<X_KEDEBUGMONITORDATA*>(pKeDebugMonitorData + 4);
-      std::memset(lpKeDebugMonitorData, 0, sizeof(X_KEDEBUGMONITORDATA);
+      std::memset(lpKeDebugMonitorData, 0, sizeof(X_KEDEBUGMONITORDATA));
     }
     // TODO: JIT - GenerateTrampoline requires JIT
     // lpKeDebugMonitorData->callback_fn =
@@ -114,7 +114,7 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
                                        pKeCertMonitorData + 4);
       auto lpKeCertMonitorData =
           memory_->TranslateVirtual<X_KECERTMONITORDATA*>(pKeCertMonitorData + 4);
-      std::memset(lpKeCertMonitorData, 0, sizeof(X_KECERTMONITORDATA);
+      std::memset(lpKeCertMonitorData, 0, sizeof(X_KECERTMONITORDATA));
     }
     // TODO: JIT - GenerateTrampoline requires JIT
     // lpKeCertMonitorData->callback_fn =
@@ -234,12 +234,12 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
     memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 0, 0);
     memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 8, 0);
     memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
-                                     chrono::Clock::QueryGuestUptimeMillis));
+                                     chrono::Clock::QueryGuestUptimeMillis());
     memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
     timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
         std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
           memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
-                                           chrono::Clock::QueryGuestUptimeMillis));
+                                           chrono::Clock::QueryGuestUptimeMillis());
         });
   } else {
     REXKRNL_ERROR("XboxkrnlModule: SystemHeapAlloc failed for KeTimeStampBundle");
