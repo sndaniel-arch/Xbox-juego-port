@@ -152,7 +152,7 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
       X_RESULT result = X_ERROR_FUNCTION_FAILED;
       uint32_t extended_error = X_ERROR_FUNCTION_FAILED;
       uint32_t length = 0;
-  };
+    };
     auto outcome = std::make_shared<DialogExOutcome>();
     dialog->set_close_callback([dialog, outcome, close_callback]() {
       outcome->result = close_callback(dialog, outcome->extended_error, outcome->length);
@@ -318,15 +318,15 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     return X_ERROR_INVALID_PARAMETER;
   }
 
-// (Hunt v1.4.6, ronda 4, A3-R4-16.) A message box with no buttons
+  // (Hunt v1.4.6, ronda 4, A3-R4-16.) A message box with no buttons
   // can never be closed: the guest thread would wait on its fence
   // forever. And active_button must name one of the buttons — the
   // headless path and the close callback both return it as the result.
   if (!button_count || active_button >= button_count) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  
-      REXKRNL_DEBUG(
+
+  REXKRNL_DEBUG(
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
       uint32_t(button_count), button_ptrs.guest_address(), uint32_t(active_button), uint32_t(flags),
@@ -532,7 +532,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
       return X_ERROR_INVALID_PARAMETER;
     }
   }
-  
+
   assert_true(overlapped.guest_address() != 0);
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
