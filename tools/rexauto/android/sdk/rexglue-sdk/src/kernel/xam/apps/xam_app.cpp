@@ -23,6 +23,41 @@ using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
 
+// (Hunt v1.4.6, ronda 4, A3-R4-07.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memset/memcpy. Same
+// heap validation as A2-R3-01 (see xam_user.cpp for the full comment).
+static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_address,
+                                 size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = memory->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
 XamApp::XamApp(KernelState* kernel_state) : App(kernel_state, 0xFE) {}
 
 X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
@@ -41,27 +76,51 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         rex::be<uint32_t> length_ptr;
         rex::be<uint32_t> unk_1C;
       }* data = reinterpret_cast<message_data*>(buffer);
+      // (Hunt v1.4.6, ronda 4, A3-R4-07.) The message struct itself is
+      // read from the guest buffer before anything else: validate its
+      // 32 bytes first. The old code then read extra->handle BEFORE the
+      // (dead)!extra check — TranslateVirtual never returns null — and
+      // memsets buffer_size bytes from an unvalidated pointer. Validate
+      // the extra struct and the destination range before touching
+      // either, and pass buffer_size to WriteItems so the enumerator
+      // truncates to what fits (A3-R4-03).
+      if (!GuestRangeAccessible(memory_, buffer_ptr, sizeof(message_data), false)) {
+        return X_E_INVALIDARG;
+      }
       REXKRNL_DEBUG(
           "XamAppEnumerateContentAggregate({}, {:08X}, {:08X}, {:08X}, {}, "
           "{:08X}, {:08X}, {:08X})",
           (uint32_t)data->user_index, (uint32_t)data->unk_04, (uint32_t)data->extra_ptr,
           (uint32_t)data->buffer_ptr, (uint32_t)data->buffer_size, (uint32_t)data->unk_14,
           (uint32_t)data->length_ptr, (uint32_t)data->unk_1C);
+      if (!GuestRangeAccessible(memory_, static_cast<uint32_t>(data->extra_ptr),
+                                sizeof(X_KENUMERATOR_CONTENT_AGGREGATE), false)) {
+        return X_E_INVALIDARG;
+      }
       auto extra = memory_->TranslateVirtual<X_KENUMERATOR_CONTENT_AGGREGATE*>(data->extra_ptr);
-      auto buffer = memory_->TranslateVirtual(data->buffer_ptr);
       auto e = kernel_state_->object_table()->LookupObject<XEnumerator>(extra->handle);
-      if (!e || !buffer || !extra) {
+      if (!e) {
         return X_E_INVALIDARG;
       }
       assert_true(extra->magic == kXObjSignature);
+      auto buffer = memory_->TranslateVirtual(data->buffer_ptr);
+      if (data->buffer_size &&
+          !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->buffer_ptr),
+                                static_cast<uint32_t>(data->buffer_size), true)) {
+        return X_E_INVALIDARG;
+      }
       if (data->buffer_size) {
         std::memset(buffer, 0, data->buffer_size);
       }
       uint32_t item_count = 0;
-      auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count);
+      auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count, data->buffer_size);
 
       if (result == X_ERROR_SUCCESS && item_count >= 1) {
         if (data->length_ptr) {
+          if (!GuestRangeAccessible(memory_, static_cast<uint32_t>(data->length_ptr),
+                                    sizeof(uint32_t), true)) {
+            return X_E_INVALIDARG;
+          }
           auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
           *length_ptr = 1;
         }
