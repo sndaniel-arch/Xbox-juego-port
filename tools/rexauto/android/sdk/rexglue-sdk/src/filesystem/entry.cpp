@@ -111,12 +111,31 @@ Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
 
 bool Entry::Delete(Entry* entry) {
   auto global_lock = global_critical_region_.Acquire();
+    if (!entry) {
+        return false;
+    }
   if (is_read_only()) {
     return false;
   }
   if (entry->parent() != this) {
     return false;
   }
+    // (Hunt v1.4.6, A2-R4-03.) The open-handle count used to be consulted
+    // only by the delete-on-close path (ReleaseOpenHandle): deleting an
+    // entry with live handles freed the Entry object out from under the
+    // File/XFile objects pointing at it (XFile::~XFile dereferences the
+    // entry after destroying the file), a use-after-free. Refuse the
+    // delete while any handle is open -- BEFORE DeleteEntryInternal, so a
+    // refused delete removes neither the entry nor the host file. Every
+    // caller already handles a false return: kSuperscede fails with
+    // ACCESS_DENIED, kOverwrite/kOverwriteIf fall back to Truncate, the
+    // stale-entry invalidation keeps the entry (its next open then fails
+    // honestly on the missing host file), and DeletePath reports failure
+    // to DeleteFileA/RemoveDirectoryA. The delete-on-close path is
+    // unaffected: ReleaseOpenHandle only calls Delete() at count zero.
+    if (entry->open_handle_count() > 0) {
+        return false;
+    }
   if (!DeleteEntryInternal(entry)) {
     return false;
   }
@@ -171,6 +190,23 @@ X_STATUS Entry::Rename(const std::filesystem::path& file_path) {
     // Drop root path (for example, "game:").
     path_parts.erase(path_parts.begin());
   }
+
+    // (Hunt v1.4.6, A2-R4-07.) The rename path never goes through the VFS
+    // canonicalization that resolves ".." on reads
+    // (utf8_canonicalize_guest_path), and HostPathEntry joins the parts
+    // verbatim onto the device root -- so a target like
+    // "game:..\..\evil.dat" renamed the file above the device root.
+    // Reject ".." components outright instead of canonicalizing: a rename
+    // target is a single destination name, never a path that needs to
+    // climb, so no legitimate rename trips this. Both callers inherit the
+    // fix (NtSetInformationFile rename and CRT MoveFileA); MoveFileA stays
+    // consistent because its exists-check uses the canonicalized path and
+    // a ".." destination now fails the rename either way.
+    for (const auto& part : path_parts) {
+        if (part == "..") {
+            return X_STATUS_INVALID_PARAMETER;
+        }
+    }
 
   X_STATUS status = RenameEntryInternal(path_parts);
   if (status != X_STATUS_SUCCESS) {
