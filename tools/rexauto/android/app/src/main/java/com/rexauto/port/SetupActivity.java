@@ -357,7 +357,7 @@ public class SetupActivity extends Activity {
             File dest = GameFiles.gameDir(this);
             File staging = importStagingDir(dest);
             try {
-                                // (Hunt v1.4.6 ronda 4, A4-R4-02.) Everything below used to
+                // (Hunt v1.4.6 ronda 4, A4-R4-02.) Everything below used to
                 // write straight into dest: a failure after default.xex
                 // landed left a partial folder that hasValidGameRoot
                 // accepted (it only checked existence), and the skip-by-size
@@ -586,7 +586,6 @@ public class SetupActivity extends Activity {
     }
 
     /**
-         /**
      * Promote a complete staged import to the game dir. The old install
      * (if any) is first renamed aside, then staging takes its place by
      * rename — both renames are within the same parent, so the swap never
@@ -610,6 +609,7 @@ public class SetupActivity extends Activity {
         }
         deleteTree(backup);
     }
+
     /** Same file as xex, but under dest after promotion (xex lived in staging). */
     private static File promotedXex(File staging, File dest, File xex) {
         String rel = staging.toURI().relativize(xex.toURI()).getPath();
