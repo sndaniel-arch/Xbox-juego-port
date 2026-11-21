@@ -45,12 +45,23 @@ set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
 #     dispatcher; per-call overhead is the CPU bottleneck on phones.
 #   * -fno-semantic-interposition / hidden visibility: lets LTO inline across
 #     the runtime library instead of going through the GOT.
+#   * -fstack-protector-strong for the runtime / GPU plugin / app code: the
+#     native tree executes guest-controlled data (round-4 hunt), so the
+#     hardening stays ON there. Only the generated recompiled code opts
+#     OUT below (target_compile_options(recomp ...)): millions of tiny
+#     functions is where the win actually is. (A5-R4-13: the old global
+#     -fno-stack-protector turned the protector off for the whole tree;
+#     Gradle's base flags already carry -fstack-protector-strong -- proven
+#     in the .cxx configure reply -- and the last flag wins, so recomp's
+#     PRIVATE -fno-stack-protector still disables it for that target
+#     only. Verified with the NDK 27.2 clang: strong, then -fno-... on the
+#     same command line, leaves no __stack_chk_fail reference.)
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
   add_compile_options(-O3 -DNDEBUG -fomit-frame-pointer -fno-plt
                       -fno-semantic-interposition -fmerge-all-constants
-                      -fno-stack-protector)
+                      -fstack-protector-strong)
   # Keep the unwind tables: the in-app crash reporter (_Unwind_Backtrace
   # + dladdr in android_main.cpp) cannot produce backtraces without them.
   if(NOT DEFINED ENV{REX_ANDROID_BASELINE_ARM})
@@ -94,6 +105,10 @@ target_precompile_headers(recomp PRIVATE "${REX_GEN_DIR}/${REX_APP_NAME}_pch.h")
 # generated PCH throws.) No RTTI: nothing in it uses dynamic_cast/typeid.
 target_compile_options(recomp PRIVATE
     -g0 -O3
+    -fno-stack-protector  # (A5-R4-13.) Perf opt-out scoped to the generated
+                          # code only: millions of small functions calling
+                          # through the dispatcher. The runtime / GPU plugin
+                          # / app code keeps -fstack-protector-strong (above).
     -fno-rtti
     -fno-math-errno -fno-trapping-math
     -Wno-unused-variable -Wno-unused-label -Wno-unused-but-set-variable
