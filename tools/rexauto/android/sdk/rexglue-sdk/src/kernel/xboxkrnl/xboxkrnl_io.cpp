@@ -603,7 +603,7 @@ u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
     return X_STATUS_INVALID_PARAMETER;
   }
 
-auto completion = new XIOCompletion(REX_KERNEL_STATE());
+  auto completion = new XIOCompletion(REX_KERNEL_STATE());
   *out_handle = completion->handle();
 
   return X_STATUS_SUCCESS;
@@ -663,12 +663,12 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 }
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
-ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+                                    ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
   // (Hunt v1.4.6, A2-R4-02.) A guest NULL arrives as a host null
   // (function.h: the marshaller returns T(nullptr) for guest address 0),
   // so dereferencing either out-pointer below used to SIGSEGV the host.
   // Same guard NtCreateFile already has for object_attrs.
-  if (!obj_attribs ||!file_info) {
+  if (!obj_attribs || !file_info) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -759,7 +759,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
     // whole buffer length, but QueryDirectory writes a single entry:
     // report the bytes it actually wrote.
     size_t bytes_written = 0;
-    result = file->QueryDirectory(file_info_ptr, length, name, restart_scan!= 0, &bytes_written);
+    result = file->QueryDirectory(file_info_ptr, length, name, restart_scan != 0, &bytes_written);
     if (XSUCCEEDED(result)) {
       info = static_cast<uint32_t>(bytes_written);
     }
@@ -793,7 +793,6 @@ u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_st
   } else {
     file->Flush();
   }
-
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
@@ -1050,7 +1049,6 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
     return X_STATUS_NO_MEMORY;
   }
 
-
   auto out = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(out_guest);
   memset(out, 0, 0x24);
 
@@ -1064,7 +1062,7 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
   // it on this already-failing path would only shrink the heap further.
   if (!out_guest2) {
     REX_KERNEL_MEMORY()->SystemHeapFree(out_guest);
-return X_STATUS_NO_MEMORY;
+    return X_STATUS_NO_MEMORY;
   }
   memory::store_and_swap(out + 0x18, out_guest2);
 
