@@ -287,7 +287,6 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
   if (!buffer_ptr) {
     return 0x271E;  // WSAEFAULT
   }
-
   // (Hunt v1.4.6, ronda 4, A3-R4-09, hermana.) Same class as WSASendTo
   // below: `length` is guest controlled (u32) and the old code memsets
   // that many bytes from an unvalidated pointer. Validate the whole
@@ -423,7 +422,6 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   uint32_t combined_buffer_offset = 0;
   for (uint32_t i = 0; i < num_buffers; i++) {
     uint8_t* combined_buffer = combined_buffer_mem.data();
-
 
     // (Hunt v1.4.6, ronda 4, A3-R4-09.) The 16 MiB cap above bounds
     // the TOTAL, not the position: a buffer near the end of the mapping
@@ -657,7 +655,7 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
     }
     ev->Set(0, false);
   }
-    return result;
+  return result;
 }
 
 u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
@@ -786,7 +784,6 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
     return -1;
   }
 
-
   // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) The host
   // setsockopt reads optlen bytes from the guest option value; validate
   // the source range first (an optlen of 0 needs no buffer).
@@ -795,7 +792,7 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
     XThread::SetLastError(0x271E);
     return -1;
   }
-  
+
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
   return XSUCCEEDED(status) ? 0 : -1;
 }
@@ -1130,7 +1127,6 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     XThread::SetLastError(0x2736);
     return -1;
   }
-
 
   // (Hunt v1.4.6, ronda 4, segundo barrido, V-A3-02.) Same class as
   // A3-R4-09: the host send() reads buf_len bytes from a guest buffer
