@@ -1071,7 +1071,15 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
     }
     render_passes_.clear();
   }
-
+  
+  // (Hunt v1.4.6, verificación profunda, FE-06.) Destroy any render
+    // passes ClearCache deferred: Shutdown runs after the pipeline cache
+  // was reset (VulkanCommandProcessor::ShutdownContext resets
+  // pipeline_cache_ before render_target_cache_), so the creation
+  // threads are joined and no creation can still hold one of these
+  // handles.
+  DestroyDeferredRenderPasses(true);
+  
   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_copy_pipeline);
   }
@@ -1121,9 +1129,28 @@ void VulkanRenderTargetCache::ClearCache() {
     // emplace (UB on unordered_map). Guarded with the same mutex as
     // the getter. (framebuffers_ above needs no lock: it is only
     // touched on the command processor thread.)
+    // (Hunt v1.4.6, verificación profunda, FE-06.) The mutex above
+    // protects the MAP, not the lifetime of the handles in it: a
+    // creation thread may have obtained a render pass in
+    // TryGetPipelineCreationArgumentsForDescription
+    // (pipeline_cache.cpp) and released the lock before using it in
+    // vkCreateGraphicsPipelines, so destroying the passes here would
+    // be a use-after-destroy. Do NOT destroy them here: move them to
+    // deferred_destroy_render_passes_ (same shape as
+    // VulkanPipelineCache::deferred_destroy_pipelines_) stamped with
+    // the current submission, and clear the map, so new creations
+    // build fresh passes. The deferred passes are destroyed in
+    // CompletedSubmissionUpdated once their stamp submission has
+    // completed, and unconditionally in Shutdown (creation threads
+    // joined by then). AwaitAllQueueOperationsCompletion, which gated
+    // this ClearCache, waits for GPU queues only, not for the creation
+    // threads -- it is NOT what makes the deferred destroy safe; the
+    // submission stamp is.
     std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
+    const uint64_t current_submission = command_processor_.GetCurrentSubmission();
     for (const auto& render_pass_pair : render_passes_) {
-      dfn.vkDestroyRenderPass(device, render_pass_pair.second, nullptr);
+          deferred_destroy_render_passes_.emplace_back(current_submission,
+                                                           render_pass_pair.second);
     }
     render_passes_.clear();
   }
@@ -1135,6 +1162,57 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
+  DestroyDeferredRenderPasses(false);
+}
+
+void VulkanRenderTargetCache::DestroyDeferredRenderPasses(bool force_all) {
+  // (Hunt v1.4.6, verificación profunda, FE-06b.) Close the residual
+    // window left by FE-06: the submission stamp alone cannot prove that no
+    // creation thread still holds one of these render passes -- a
+    // PipelineCreationArguments carrying the old pass may sit in the
+    // creation queue, or a worker may be inside vkCreateGraphicsPipelines,
+    // after the stamped submission completes. Only destroy while pipeline
+    // creation is idle (no startup loading, nothing queued, no busy worker,
+    // per VulkanPipelineCache::IsCreatingPipelines); otherwise leave the
+    // entries queued and retry on the next CompletedSubmissionUpdated. The
+    // force_all path (Shutdown) does not consult the probe: by then
+    // ShutdownContext has reset pipeline_cache_ (joining the creation
+    // threads) before render_target_cache_. The probe runs before any lock
+    // is taken here, and no worker holds the creation lock while taking the
+    // render pass lock, so this cannot deadlock (see evidence-fe-06b.md).
+    if (!force_all && !command_processor_.IsPipelineCreationIdle()) {
+    return;
+    }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  std::vector<VkRenderPass> render_passes_to_destroy;
+{
+    std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
+    while (!deferred_destroy_render_passes_.empty()) {
+      const auto& deferred_pair = deferred_destroy_render_passes_.front();
+      // Same rule as ProcessDeferredPipelineDestructions and the command
+            // processor's destroy_* queues: an entry stamped with submission S
+            // may only be destroyed once S has completed, so no submitted
+            // command buffer can still reference the render pass. Entries are
+            // stamped in non-decreasing submission order, so the first entry
+            // that is not due yet implies none of the later ones is either.
+            if (!force_all && deferred_pair.first > completed_submission) {
+        break;
+            }
+      if (deferred_pair.second != VK_NULL_HANDLE) {
+        render_passes_to_destroy.push_back(deferred_pair.second);
+      }
+      deferred_destroy_render_passes_.pop_front();
+    }
+}
+  // Destroy outside the lock: vkDestroyRenderPass does not touch the
+    // map, and the getter holds this mutex across vkCreateRenderPass, so
+    // holding it across a driver call here would only widen contention.
+    for (VkRenderPass render_pass : render_passes_to_destroy) {
+    dfn.vkDestroyRenderPass(device, render_pass, nullptr);
+    }
 }
 
 void VulkanRenderTargetCache::EndSubmission() {
