@@ -119,9 +119,9 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // 4-byte writable range first, like the other validations above;
       // the write itself still happens only on success below.
       if (data->length_ptr &&
-            !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->length_ptr),
-                                  sizeof(uint32_t), true)) {
-          return X_E_INVALIDARG;
+          !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->length_ptr),
+                                sizeof(uint32_t), true)) {
+        return X_E_INVALIDARG;
       }
       uint32_t item_count = 0;
       auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count, data->buffer_size);
@@ -148,14 +148,14 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // before touching any field. AppManager::DispatchMessageSync
       // forwards buffer_ptr/buffer_length with no validation upstream.
       if (!GuestRangeAccessible(memory_, buffer_ptr, sizeof(message_data), false)) {
-          return X_E_INVALIDARG;
+        return X_E_INVALIDARG;
       }
       // (Audit A3, ronda 6, R6-06, sweep.) unk_44 is a guest pointer
       // field; a zero value used to write to guest address 0.
       if (data->unk_44) {
         if (!GuestRangeAccessible(memory_, static_cast<uint32_t>(data->unk_44),
-                                    sizeof(uint32_t), true)) {
-            return X_E_INVALIDARG;
+                                  sizeof(uint32_t), true)) {
+          return X_E_INVALIDARG;
         }
         auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_44);
         *unk = 0;
@@ -180,12 +180,12 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // Validate the 8-byte struct first, then the pointed-to u32
       // (a zero unk_00 has no legitimate target here).
       if (!GuestRangeAccessible(memory_, buffer_ptr, sizeof(message_data), false)) {
-          return X_E_INVALIDARG;
+        return X_E_INVALIDARG;
       }
       if (!data->unk_00 ||
-            !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->unk_00),
-                                  sizeof(uint32_t), false)) {
-          return X_E_INVALIDARG;
+          !GuestRangeAccessible(memory_, static_cast<uint32_t>(data->unk_00),
+                                sizeof(uint32_t), false)) {
+        return X_E_INVALIDARG;
       }
       auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_00);
       auto adr = *unk;
