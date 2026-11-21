@@ -500,6 +500,12 @@ class TextureCache {
   // invalid if the implementation is destroyed before the texture.
   void DestroyAllTextures(bool from_destructor = false);
 
+  // (Hunt v1.4.6 round 5, T-R5-09.) Hook called by CompletedSubmissionUpdated
+  // when it evicts one texture: subclasses prune their per-key side state
+  // for that key (Vulkan: placeholder / ETC2-failure / DXT1-alpha maps).
+  // Default: nothing.
+  virtual void OnTextureEvicted(const TextureKey& /*key*/) {}
+
   // Whether the signed version of the texture has a different representation on
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
