@@ -929,6 +929,11 @@ public class VirtualPadView extends View {
     private void openSettingsDialog() {
         final Context context = getContext();
         if (context instanceof Activity) {
+            // (Hunt v1.4.6 ronda 4, A4-R4-09.) The gear fires on release;
+            // a double-tap (or two fingers) reached here twice before the
+            // first dialog was up. PadSettingsDialog.show() owns the same
+            // guard; this check keeps the second tap from even building one.
+            if (PadSettingsDialog.isShowing()) return;
             // onSettingsChanged re-reads the store AND syncs mHidden, so the
             // "hide overlay" action collapses the pad in-session (not only
             // after an app restart).
