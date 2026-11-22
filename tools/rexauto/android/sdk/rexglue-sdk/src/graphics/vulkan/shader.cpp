@@ -71,7 +71,7 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     // so no second thread can race on the plain static — the atomic
     // below is kept as cheap defense in depth for the log-once flag, not
     // because a live race exists. The check-then-set below can still log
-    // the first audit twice (benign, log-only).    
+    // the first audit twice (benign, log-only).
     static std::atomic<bool> logged_first_audit{false};
     const bool noteworthy =
         audit.valid && (audit.max_descriptor_set > 3 ||
@@ -141,7 +141,7 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     // retry the module creation on the next call instead of poisoning
     // this shader forever; TryGet... refuses a valid translation with
     // no module yet, so no VK_NULL_HANDLE ever reaches pipeline
-    // creation. shader_module_ stays VK_NULL_HANDLE on this path.    
+    // creation. shader_module_ stays VK_NULL_HANDLE on this path.
     return VK_NULL_HANDLE;
   }
   return shader_module_;
