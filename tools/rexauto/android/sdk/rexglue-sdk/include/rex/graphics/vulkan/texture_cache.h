@@ -11,6 +11,8 @@
  */
 
 #include <array>
+#include <atomic>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,6 +83,11 @@ class VulkanTextureCache final : public TextureCache {
   void BeginFrame() override;
   void EndFrame();
   void ClearCache() override;
+  // (Hunt v1.4.6 round 7, A1-R7-01.) Reclaims the 3D-as-2D resources
+  // deferred by DeferDestroy3DAs2DImageView/DeferDestroy3DAs2DWrapper once
+  // the submission they were stamped with has completed; see the
+  // implementation in texture_cache.cpp.
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void OnTextureEvicted(const TextureKey& key) override;
 
   // Must be called within a frame - creates and untiles textures needed by
@@ -343,6 +350,21 @@ class VulkanTextureCache final : public TextureCache {
       } else {
         etc2_partial_load_mips_watch_handle_ = nullptr;
       }
+           // (Hunt v1.4.6 round 7, A2-R7-02.) Also flag the in-flight
+           // transcode as invalidated (see etc2_transcode_invalidated_ below):
+           // the store is last, so the plain-member writes above
+           // happen-before any graphics-thread load that observes the flag.
+           etc2_transcode_invalidated_.store(true, std::memory_order_release);
+    }
+    // Whether a guest write fired the partial-load watch since the
+    // current ETC2 load started (see LoadTextureDataFromResidentMemoryImpl).
+    bool etc2_transcode_invalidated() const {
+           return etc2_transcode_invalidated_.load(std::memory_order_acquire);
+    }
+    // Clears the flag above. Only the graphics thread calls this, at the
+    // start of an ETC2 load, before arming the watch and transcoding.
+    void ClearEtc2TranscodeInvalidated() {
+           etc2_transcode_invalidated_.store(false, std::memory_order_relaxed);
     }
 
    private:
@@ -402,6 +424,20 @@ class VulkanTextureCache final : public TextureCache {
     bool etc2_progress_active_ = false;
     uint32_t etc2_next_loop_level_ = 0;
     uint32_t etc2_next_slice_ = 0;
+    // (Hunt v1.4.6 round 7, A2-R7-02.) Set by
+    // NoteEtc2PartialLoadWatchFired (guest CPU thread, via
+    // SharedMemory::FireWatches under the global critical region) when a
+    // guest write lands in the watched range while an ETC2 load is
+    // transcoding, and only ever cleared by the graphics thread at the
+    // start of an ETC2 load. Atomic on purpose: the plain members above
+    // (etc2_progress_active_, the watch handles) are already written by
+    // the callback while the graphics thread reads/writes them -- that
+    // pre-existing race is only benign because the callback's own clear
+    // of the progress is re-asserted by the graphics thread itself in
+    // the discard path (see LoadTextureDataFromResidentMemoryImpl), but
+    // the "did a write land mid-transcode" signal itself must be exact,
+    // so it lives here, not in a plain bool.
+    std::atomic<bool> etc2_transcode_invalidated_{false};
     // (Hunt v1.4.6 round 5, T-R5-02.) Partial-load watches, armed while
     // etc2_progress_active_. They are separate from the base Texture
     // base/mips watches, which only exist once the texture is up to date.
@@ -466,6 +502,28 @@ class VulkanTextureCache final : public TextureCache {
   bool Initialize();
   bool InitializeScaledResolveBuffer();
   void ShutdownScaledResolveBuffer();
+
+  // (Hunt v1.4.6 round 7, A1-R7-01.) Deferred destruction for 3D-as-2D
+  // wrapper resources. A view or wrapper retired by
+  // VulkanTexture::GetOrCreate3DAs2DImageView must NOT be destroyed
+  // immediately: draws in the currently open submission -- and in the up
+  // to kMaxFramesInFlight = 3 submissions already in flight -- may still
+  // reference it. Both calls stamp the resource with
+  // command_processor_.GetCurrentSubmission() (the index the open
+  // submission will get) and queue it; CompletedSubmissionUpdated
+  // destroys it once that submission has completed, with the same rule
+  // as the normal texture eviction and as the command processor's own
+  // destroy_* queues. Called from VulkanTexture, which as a nested class
+  // can reach these private members. Only ever touched on the command
+  // processor thread (enqueue in GetOrCreate3DAs2DImageView, reclaim in
+  // CompletedSubmissionUpdated), so no lock is needed.
+  void DeferDestroy3DAs2DImageView(VkImageView image_view);
+  void DeferDestroy3DAs2DWrapper(std::unique_ptr<VulkanTexture> wrapper);
+  // Destroys every pending deferred 3D-as-2D resource, regardless of
+  // submission completion. Only safe once all queue operations have
+  // completed (shutdown); the destructor uses it the same way
+  // VulkanCommandProcessor::ShutdownContext drains its destroy_* queues.
+  void DestroyAllDeferred3DAs2DResources();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
 
@@ -545,6 +603,18 @@ class VulkanTextureCache final : public TextureCache {
   std::vector<uint64_t> scaled_resolve_sparse_allocated_;
   bool scaled_resolve_last_usage_write_ = false;
   std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
+
+  // (Hunt v1.4.6 round 7, A1-R7-01.) Deferred 3D-as-2D destruction, see
+  // DeferDestroy3DAs2DImageView/DeferDestroy3DAs2DWrapper above.
+  // <Submission where last used, resource>, sorted by the submission
+  // number, like VulkanCommandProcessor::destroy_image_views_. The
+  // wrapper queue must hold whole VulkanTexture objects (not raw
+  // VkImage/VkDeviceMemory handles): the wrapper image is a VMA
+  // allocation, so only ~VulkanTexture (vmaDestroyImage) can free it, and
+  // its image must outlive the deferred views that sample it.
+  std::deque<std::pair<uint64_t, VkImageView>> deferred_3d_as_2d_image_views_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<VulkanTexture>>>
+      deferred_3d_as_2d_wrappers_;
 };
 
 }  // namespace rex::graphics::vulkan
