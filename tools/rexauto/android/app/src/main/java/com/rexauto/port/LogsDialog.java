@@ -181,6 +181,10 @@ public final class LogsDialog {
     public static void show(Activity activity) {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
         if (isShowing()) return;
+        // (Caza ronda 6, A4-R6-07.) Sin este guard, un show() sobre una
+        // activity terminada/destruida tira WindowManager$BadTokenException;
+        // mismo guard que GraphicsDialog.showRestartDialog ya usa.
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         String prev = tail(new File(logsDir(activity), "crash.prev.txt"), 4000);
         String cur = tail(crashFile(activity), 4000);
         String log = tail(gameLog(activity), 200000);
