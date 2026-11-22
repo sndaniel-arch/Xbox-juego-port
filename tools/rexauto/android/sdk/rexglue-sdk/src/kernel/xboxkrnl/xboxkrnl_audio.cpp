@@ -28,12 +28,12 @@ using namespace rex::system;
 // (Hunt v1.4.6, caza ronda 6, A3-R6-02.) TranslateVirtual never
 // validates and never returns null, so a guest pointer + length that
 // runs past the end of the mapping SIGSEGVs the host on the
-// memcpy/read/write. Same heap validation as A3-R4-09 (see xam_net.cpp
-// for the full comment), copied here because this file had no range
-// helper at all: reject a range that wraps past 4 GiB, starts or ends
-// outside any heap, or spans heaps of different kinds (or two physical
-// heaps); inside a single heap, require the pages to be accessible
-// (read/write for a destination, readable for a source).
+// read/write. Same heap validation as A3-R4-09 (see xam_net.cpp for
+// the full comment), copied here because this file had no range helper
+// at all: reject a range that wraps past 4 GiB, starts or ends outside
+// any heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
 static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
   if (!length) {
     return true;
