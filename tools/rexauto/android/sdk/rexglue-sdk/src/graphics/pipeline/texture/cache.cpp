@@ -497,11 +497,24 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
       if (texture.GetGuestBaseSize() &&
           !shared_memory().IsRangeValid(texture_key.base_page << 12,
                                         texture.GetGuestBaseSize())) {
+        // (Hunt v1.4.6 round 7, A2-R7-01.) Disarm the live watch BEFORE
+        // the manual WatchCallback: WatchCallback only nulls the handle,
+        // so without this the WatchRange would stay registered in
+        // SharedMemory with its handle lost (orphan: forced re-uploads, a
+        // slow leak of ranges for textures the guest never rewrites
+        // again, and a use-after-free if the texture is destroyed before
+        // the next write fires it). The handle is known live here -- the
+        // global lock is held, so FireWatches cannot fire it
+        // concurrently -- and DisarmWatch is a no-op when it already
+        // fired (handle null).
+        texture.DisarmWatch(global_lock, false);
         texture.WatchCallback(global_lock, false);
       }
       if (texture.GetGuestMipsSize() &&
           !shared_memory().IsRangeValid(texture_key.mip_page << 12,
                                         texture.GetGuestMipsSize())) {
+        // (Hunt v1.4.6 round 7, A2-R7-01.) Same as above, mips range.
+        texture.DisarmWatch(global_lock, true);
         texture.WatchCallback(global_lock, true);
       }
       base_outdated = base_outdated || texture.base_outdated(global_lock);
@@ -890,6 +903,23 @@ void TextureCache::Texture::MarkAsUsed() {
   used_next_ = nullptr;
   texture_cache_.texture_used_last_->used_next_ = this;
   texture_cache_.texture_used_last_ = this;
+}
+
+void TextureCache::Texture::DisarmWatch(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+  // (Hunt v1.4.6 round 7, A2-R7-01.) Same API as ~Texture below: a
+  // non-null handle means the range is still registered (WatchCallback
+  // nulls it when the watch fires, and FireWatches unlinks the range
+  // before calling the callback, so a null handle is never unlinked
+  // twice). UnwatchMemoryRange unlinks the range and returns it to the
+  // free list, so after this the handle is null AND the range is gone:
+  // MakeUpToDateAndWatch can install a fresh watch, and destroying the
+  // texture can no longer leave an orphan behind.
+  SharedMemory::WatchHandle& watch_handle = is_mip ? mips_watch_handle_ : base_watch_handle_;
+  if (watch_handle) {
+    texture_cache().shared_memory().UnwatchMemoryRange(watch_handle);
+    watch_handle = nullptr;
+  }
 }
 
 void TextureCache::Texture::WatchCallback(
