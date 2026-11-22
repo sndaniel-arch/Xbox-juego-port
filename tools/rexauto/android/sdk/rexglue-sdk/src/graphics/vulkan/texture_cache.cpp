@@ -202,7 +202,17 @@ void VulkanTextureCache::VulkanTexture::ArmEtc2PartialLoadWatch(SharedMemory& sh
   }
 }
 
-void VulkanTextureCache::VulkanTexture::DisarmEtc2PartialLoadWatch(SharedMemory& shared_memory) {
+void VulkanTextureCache::VulkanTexture::DisarmEtc2PartialLoadWatch(
+[[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+SharedMemory& shared_memory) {
+  // (Hunt v1.4.6 round 8, A2-R8-01.) The caller holds the global critical
+  // region (see texture_cache.h): the handle reads below and the
+  // unwatches are atomic against FireWatches, so a guest write cannot
+  // fire a watch between the read and the unwatch and
+  // UnwatchMemoryRange can never unlink the same WatchRange twice. The
+  // lock is only a proof here -- UnwatchMemoryRange re-acquires the same
+  // (recursive) mutex -- and this function does nothing else while
+  // holding it.
   if (etc2_partial_load_base_watch_handle_) {
     shared_memory.UnwatchMemoryRange(etc2_partial_load_base_watch_handle_);
     etc2_partial_load_base_watch_handle_ = nullptr;
@@ -2172,7 +2182,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     // (Audit A-3b.) Transcode succeeded: forget any earlier failures for
     // this key so a later failure starts counting from zero again, and
     // drop the progress -- the load is complete.
-    vulkan_texture.DisarmEtc2PartialLoadWatch(shared_memory());
+    // (Hunt v1.4.6 round 8, A2-R8-01.) Disarm under the global critical
+    // region, covering the handle read and the unwatch: this load runs
+    // without the lock, so a guest write could otherwise fire the watch
+    // between the two and the range would be unlinked twice. The scope
+    // covers only the disarm -- the invalidation check below runs
+    // unlocked, as before, and still catches a write that fired before
+    // the disarm (its handle is already null, the disarm is a no-op, and
+    // the flag stays set).
+    {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      vulkan_texture.DisarmEtc2PartialLoadWatch(global_lock, shared_memory());
+    }
     vulkan_texture.ClearEtc2Progress();
     // (Hunt v1.4.6 round 7, A2-R7-02.) Same as the check above, for the
     // last few statements: a guest write fired after that check but
@@ -2871,7 +2892,18 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   // access; through the derived reference it does.)
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
-  DisarmEtc2PartialLoadWatch(vulkan_texture_cache.shared_memory());
+  // (Hunt v1.4.6 round 8, A2-R8-01.) Disarm under the global critical
+// region, covering the handle read and the unwatch: without the lock a
+// guest write can fire the watch between the read and the unwatch, and
+// UnwatchMemoryRange would then unlink the same WatchRange a second
+// time. The lock is the single process-wide recursive mutex, so taking
+// it here cannot deadlock against FireWatches or any other holder of
+// the same lock; the scope ends before the VkImageView / image
+// destruction below, so no Vulkan call runs under the lock.
+{
+auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+DisarmEtc2PartialLoadWatch(global_lock, vulkan_texture_cache.shared_memory());
+}
   const ui::vulkan::VulkanDevice* const vulkan_device =
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
