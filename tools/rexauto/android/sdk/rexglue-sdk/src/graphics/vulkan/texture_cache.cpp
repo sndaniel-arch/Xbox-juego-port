@@ -173,25 +173,29 @@ void VulkanTextureCache::ClearTexturePlaceholder(const TextureKey& key) {
 
 // (Hunt v1.4.6 round 5, T-R5-02.) See texture_cache.h. The callback only
 // clears the texture's resume progress; the shared memory has already
-// cancelled the fired watch, so the handles are just forgotten, never
+// cancelled the fired watch, so the fired handle is just forgotten, never
 // unwatched from here.
+// (Hunt v1.4.6 round 6, A2-R6-01.) The argument selects which range fired
+// (0 = base, 1 = mips) and is forwarded: FireWatches cancels only the
+// fired range, so the other handle must survive.
 void VulkanTextureCache::Etc2PartialLoadWatchCallback(
     const std::unique_lock<std::recursive_mutex>& /*global_lock*/, void* context, void* /*data*/,
-    uint64_t /*argument*/, bool /*invalidated_by_gpu*/) {
+    uint64_t argument, bool /*invalidated_by_gpu*/) {
   VulkanTexture* texture = static_cast<VulkanTexture*>(context);
-  texture->NoteEtc2PartialLoadWatchFired();
+  texture->NoteEtc2PartialLoadWatchFired(argument);
 }
 
 void VulkanTextureCache::VulkanTexture::ArmEtc2PartialLoadWatch(SharedMemory& shared_memory) {
-  if (etc2_partial_load_base_watch_handle_ || etc2_partial_load_mips_watch_handle_) {
-    return;
-  }
-  if (GetGuestBaseSize() != 0) {
+  // (Hunt v1.4.6 round 6, A2-R6-01.) Arm PER RANGE, not both-or-nothing:
+// after one range fires, its handle is null while the other watch is
+// still registered, and the old joint early-return would have re-armed
+// the live range a second time (duplicate watch on the same range).
+  if (!etc2_partial_load_base_watch_handle_ && GetGuestBaseSize() != 0) {
     etc2_partial_load_base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(),
         VulkanTextureCache::Etc2PartialLoadWatchCallback, this, nullptr, 0);
   }
-  if (GetGuestMipsSize() != 0) {
+  if (!etc2_partial_load_mips_watch_handle_ && GetGuestMipsSize() != 0) {
     etc2_partial_load_mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(),
         VulkanTextureCache::Etc2PartialLoadWatchCallback, this, nullptr, 1);
@@ -253,7 +257,13 @@ void VulkanTextureCache::ReadGuestBcBlock(
     uint32_t slice, uint8_t* block_out, uint32_t bytes_per_block) {
   uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
   uint32_t pitch_blocks = level_layout.row_pitch_bytes / bytes_per_block;
-  uint32_t block_offset;
+  // (Hunt v1.4.6 round 6, A2-R6-04.) 64-bit block offset: the linear
+  // products below (by * pitch, bz * stride * pitch) overflow uint32_t
+  // for absurd extents and would wrap the read to a wrong guest block.
+  // The guest address itself stays 32-bit (TranslatePhysical masks it
+  // into the 512 MiB mapping), so this keeps the offset exact up to that
+  // final truncation instead of wrapping early in the products.
+  uint64_t block_offset;
   if (key.tiled || is_3d_tiling) {
     if (is_3d_tiling) {
       // Height in blocks, like the 3D resolve path passes it.
@@ -265,18 +275,20 @@ void VulkanTextureCache::ReadGuestBcBlock(
                                                              pitch_blocks, bytes_per_block_log2));
     }
   } else {
-    block_offset = by * level_layout.row_pitch_bytes + bx * bytes_per_block +
-                   bz * level_layout.z_slice_stride_block_rows * level_layout.row_pitch_bytes;
+    block_offset = uint64_t(by) * level_layout.row_pitch_bytes + uint64_t(bx) * bytes_per_block +
+                   uint64_t(bz) * level_layout.z_slice_stride_block_rows *
+                       level_layout.row_pitch_bytes;
   }
-  uint32_t guest_address = guest_level_base + block_offset +
-                           slice * level_layout.array_slice_stride_bytes;
+  uint32_t guest_address = uint32_t(uint64_t(guest_level_base) + block_offset +
+                                    uint64_t(slice) * level_layout.array_slice_stride_bytes);
   const uint8_t* guest_block = shared_memory.TranslatePhysicalForDebug(guest_address);
   etc2::ApplyGuestEndian(uint32_t(key.endianness), block_out, guest_block, bytes_per_block);
 }
 
-// Whether a DXT1 texture uses 1-bit alpha anywhere in its base level (a
-// BC1 block with color0 <= color1 and a texel using index 3). ETC2_RGB8
-// has no alpha, so such a texture must stay on the RGBA8 compute fallback.
+// Whether a DXT1 texture uses 1-bit alpha anywhere in its base or mip
+// levels (a BC1 block with color0 <= color1 and a texel using index 3).
+// ETC2_RGB8 has no alpha, so such a texture must stay on the RGBA8
+// compute fallback.
 // Memoized per TextureKey on the cache instance: the decision has to agree
 // between CreateTexture (which picks the image format) and every later
 // GetHostFormatPair() call, and re-scanning on the draw path would be far
@@ -296,6 +308,10 @@ void VulkanTextureCache::ReadGuestBcBlock(
 // still kDxt1AlphaScanMaxBlocks sampled blocks in total, so a big 3D or
 // array texture samples each plane more sparsely -- same tradeoff as
 // within one plane, now spread over the whole volume.
+// (Hunt v1.4.6 round 6, A2-R6-03.) The sample now spans the mip levels
+// too (same shared cap): a mip-only 1-bit alpha used to be missed, and
+// the whole texture went to ETC2_RGB8, turning cutouts opaque at a
+// distance.
 // Caveat: if a texture's contents change from opaque to 1-bit-alpha under
 // the same key (dynamic texture reuse), the memoized answer goes stale and
 // the transparent texels render opaque. Game textures are static data, so
@@ -309,42 +325,94 @@ bool VulkanTextureCache::Dxt1TextureHasOneBitAlpha(
     return it->second;
   }
   bool has_alpha = false;
-  const texture_util::TextureGuestLayout::Level& level_layout = guest_layout.base;
-  uint32_t guest_base = key.base_page << 12;
+  const uint32_t guest_base = key.base_page << 12;
+  const uint32_t guest_mips = key.mip_page << 12;
   bool is_3d = key.dimension == xenos::DataDimension::k3D;
   uint8_t block[8];
+  // (Hunt v1.4.6 round 6, A2-R6-03.) Scan the mip levels too, not just the
+  // base: a cutout's mip keeps its 1-bit alpha, and GetHostFormatPair
+  // applies one host format to the whole texture, so a base-only scan sent
+  // alpha mips to ETC2_RGB8 (no alpha) and cutouts turned opaque at a
+  // distance. The levels scanned are exactly the stored ones: the base
+  // plus mips[1..min(max_level, packed_level)], or the packed tail
+  // mips[0] when packed_level == 0 (its layout already spans the whole
+  // tail, so every packed sublevel is covered). The sample budget stays
+  // shared across all levels: one stride over the grand total, so a big
+  // texture still costs at most kDxt1AlphaScanMaxBlocks block reads.
   // (Hunt v1.4.6 round 5, T-R5-08.) Sample every z plane and every array
   // slice, not just slice 0: for 3D textures the third axis is z_extent
   // block-planes (BC blocks are 4x4x1); for stacked textures it is the
   // array layers, addressed by the slice parameter of ReadGuestBcBlock.
-  const uint32_t z_planes =
-      is_3d ? std::max(level_layout.z_extent, UINT32_C(1)) : UINT32_C(1);
   const uint32_t array_slices =
       is_3d ? UINT32_C(1) : std::max(key.GetDepthOrArraySize(), UINT32_C(1));
-  const uint32_t plane_blocks = level_layout.x_extent_blocks * level_layout.y_extent_blocks;
+  struct LevelScan {
+    const texture_util::TextureGuestLayout::Level* layout;
+    uint32_t guest_level_base;
+    uint64_t total_blocks;
+  };
+  LevelScan levels[xenos::kTextureMaxMips + 1];
+  uint32_t level_count = 0;
+  uint64_t total_blocks = 0;
+  auto add_level = [&](const texture_util::TextureGuestLayout::Level& level_layout,
+                       uint32_t guest_level_base) {
+    const uint32_t z_planes =
+        is_3d ? std::max(level_layout.z_extent, UINT32_C(1)) : UINT32_C(1);
+    const uint64_t level_total = uint64_t(level_layout.x_extent_blocks) *
+                                 level_layout.y_extent_blocks * z_planes * array_slices;
+    if (level_total == 0) {
+      return;
+    }
+    levels[level_count++] = LevelScan{&level_layout, guest_level_base, level_total};
+    total_blocks += level_total;
+  };
+  add_level(guest_layout.base, guest_base);
+  if (guest_layout.packed_level == 0) {
+    // Packed mip tail: the mips live in mips[0], at the mip base.
+    add_level(guest_layout.mips[0], guest_mips + guest_layout.mip_offsets_bytes[0]);
+  } else {
+    const uint32_t max_stored_level =
+        std::min(guest_layout.max_level, guest_layout.packed_level);
+    for (uint32_t level = 1; level <= max_stored_level; ++level) {
+      add_level(guest_layout.mips[level], guest_mips + guest_layout.mip_offsets_bytes[level]);
+    }
+  }
   // 64-bit: a bogus fetch constant could make x*y*z*slices exceed 2^32
   // (e.g. 8192x8192 x 2048 slices); the sampled loop below only ever
   // visits kDxt1AlphaScanMaxBlocks of them, but the total itself must not
   // wrap.
-  const uint64_t total_blocks = uint64_t(plane_blocks) * z_planes * array_slices;
-  // Stride in blocks, row-major over the whole level: 1 while the level
-  // fits in the cap, larger for big levels (1024x1024 -> stride 16).
+  // Stride in blocks, row-major over all levels: 1 while everything fits
+  // in the cap, larger for big textures (1024x1024 -> stride 16).
   // total_blocks == 0 skips the loop entirely (x_extent_blocks == 0).
   const uint64_t stride = std::max(
       (total_blocks + kDxt1AlphaScanMaxBlocks - 1) / kDxt1AlphaScanMaxBlocks, uint64_t(1));
   for (uint64_t block_index = 0; block_index < total_blocks && !has_alpha;
        block_index += stride) {
-    const uint32_t slice = uint32_t(block_index / (uint64_t(plane_blocks) * z_planes));
+    // Map the global index to its level: the first level whose range
+    // contains it. block_index < total_blocks guarantees one exists.
+    uint64_t level_first = 0;
+    uint32_t level_index = 0;
+    for (; level_index + 1 < level_count &&
+           block_index >= level_first + levels[level_index].total_blocks;
+         ++level_index) {
+      level_first += levels[level_index].total_blocks;
+    }
+    const LevelScan& level_scan = levels[level_index];
+    const texture_util::TextureGuestLayout::Level& level_layout = *level_scan.layout;
+    const uint64_t local_index = block_index - level_first;
+    const uint32_t plane_blocks = level_layout.x_extent_blocks * level_layout.y_extent_blocks;
+    const uint32_t z_planes =
+        is_3d ? std::max(level_layout.z_extent, UINT32_C(1)) : UINT32_C(1);
+    const uint32_t slice = uint32_t(local_index / (uint64_t(plane_blocks) * z_planes));
     const uint32_t z_remainder =
-        uint32_t(block_index % (uint64_t(plane_blocks) * z_planes));
+        uint32_t(local_index % (uint64_t(plane_blocks) * z_planes));
     const uint32_t bz = z_remainder / plane_blocks;
     const uint32_t xy_index = z_remainder % plane_blocks;
     const uint32_t bx = xy_index % level_layout.x_extent_blocks;
     const uint32_t by = xy_index / level_layout.x_extent_blocks;
     // (Hunt v1.4.6 round 3, A1-R3-07.) No unreadable-block fallback: the
     // read always succeeds (see ReadGuestBcBlock).
-    ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, bz, slice,
-                     block, 8);
+    ReadGuestBcBlock(shared_memory, level_layout, level_scan.guest_level_base, key, is_3d, bx,
+                     by, bz, slice, block, 8);
     if (etc2::Bc1BlockHasOneBitAlpha(block)) {
       has_alpha = true;
       break;
@@ -1784,7 +1852,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         // not recorded, and the texture retries next submission from the
         // saved position, with the slices already transcoded in this call
         // uploaded below.
-        const uint32_t slice_blocks = x_blocks * y_blocks * level_depth;
+        // (Hunt v1.4.6 round 6, A2-R6-04.) 64-bit slice block count:
+        // x_blocks * y_blocks * level_depth overflows uint32_t for
+        // absurd extents, wrapping the budget check so one submission
+        // could transcode far past kEtc2MaxBlocksPerSubmission. (The
+        // first-slice guard below still lets a single oversized slice
+        // through once, so progress is guaranteed.)
+        const uint64_t slice_blocks = uint64_t(x_blocks) * y_blocks * level_depth;
         if (etc2_budget_.submission != submission_current) {
           etc2_budget_.submission = submission_current;
           etc2_budget_.blocks_used = 0;
@@ -2765,13 +2839,38 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     return VK_NULL_HANDLE;
   }
 
+  VulkanTextureCache& vulkan_texture_cache = static_cast<VulkanTextureCache&>(texture_cache());
+
+  // (Hunt v1.4.6 round 6, A2-R6-02.) The wrapper is a real Texture: its
+  // load arms guest-memory watches via MakeUpToDateAndWatch, so a guest
+  // rewrite marks it outdated -- but nothing ever reset
+  // texture_3d_as_2d_loaded_, so the cached view kept serving the old
+  // texels forever. When the wrapper is outdated, drop the cached views
+  // and reload below through the same path as the first load, so the
+  // T-R5-01 retry still applies: a failed reload leaves loaded_ false
+  // and the next call retries. outdated_mask() is atomic, so no global
+  // lock is needed to read it here.
+  if (texture_3d_as_2d_ && texture_3d_as_2d_->outdated_mask() != 0) {
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        vulkan_texture_cache.command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
+      image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+    }
+    if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+      image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+    }
+    texture_3d_as_2d_loaded_ = false;
+  }
+
   VkImageView& cached_view =
       is_signed ? image_view_3d_as_2d_signed_ : image_view_3d_as_2d_unsigned_;
   if (cached_view != VK_NULL_HANDLE) {
     return cached_view;
   }
-
-  VulkanTextureCache& vulkan_texture_cache = static_cast<VulkanTextureCache&>(texture_cache());
 
   if (!texture_3d_as_2d_) {
     const HostFormatPair& host_format_pair = vulkan_texture_cache.GetHostFormatPair(key());
