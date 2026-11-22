@@ -65,10 +65,13 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     const auto audit = rex::graphics::spirv_patch::Audit(
         reinterpret_cast<const uint32_t*>(translated_binary().data()),
         translated_binary().size() / sizeof(uint32_t));
-    // (Audit run #16, J-19.) Atomic: GetOrCreateShaderModule runs on the
-    // pipeline creation threads, so two of them could race on the plain
-    // static. The check-then-set below can still log the first audit twice
-    // (benign, log-only); the atomic only removes the data race.
+    // (Audit run #16, J-19; corregido en ronda 5, S-R5-01.)
+    // GetOrCreateShaderModule only runs on the command processor thread
+    // today (sole caller: VulkanPipelineCache::TranslateAnalyzedShader),
+    // so no second thread can race on the plain static — the atomic
+    // below is kept as cheap defense in depth for the log-once flag, not
+    // because a live race exists. The check-then-set below can still log
+    // the first audit twice (benign, log-only).    
     static std::atomic<bool> logged_first_audit{false};
     const bool noteworthy =
         audit.valid && (audit.max_descriptor_set > 3 ||
@@ -128,7 +131,17 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
         "VulkanShader::VulkanTranslation: Failed to create a Vulkan shader "
         "module for shader {:016X} modification {:016X}",
         shader().ucode_data_hash(), modification());
-    MakeInvalid();
+    // (Caza v1.4.6 ronda 5, S-R5-02.) Do NOT mark the translation
+    // invalid here: unlike the spirv_patch rejection above (a
+    // deterministic property of the SPIR-V), a failed
+    // vkCreateShaderModule can be transient driver OOM
+    // (VK_ERROR_OUT_OF_HOST_MEMORY / VK_ERROR_OUT_OF_DEVICE_MEMORY).
+    // The translation itself is valid; only the module handle is
+    // missing. Leaving is_valid_ true lets EnsureShadersTranslated
+    // retry the module creation on the next call instead of poisoning
+    // this shader forever; TryGet... refuses a valid translation with
+    // no module yet, so no VK_NULL_HANDLE ever reaches pipeline
+    // creation. shader_module_ stays VK_NULL_HANDLE on this path.    
     return VK_NULL_HANDLE;
   }
   return shader_module_;
