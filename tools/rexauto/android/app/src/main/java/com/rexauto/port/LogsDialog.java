@@ -112,6 +112,12 @@ public final class LogsDialog {
      * driver-boot failure and the generic report is shown instead.
      */
     public static boolean showDriverCrashGuardIfAny(Activity activity, Runnable onDismiss) {
+        // (Caza ronda 7, A4-R7-03.) Same guard as show() (A4-R6-07):
+        // without it, a show() on a finishing/destroyed activity throws
+        // WindowManager$BadTokenException. This gate runs first in
+        // onCreate, so the activity has just been born -- narrow window,
+        // same class as the four sites A4-R6-07 closed.
+        if (activity.isFinishing() || activity.isDestroyed()) return false;
         GpuDriver gd = new GpuDriver(activity);
         String slug = gd.selected();
         if (slug == null || !hasCrashReport(activity) || hasFramesOk(activity)) return false;
@@ -143,6 +149,10 @@ public final class LogsDialog {
      * dialog: onDismiss runs after the report is renamed away).
      */
     public static boolean showCrashReportIfAny(Activity activity, Runnable onDismiss) {
+        // (Caza ronda 7, A4-R7-03.) Same guard as showDriverCrashGuardIfAny
+        // above (A4-R6-07 family): no show() on a finishing/destroyed
+        // activity (WindowManager$BadTokenException).
+        if (activity.isFinishing() || activity.isDestroyed()) return false;
         File c = crashFile(activity);
         if (!c.isFile()) return false;
         String report = tail(c, 20000);
