@@ -331,6 +331,7 @@ public class MainActivity extends SDLActivity {
         mEmulationPaused = false;
         try { nativeResumeEmulation(); } catch (Throwable t) { Log.w("MainActivity", "resume emulation failed", t); }
     }
+
     /**
      * (Hunt v1.4.6 ronda 7, A4-R7-02.) The Android gesture back (edge
      * swipe, the default navigation on Android 16) reaches here, while
