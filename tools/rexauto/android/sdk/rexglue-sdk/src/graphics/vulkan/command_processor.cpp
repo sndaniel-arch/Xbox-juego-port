@@ -925,6 +925,51 @@ bool VulkanCommandProcessor::SetupContext() {
         "Vulkan draw resolution scaling is experimental and may not affect all "
         "titles correctly");
   }
+  // (Ronda 5, C-R5-01.) Degrade to 1x instead of failing the boot. On
+  // devices without sparse residency (Mali-G57 reports
+  // sparseResidencyBuffer=false) the scaled-resolve buffer is a single
+  // non-sparse allocation of 512 MiB x scale^2 -- 2 GiB at 2x, 4.5 GiB
+  // at 3x -- and if that allocation fails, VulkanTextureCache::Initialize
+  // returns false and the GPU never starts, even though the game would
+  // run fine at 1x. Probe the EXACT allocation now, with the same
+  // function the texture cache will use, and fall back to 1x if it does
+  // not fit. This is the only consistent place to degrade: the scale is
+  // copied into three independent holders below (the render target cache,
+  // the texture cache, and -- via the render target cache -- the shader
+  // translator), so degrading inside VulkanTextureCache::Initialize
+  // would leave the other two at 2x/3x, rendering at 2x while resolving
+  // at 1x. Shared memory (512 MiB) was already allocated above, so the
+  // probe measures the memory that is actually left. The probe only runs
+  // when scaling is requested without sparse residency; at 1x, or on
+  // sparse-capable devices, nothing changes. Residual risk: the probe
+  // passing does not guarantee the real allocation minutes later (a few
+  // shader modules and the pipeline cache init run in between), but
+  // those are tens of MiB at most; if the real allocation still fails,
+  // Initialize still returns false as before -- this only removes the
+  // common case, it does not pretend to remove the failure path.
+  if ((draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) &&
+      !vulkan_device->properties().sparseResidencyBuffer) {
+    uint64_t scaled_resolve_size = uint64_t(SharedMemory::kBufferSize) *
+                                    uint64_t(draw_resolution_scale_x) *
+                                    uint64_t(draw_resolution_scale_y);
+    VkBuffer probe_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory probe_memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, scaled_resolve_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, probe_buffer, probe_memory)) {
+      REXGPU_WARN(
+          "The {}x{} draw resolution scale needs a {} MB non-sparse "
+          "scaled-resolve buffer, which does not fit in device memory on "
+          "this device (no sparse residency) -- falling back to 1x "
+          "resolution scale so the game can start",
+          draw_resolution_scale_x, draw_resolution_scale_y, scaled_resolve_size >> 20);
+      draw_resolution_scale_x = 1;
+      draw_resolution_scale_y = 1;
+    } else {
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_buffer);
+      dfn.vkFreeMemory(device, probe_memory, nullptr);
+    }
+  }    
   if (!device_properties.fragmentStoresAndAtomics) {
     if (REXCVAR_GET(vulkan_require_fragment_stores_and_atomics)) {
       REXGPU_ERROR(
@@ -1048,6 +1093,37 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
+    // (Ronda 5, C-R5-03.) RAM tally at startup (GPU side). There is no
+  // global RAM budget: each subsystem grows under its own cap (or none),
+  // so this line is the one place the phone log shows the reserved
+  // blocks together at the scale that actually booted (the C-R5-01 probe
+  // above may already have degraded it to 1x). The guest-heap block is
+  // logged by the memory system at init (xmemory.cpp, "RAM tally (guest
+  // heaps)". Sizes are reservations/caps, not RSS: the shared buffer is
+  // fully resident when non-sparse (see shared_memory.cpp, C-R5-02) and
+  // only the touched pages when sparse; the texture cache grows up to
+  // its hard cap and evicts with LRU past the soft one. 1x estimate on a
+  // 4 GiB phone: 512 MiB shared + up to 768 MiB textures + 10 MiB EDRAM
+  // + guest physical heap up to 512 MiB ~= 1.5-2.5+ GiB resident before
+  // the game itself -- no global cap watches the total.
+{ 
+    const uint64_t scale_area = uint64_t(draw_resolution_scale_x) * uint64_t(draw_resolution_scale_y);
+    const bool shared_sparse = REXCVAR_GET(vulkan_sparse_shared_memory) &&
+                               vulkan_device->properties().sparseResidencyBuffer;
+    REXGPU_INFO(
+        "RAM tally (GPU, scale {}x{}): shared memory {} MB {} | texture cache soft/hard {}/{} MB "
+        "(+{} MB render-to-texture x scale^2) | EDRAM {} MB | scaled-resolve buffer {} MB",
+        draw_resolution_scale_x, draw_resolution_scale_y, SharedMemory::kBufferSize >> 20,
+        shared_sparse ? "sparse (resident = touched pages only)" : "NON-SPARSE (fully resident)",
+        REXCVAR_GET(texture_cache_memory_limit_soft),
+        REXCVAR_GET(texture_cache_memory_limit_hard),
+        REXCVAR_GET(texture_cache_memory_limit_render_to_texture),
+        (uint64_t(xenos::kEdramSizeBytes) * scale_area) >> 20,
+        (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1)
+            ? (uint64_t(SharedMemory::kBufferSize) * scale_area) >> 20
+            : 0);
+}
+  
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -2340,7 +2416,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
   if (swap_texture_view == VK_NULL_HANDLE) {
-    REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+    // (Hunt v1.4.6 round 5, T-R5-03.). Throttle: a deterministic frontbuffer
+    // load failure repeats on every present, so one REXGPU_ERROR per present
+    // would flush the log forever. At most one line per 5 s (same cadence
+    // as the texture-cache eviction log). RequestSwapTexture itself now
+    // serves the 1x1 null image on load failure, so this path should only
+    // be reached when the swap key is invalid or no texture could be
+    // created at all.
+    static std::chrono::steady_clock::time_point last_swap_null_log;
+    static bool swap_null_logged_once = false;
+    const auto swap_null_log_now = std::chrono::steady_clock::now();
+    if (!swap_null_logged_once ||
+        swap_null_log_now - last_swap_null_log >= std::chrono::seconds(5)) {
+      swap_null_logged_once = true;
+      last_swap_null_log = swap_null_log_now;
+      REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+    }      
     return;
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
@@ -3341,15 +3432,19 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
 VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool is_vertex,
                                                                             size_t texture_count,
                                                                             size_t sampler_count) {
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Called from GetPipelineLayout,
-  // which runs on the pipeline creation threads as well as on the
-  // command processor thread: serialize the find + emplace on
-  // descriptor_set_layouts_textures_ and the use of the shared scratch
-  // vector descriptor_set_layout_bindings_ below, which two threads
-  // could otherwise race (UB on unordered_map / vector). Recursive
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.)
+  // Called from GetPipelineLayout, which only runs on the command
+  // processor thread today (via TryGetPipelineCreationArgumentsForDescription
+  // from ConfigurePipeline / IssueDraw, and InitializeShaderStorage) —
+  // never on the pipeline creation threads, which only consume the
+  // pre-looked-up arguments in EnsurePipelineCreated. The lock stays as
+  // defense in depth: it serializes the find + emplace on
+  // descriptor_set_layout_textures_and the use of the shared scratch
+  // vector descriptor_set_layout_bindings_below if this path ever moves
+  // off the processor thread, and it is never contended today. Recursive
   // mutex: GetPipelineLayout holds it while calling this function.
   std::lock_guard<std::recursive_mutex> layout_lock(pipeline_layout_cache_mutex_);
-  size_t binding_count = texture_count + sampler_count;
+  size_t binding_count = texture_count + sampler_count;  
   if (!binding_count) {
     return descriptor_set_layout_empty_;
   }
@@ -3426,16 +3521,19 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
 const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPipelineLayout(
     size_t texture_count_pixel, size_t sampler_count_pixel, size_t texture_count_vertex,
     size_t sampler_count_vertex) {
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Called from
-  // TryGetPipelineCreationArgumentsForDescription, which runs on the
-  // pipeline creation threads (via EnsurePipelineCreated) as well as on
-  // the command processor thread: serialize the find + emplace on
-  // pipeline_layouts_ below, which two threads could otherwise race (UB
-  // on unordered_map). Held across the GetTextureDescriptorSetLayout
-  // calls below, so the recursive mutex also covers the descriptor set
-  // layout cache and the shared scratch vector; this also closes the
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.)
+  // Called from TryGetPipelineCreationArgumentsForDescription, which only
+  // runs on the command processor thread today (ConfigurePipeline /
+  // IssueDraw, and InitializeShaderStorage) — never on the pipeline
+  // creation threads, which only consume the pre-looked-up arguments in
+  // EnsurePipelineCreated. The lock stays as defense in depth: it
+  // serializes the find + emplace on pipeline_layouts_ below if this
+  // path ever moves off the processor thread, and it is never contended
+  // today. Held across the GetTextureDescriptorSetLayout calls below, so
+  // the recursive mutex also covers the descriptor set layout cache and
+  // the shared scratch vector; this also closes the
   // check-then-create TOCTOU (two threads creating the same layout and
-  // one leaking its vkCreatePipelineLayout on the losing emplace).
+  // one leaking its vkCreatePipelineLayout on the losing emplace).  
   // IssueDraw never takes this lock, so no lock-ordering issue there.
   std::lock_guard<std::recursive_mutex> layout_lock(pipeline_layout_cache_mutex_);
   PipelineLayoutKey pipeline_layout_key;
