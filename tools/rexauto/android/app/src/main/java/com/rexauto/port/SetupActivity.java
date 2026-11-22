@@ -2,6 +2,8 @@ package com.rexauto.port;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
@@ -28,9 +30,11 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 /**
  * First-run router + minimal import screen. Official-port UX (v1.4): tapping
@@ -335,10 +339,19 @@ public class SetupActivity extends Activity {
         progress.setIndeterminate(true);
     }
 
-    private void post(String s) { ui.post(() -> status.setText(s)); }
+    // (Caza ronda 7, A4-R7-04.) The progress posts below run from the
+    // import worker threads, which no longer hold the activity (see
+    // importFile()/importTree()): the runnable re-checks liveness on the
+    // UI thread before touching a view, so a post that lands after the
+    // activity died is dropped instead of poking dead views.
+    private void post(String s) { ui.post(() -> {
+        if (isFinishing() || isDestroyed() || status == null) return;
+        status.setText(s);
+    }); }
 
     private void postProgress(String s, long done, long total) {
         ui.post(() -> {
+            if (isFinishing() || isDestroyed() || status == null || progress == null) return;
             progress.setIndeterminate(total <= 0);
             if (total > 0) progress.setProgress((int) (done * 1000 / total));
             status.setText(String.format(Locale.US, "%s  %d / %d MB", s, done >> 20, total >> 20));
@@ -354,13 +367,41 @@ public class SetupActivity extends Activity {
         setBusy(true);
         String name = displayName(uri);
         post(getString(R.string.status_reading, name));
+        // (Caza ronda 7, A4-R7-04.) The worker thread below used to capture
+        // this (the activity) through its lambda -- getContentResolver(),
+        // GameFiles.gameDir(this), this::postProgress -- so a destroyed
+        // activity (Back mid-import) could not be collected until a ~7 GB
+        // import finished. The thread now holds only a WeakReference to
+        // the activity plus the application context, which outlives any
+        // activity and is all the import needs: ContentResolver, files
+        // dir, strings, prefs. Progress posts go through the weak
+        // reference and postProgress() itself re-checks liveness on the
+        // UI thread before touching a view. The deliberate R9-F1 design
+        // is unchanged: Back does NOT cancel the import -- it completes,
+        // game_root.txt is written, and only the launch is suppressed
+        // (finish() checks the weak reference before launching).
+        final WeakReference<SetupActivity> selfRef = new WeakReference<>(this);
+        final Context appCtx = getApplicationContext();
+        final ContentResolver appResolver = appCtx.getContentResolver();
         new Thread(() -> {
-            File dest = GameFiles.gameDir(this);
+            File dest = GameFiles.gameDir(appCtx);
             File staging = importStagingDir(dest);
             // (Caza ronda 6, A4-R6-08.) Si la promocion falla, staging
             // guarda la unica copia buena del import completo: el finally
             // NO debe borrarlo (ver el catch de promoteStagedImport abajo).
             boolean promotionFailed = false;
+            // Progress/status callbacks that never retain the activity:
+            // the weak reference is dereferenced per event, and a dead
+            // activity simply stops receiving updates (the import
+            // continues to completion).
+            IsoExtractor.Progress progress = (s, done, total) -> {
+                SetupActivity a = selfRef.get();
+                if (a != null) a.postProgress(s, done, total);
+            };
+            Consumer<String> poster = s -> {
+                SetupActivity a = selfRef.get();
+                if (a != null) a.post(s);
+            };
             try {
                 // (Hunt v1.4.6 ronda 4, A4-R4-02.) Everything below used to
                 // write straight into dest: a failure after default.xex
@@ -376,7 +417,7 @@ public class SetupActivity extends Activity {
                 // no output file exists yet, so nothing is ever skipped.
                 deleteTree(staging);
                 staging.mkdirs();
-                IsoExtractor iso = IsoExtractor.open(getContentResolver(), uri);
+                IsoExtractor iso = IsoExtractor.open(appResolver, uri);
                 File xex;
                 if (iso != null) {
                     // (Ronda 7, auditor F — R7-F1.) Sin try/finally, un
@@ -395,32 +436,32 @@ public class SetupActivity extends Activity {
                         long total = 0;
                         for (IsoExtractor.Entry e : iso.list()) total += e.size;
                         requireFreeSpace(staging, total);
-                        xex = iso.extractAll(staging, this::postProgress);
+                        xex = iso.extractAll(staging, progress);
                     } finally {
                         iso.close();
                     }
-                    if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
-                } else if ((xex = importPackage(uri, name, staging)) != null) {
+                    if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_iso));
+                } else if ((xex = importPackage(appCtx, appResolver, uri, name, staging, progress, poster)) != null) {
                     // CON/LIVE/PIRS handled
                 } else {
                     // not a disc: accept a raw default.xex
-                    try (InputStream probe = getContentResolver().openInputStream(uri)) {
+                    try (InputStream probe = appResolver.openInputStream(uri)) {
                         // (Ronda 5, auditor F — R5-F2.) openInputStream() puede
                         // devolver null (permiso SAF revocado): xexTitleId(null)
                         // tira NPE, que xexTitleId NO caza (solo IOException).
-                        if (probe == null) throw new Exception(getString(R.string.err_not_iso, name));
+                        if (probe == null) throw new Exception(appCtx.getString(R.string.err_not_iso, name));
                         if (GameFiles.xexTitleId(probe) == null)
-                            throw new Exception(getString(R.string.err_not_iso, name));
+                            throw new Exception(appCtx.getString(R.string.err_not_iso, name));
                     }
                     xex = new File(staging, "default.xex");
                     // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre
                     // con el tamano del documento (0 si el provider no lo
                     // da: entonces solo se exige el margen).
-                    requireFreeSpace(staging, pickedFileSize(uri));
-                    try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    requireFreeSpace(staging, pickedFileSize(appResolver, uri));
+                    try (InputStream in = appResolver.openInputStream(uri)) {
                         // (Ronda 5, auditor F — R5-F2.) Igual que el probe de
                         // arriba: copyStream(null, ...) tira NPE en in.read().
-                        if (in == null) throw new Exception(getString(R.string.err_not_iso, name));
+                        if (in == null) throw new Exception(appCtx.getString(R.string.err_not_iso, name));
                         IsoExtractor.copyStream(in, xex);
                     }
                 }
@@ -428,7 +469,7 @@ public class SetupActivity extends Activity {
                 // catch a wrong game after the new files already replaced
                 // the old install, while game_root.txt still points at the
                 // same path — a wrong-title import would then boot as valid.
-                checkXexTitle(xex);
+                checkXexTitle(appCtx, xex);
                 try {
                     promoteStagedImport(staging, dest);
                 } catch (java.io.IOException e) {
@@ -439,9 +480,13 @@ public class SetupActivity extends Activity {
                     promotionFailed = true;
                     throw e;
                 }
-                finish(promotedXex(staging, dest, xex));
+                finish(appCtx, selfRef, promotedXex(staging, dest, xex));
             } catch (Exception e) {
-                fail(e.getMessage());
+                // (Caza ronda 7, A4-R7-04.) The worker holds no strong
+                // reference to the activity: fail() is only reached while
+                // it still lives.
+                SetupActivity a = selfRef.get();
+                if (a != null) a.fail(e.getMessage());
             } finally {
                 sImportRunning = false;
                 if (!promotionFailed) deleteTree(staging);
@@ -454,10 +499,16 @@ public class SetupActivity extends Activity {
      * unpacked entry by entry; a single-file Games-on-Demand image goes through
      * the GDFX path. A multi-part GoD needs its ".data" folder, so the user is
      * pointed at the folder picker. Returns null when the file is not a package.
+     * (Caza ronda 7, A4-R7-04.) Static with explicit context: it runs on the
+     * import worker thread, so it takes the application context, its
+     * ContentResolver and the progress/status callbacks as parameters
+     * instead of capturing the activity (getContentResolver(),
+     * this::postProgress, post()).
      */
-    private File importPackage(Uri uri, String name, File dest) throws Exception {
+    private static File importPackage(Context appCtx, ContentResolver cr, Uri uri, String name, File dest,
+            IsoExtractor.Progress progress, Consumer<String> poster) throws Exception {
         java.nio.ByteBuffer hdr;
-        android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r");
+        android.os.ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r");
         // (Ronda 6, auditor F — R6-F2.) Un fd que no se puede abrir no es
         // "no es un paquete": devolver null hacia que importFile lo tratase
         // como un .xex suelto y fallase con err_not_iso, el mensaje
@@ -480,21 +531,21 @@ public class SetupActivity extends Activity {
         if (StfsExtractor.volumeType(hdr) == StfsExtractor.VOLUME_SVOD) {
             ch.close(); pfd.close();
             if (hdr.getInt(0x39D) > 1)
-                throw new Exception(getString(R.string.err_god_needs_folder, name));
+                throw new Exception(appCtx.getString(R.string.err_god_needs_folder, name));
             StfsExtractor.Found f = new StfsExtractor.Found(uri, name, hdr, null);
-            post(getString(R.string.status_reading, name + " (Games on Demand)"));
-            IsoExtractor god = StfsExtractor.openSvod(getContentResolver(), f, null);
+            poster.accept(appCtx.getString(R.string.status_reading, name + " (Games on Demand)"));
+            IsoExtractor god = StfsExtractor.openSvod(cr, f, null);
             try {
                 // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre.
                 long total = 0;
                 for (IsoExtractor.Entry e : god.list()) total += e.size;
                 requireFreeSpace(dest, total);
-                File xex = god.extractAll(dest, this::postProgress);
-                if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
+                File xex = god.extractAll(dest, progress);
+                if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_iso));
                 return xex;
             } finally { god.close(); }
         }
-        post(getString(R.string.status_reading, name + " (STFS)"));
+        poster.accept(appCtx.getString(R.string.status_reading, name + " (STFS)"));
         try {
             // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre con el
             // total de la tabla de archivos, antes de escribir nada.
@@ -504,8 +555,8 @@ public class SetupActivity extends Activity {
             long total = 0;
             for (StfsExtractor.Stfs.Entry e : stfs.fileTable()) total += e.length;
             requireFreeSpace(dest, total);
-            File xex = stfs.extractAll(dest, this::postProgress);
-            if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_stfs, name));
+            File xex = stfs.extractAll(dest, progress);
+            if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_stfs, name));
             return xex;
         } finally { ch.close(); pfd.close(); }
     }
@@ -517,12 +568,26 @@ public class SetupActivity extends Activity {
         sImportRunning = true;
         setBusy(true);
         post(getString(R.string.status_copying));
+        // (Caza ronda 7, A4-R7-04.) Same weak-reference + application-
+        // context split as importFile() above: the worker thread holds no
+        // strong reference to this activity (see there for the R9-F1 note).
+        final WeakReference<SetupActivity> selfRef = new WeakReference<>(this);
+        final Context appCtx = getApplicationContext();
+        final ContentResolver appResolver = appCtx.getContentResolver();
         new Thread(() -> {
-            File dest = GameFiles.gameDir(this);
+            File dest = GameFiles.gameDir(appCtx);
             File staging = importStagingDir(dest);
             // (Caza ronda 6, A4-R6-08.) Igual que en importFile: si la
             // promocion falla, staging guarda la unica copia buena.
             boolean promotionFailed = false;
+            IsoExtractor.Progress progress = (s, done, total) -> {
+                SetupActivity a = selfRef.get();
+                if (a != null) a.postProgress(s, done, total);
+            };
+            Consumer<String> poster = s -> {
+                SetupActivity a = selfRef.get();
+                if (a != null) a.post(s);
+            };
             try {
                 // (Hunt v1.4.6 ronda 4, A4-R4-02.) Staging dir, same as
                 // importFile: nothing is written into dest until the
@@ -530,22 +595,22 @@ public class SetupActivity extends Activity {
                 deleteTree(staging);
                 staging.mkdirs();
                 File xex;
-                StfsExtractor.Found pkg = StfsExtractor.findInTree(getContentResolver(), tree, DocumentsContract.getTreeDocumentId(tree), 0);
+                StfsExtractor.Found pkg = StfsExtractor.findInTree(appResolver, tree, DocumentsContract.getTreeDocumentId(tree), 0);
                 if (pkg != null && pkg.volumeType() == StfsExtractor.VOLUME_SVOD) {
                     // Games on Demand dump: <id>/<header> + <header>.data/Data0000..
-                    post(getString(R.string.status_reading, pkg.name + " (Games on Demand)"));
-                    IsoExtractor god = StfsExtractor.openSvod(getContentResolver(), pkg, tree);
+                    poster.accept(appCtx.getString(R.string.status_reading, pkg.name + " (Games on Demand)"));
+                    IsoExtractor god = StfsExtractor.openSvod(appResolver, pkg, tree);
                     try {
                         // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre.
                         long total = 0;
                         for (IsoExtractor.Entry e : god.list()) total += e.size;
                         requireFreeSpace(staging, total);
-                        xex = god.extractAll(staging, this::postProgress);
+                        xex = god.extractAll(staging, progress);
                     } finally { god.close(); }
-                    if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
+                    if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_iso));
                 } else if (pkg != null) {
-                    post(getString(R.string.status_reading, pkg.name + " (STFS)"));
-                    android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(pkg.headerDoc, "r");
+                    poster.accept(appCtx.getString(R.string.status_reading, pkg.name + " (STFS)"));
+                    android.os.ParcelFileDescriptor pfd = appResolver.openFileDescriptor(pkg.headerDoc, "r");
                     // (Ronda 5, auditor F — R5-F2.) openFileDescriptor() puede
                     // devolver null; IsoExtractor.open() SI lo comprueba (:54),
                     // esta rama no: pfd.getFileDescriptor() tira NPE y el
@@ -559,20 +624,20 @@ public class SetupActivity extends Activity {
                         long total = 0;
                         for (StfsExtractor.Stfs.Entry e : stfs.fileTable()) total += e.length;
                         requireFreeSpace(staging, total);
-                        xex = stfs.extractAll(staging, this::postProgress);
+                        xex = stfs.extractAll(staging, progress);
                     }
                     finally { ch.close(); pfd.close(); }
-                    if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_stfs, pkg.name));
+                    if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_stfs, pkg.name));
                 } else {
                     long[] counter = {0};
                     // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre
                     // con el tamano total del arbol (solo metadatos).
-                    requireFreeSpace(staging, treeSize(tree, DocumentsContract.getTreeDocumentId(tree), 0));
-                    copyTree(tree, DocumentsContract.getTreeDocumentId(tree), staging, counter, 0);
+                    requireFreeSpace(staging, treeSize(appResolver, tree, DocumentsContract.getTreeDocumentId(tree), 0));
+                    copyTree(appCtx, appResolver, poster, tree, DocumentsContract.getTreeDocumentId(tree), staging, counter, 0);
                     xex = findXex(staging, 0);
                 }
-                if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_folder));
-                checkXexTitle(xex);
+                if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_folder));
+                checkXexTitle(appCtx, xex);
                 try {
                     promoteStagedImport(staging, dest);
                 } catch (java.io.IOException e) {
@@ -581,9 +646,12 @@ public class SetupActivity extends Activity {
                     promotionFailed = true;
                     throw e;
                 }
-                finish(promotedXex(staging, dest, xex));
+                finish(appCtx, selfRef, promotedXex(staging, dest, xex));
             } catch (Exception e) {
-                fail(e.getMessage());
+                // (Caza ronda 7, A4-R7-04.) Igual que en importFile: fail()
+                // solo se alcanza mientras la activity sigue viva.
+                SetupActivity a = selfRef.get();
+                if (a != null) a.fail(e.getMessage());
             } finally {
                 sImportRunning = false;
                 if (!promotionFailed) deleteTree(staging);
@@ -591,11 +659,15 @@ public class SetupActivity extends Activity {
         }, "import-tree").start();
     }
 
-    private void copyTree(Uri tree, String docId, File dest, long[] counter, int depth) throws Exception {
+    // (Caza ronda 7, A4-R7-04.) Static with explicit context: runs on the
+    // import worker thread, so the resolver and the status callback come
+    // in as parameters instead of capturing the activity.
+    private static void copyTree(Context appCtx, ContentResolver cr, Consumer<String> poster,
+            Uri tree, String docId, File dest, long[] counter, int depth) throws Exception {
         if (depth > 12) return;
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
         List<String[]> rows = new ArrayList<>();
-        try (Cursor c = getContentResolver().query(children, new String[]{
+        try (Cursor c = cr.query(children, new String[]{
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                 DocumentsContract.Document.COLUMN_MIME_TYPE}, null, null, null)) {
@@ -606,17 +678,17 @@ public class SetupActivity extends Activity {
             File out = new File(dest, name);
             if (DocumentsContract.Document.MIME_TYPE_DIR.equals(r[2])) {
                 out.mkdirs();
-                copyTree(tree, r[0], out, counter, depth + 1);
+                copyTree(appCtx, cr, poster, tree, r[0], out, counter, depth + 1);
             } else {
                 Uri doc = DocumentsContract.buildDocumentUriUsingTree(tree, r[0]);
-                try (InputStream in = getContentResolver().openInputStream(doc)) {
+                try (InputStream in = cr.openInputStream(doc)) {
                     // (Ronda 5, auditor F — R5-F2.) openInputStream() null ->
                     // NPE en copyStream; convertirlo en error con el doc.
                     if (in == null) throw new java.io.IOException("cannot open " + doc);
                     IsoExtractor.copyStream(in, out);
                 }
                 counter[0]++;
-                post(getString(R.string.status_copied, counter[0], name));
+                poster.accept(appCtx.getString(R.string.status_copied, counter[0], name));
             }
         }
     }
@@ -661,19 +733,19 @@ public class SetupActivity extends Activity {
     }
 
     /** Size of a picked document via OpenableColumns.SIZE; 0 when unknown. */
-    private long pickedFileSize(Uri uri) {
-        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+    private static long pickedFileSize(ContentResolver cr, Uri uri) {
+        try (Cursor c = cr.query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
             if (c != null && c.moveToFirst()) return c.getLong(0);
         } catch (Exception ignored) { }
         return 0;
     }
 
     /** Total bytes of a picked folder tree (metadata only, nothing is read). */
-    private long treeSize(Uri tree, String docId, int depth) {
+    private static long treeSize(ContentResolver cr, Uri tree, String docId, int depth) {
         if (depth > 12) return 0;
         long total = 0;
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
-        try (Cursor c = getContentResolver().query(children, new String[]{
+        try (Cursor c = cr.query(children, new String[]{
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_MIME_TYPE,
                 DocumentsContract.Document.COLUMN_SIZE}, null, null, null)) {
@@ -681,7 +753,7 @@ public class SetupActivity extends Activity {
             while (c != null && c.moveToNext()) rows.add(new String[]{c.getString(0), c.getString(1), c.getString(2)});
             for (String[] r : rows) {
                 if (DocumentsContract.Document.MIME_TYPE_DIR.equals(r[1])) {
-                    total += treeSize(tree, r[0], depth + 1);
+                    total += treeSize(cr, tree, r[0], depth + 1);
                 } else {
                     try { total += r[2] == null ? 0 : Long.parseLong(r[2]); } catch (NumberFormatException ignored) { }
                 }
@@ -754,17 +826,20 @@ public class SetupActivity extends Activity {
      * the staged xex BEFORE promoting: a wrong game must never replace a
      * good install. finish() runs it again on the promoted xex before
      * writing game_root.txt.
+     * (Caza ronda 7, A4-R7-04.) Static with explicit context: called from
+     * the import worker threads, so it takes the application context
+     * instead of capturing the activity.
      */
-    private void checkXexTitle(File xex) throws Exception {
+    private static void checkXexTitle(Context ctx, File xex) throws Exception {
         String got = GameFiles.xexTitleId(xex);
         String want = BuildConfig.TITLE_ID;
         if (want != null && !want.isEmpty() && !want.equals("00000000")) {
             if (got == null) {
-                throw new Exception(getString(R.string.err_xex_unreadable));
+                throw new Exception(ctx.getString(R.string.err_xex_unreadable));
             }
             if (!got.equalsIgnoreCase(want)) {
-                String other = TitleDb.lookup(this, got);
-                throw new Exception(getString(R.string.err_wrong_game,
+                String other = TitleDb.lookup(ctx, got);
+                throw new Exception(ctx.getString(R.string.err_wrong_game,
                         other != null ? other : ("Title ID " + got), BuildConfig.GAME_TITLE, want));
             }
         }
@@ -775,18 +850,23 @@ public class SetupActivity extends Activity {
      * Official-port UX: no "installed" screen, no JUGAR button — the game
      * starts right away. Called from import threads, so the launch runs on
      * the UI thread.
+     * (Caza ronda 7, A4-R7-04.) Static with explicit context: the import
+     * worker threads hold no reference to the activity, so the file work
+     * uses the application context and the launch goes through a static
+     * main-looper Handler that dereferences the weak reference (see the
+     * R9-F1 note in the runnable below).
      */
-    private void finish(File xex) throws Exception {
+    private static void finish(Context appCtx, WeakReference<SetupActivity> selfRef, File xex) throws Exception {
         // Title gate runs here too (finish is also the last check before
         // game_root.txt is written); the imports already ran it on the
         // staged xex before promoting (A4-R4-02).
-        checkXexTitle(xex);
+        checkXexTitle(appCtx, xex);
         File root = xex.getParentFile();
         // (Hunt v1.4.6 ronda 2, A4-R2-02.) Tmp + rename, as GpuDriver.select()
         // does for driver.txt (same reason as launchBundledAsset above: a
         // torn game_root.txt makes the next launch show the reinstall
         // error). The rename runs after the writer closes.
-        File config = GameFiles.configFile(this);
+        File config = GameFiles.configFile(appCtx);
         File tmp = new File(config.getParentFile(), config.getName() + ".tmp");
         try (PrintWriter w = new PrintWriter(new FileWriter(tmp, false))) {
             w.println(root.getAbsolutePath());
@@ -804,25 +884,32 @@ public class SetupActivity extends Activity {
             tmp.delete();
             throw new java.io.IOException("write game_root.txt");
         }
-        new GraphicsSettings(this).write(this);
-        ui.post(() -> {
+        new GraphicsSettings(appCtx).write(appCtx);
+        new Handler(Looper.getMainLooper()).post(() -> {
             // (Ronda 9, auditor F - R9-F1.) finish() corre en el hilo de
-            // import y el runnable llega por ui.post: si el usuario pulso
-            // Atras a mitad del import, la actividad ya esta destruida
-            // cuando corre, y launchGame() lanzaria el juego contra su
-            // voluntad (misma familia que R8-F2, en el otro sentido: alli
-            // era un Toast/dialogo, aqui un startActivity). Sin juego que
-            // lanzar: el import ya esta completo (game_root.txt escrito)
-            // y el proximo arranque entra directo al juego.
-            if (isFinishing() || isDestroyed()) return;
-            setBusy(false);
-            launchGame();
-            finish();
+            // import y el runnable llega por el main looper: si el usuario
+            // pulso Atras a mitad del import, la actividad ya esta
+            // destruida cuando corre, y launchGame() lanzaria el juego
+            // contra su voluntad (misma familia que R8-F2, en el otro
+            // sentido: alli era un Toast/dialogo, aqui un startActivity).
+            // Sin juego que lanzar: el import ya esta completo
+            // (game_root.txt escrito) y el proximo arranque entra directo
+            // al juego. (A4-R7-04:) el runnable solo retiene la referencia
+            // debil, asi que tampoco es el quien retiene la activity.
+            SetupActivity a = selfRef.get();
+            if (a == null || a.isFinishing() || a.isDestroyed()) return;
+            a.setBusy(false);
+            a.launchGame();
+            a.finish();
         });
     }
 
     private void fail(String msg) {
         ui.post(() -> {
+            // (Caza ronda 7, A4-R7-04.) Same liveness guard as post():
+            // the worker's catch reaches here after the activity may
+            // have died (Back mid-import); there is no UI left to update.
+            if (isFinishing() || isDestroyed() || status == null) return;
             setBusy(false);
             status.setText(msg == null ? getString(R.string.err_generic) : msg);
             status.setTextColor(COL_ERROR);
