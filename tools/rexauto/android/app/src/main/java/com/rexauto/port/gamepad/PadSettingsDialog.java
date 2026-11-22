@@ -250,7 +250,12 @@ final class PadSettingsDialog {
 
         final Button resetGame = new Button(activity);
         resetGame.setText(R.string.reset);
-        resetGame.setOnClickListener(v -> new AlertDialog.Builder(activity)
+        resetGame.setOnClickListener(v -> {
+            // (Caza ronda 7, A4-R7-03.) Same guard as show() (A4-R6-07):
+            // no show() on a finishing/destroyed activity
+            // (WindowManager$BadTokenException).
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+                new AlertDialog.Builder(activity)
                 .setMessage(R.string.reset_confirm)
                 .setPositiveButton(android.R.string.ok, (d, w) -> {
                     // (Ronda 7, auditor F — R7-F7.) delete() devuelve
@@ -283,7 +288,8 @@ final class PadSettingsDialog {
                     activity.finish();
                 })
                 .setNegativeButton(android.R.string.cancel, null)
-                .show());
+                .show();
+        });
         hidden2.addView(resetGame, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
