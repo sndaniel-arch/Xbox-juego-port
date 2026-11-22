@@ -33,6 +33,15 @@
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
+// (Hunt v1.4.6, ronda 8, A3-R8-15.) COUPLING, do not flip
+// lightly: every GuestRange* guest-0 rejection in the
+// kernel/XAM layers (rondas 4/6/7/8) works ONLY because
+// QueryRangeAccess reports the first 64 KiB as NoAccess
+// while this is true. Setting protect_zero to false makes
+// the zero page ReadWrite, and all of those checks silently
+// start accepting guest address 0. No code in this tree
+// changes it (verified 2026-11-22); keep it that way.
+
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
