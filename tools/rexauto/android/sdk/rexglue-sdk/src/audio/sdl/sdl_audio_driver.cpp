@@ -26,6 +26,24 @@
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 
+namespace {
+
+// (Ronda 5, C-R5-09.) Hard cap for frames_queued_. The guest is paced by
+// the client semaphore (AudioSystem::queued_frames_, at most
+// kMaximumQueuedFrames = 64 permits: one permit per submitted frame,
+// released by the SDL callback per consumed frame), so on the paced path
+// the queue can never hold more than 64 -- the cap only bites if the
+// guest submits outside the pacing, or the SDL callback stalls (device
+// switch, pause without drain). Dropping the OLDEST frame keeps latency
+// low and the semaphore accounting self-consistent: a dropped frame never
+// gets its permit released, so the guest throttles itself instead of
+// growing the queue at ~1.1 MiB/s forever. Same bound for the retained
+// spare pool: a frame is 1536 floats = 6 KiB, so 64 spares is 384 KiB.
+constexpr size_t kMaxQueuedFrames = 64;
+constexpr size_t kMaxRetainedUnusedFrames = 64;
+
+}  // namespace
+
 namespace rex::audio::sdl {
 
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
@@ -155,6 +173,31 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
+    // (Ronda 5, C-R5-09.) Hard cap: drop the oldest queued frame(s)
+    // instead of growing without bound. The cap is enforced here, at the
+    // push -- the single linearization point -- so concurrent submits
+    // cannot race past it. The dropped buffer is recycled into the spare
+    // pool (or freed if that is full, see below): the new frame's buffer
+    // was already filled above, so this only discards stale audio. The
+    // semaphore permit for the dropped frame is never released, which is
+    // what throttles the guest back into the paced path.
+    static uint32_t dropped_frame_count = 0;
+    while (frames_queued_.size() >= kMaxQueuedFrames) {
+      float* stale_frame = frames_queued_.front();
+      frames_queued_.pop();
+      if (frames_unused_.size() < kMaxRetainedUnusedFrames) {
+        frames_unused_.push(stale_frame);
+      } else {
+        delete[] stale_frame;
+      }
+      ++dropped_frame_count;
+      if (dropped_frame_count < 8 || (dropped_frame_count % 1024) == 0) {
+        REXAPU_WARN("SDLAudioDriver::SubmitFrame: audio frame queue full ({} frames) - "
+                    "dropping oldest frame #{} (SDL callback stalled or guest submitting "
+                    "outside the semaphore pacing)",
+                    kMaxQueuedFrames, dropped_frame_count);
+      }
+    }
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
@@ -191,6 +234,18 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const int sample_count =
       static_cast<int>(channel_samples_ * std::max<uint8_t>(driver->sdl_device_channels_, 1));
   const int len = static_cast<int>(sizeof(float) * sample_count);
+  // (Ronda 5, C-R5-09.) Return a consumed buffer to the spare pool, but
+  // never retain more than kMaxRetainedUnusedFrames: after a stall the
+  // pool used to keep every buffer the burst allocated, forever (384 KiB
+  // at the cap instead of unbounded).
+  auto return_unused_frame = [&](float* frame) {
+    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+    if (driver->frames_unused_.size() < kMaxRetainedUnusedFrames) {
+      driver->frames_unused_.push(frame);
+    } else {
+      delete[] frame;
+    }
+  };
   float* data = SDL_stack_alloc(float, sample_count);
   if (!data) {
     REXAPU_ERROR("SDLAudioDriver::SDLCallback failed to allocate {} samples", sample_count);
@@ -254,14 +309,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     }
     if (!SDL_PutAudioStreamData(stream, data, len)) {
       REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
-      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-      driver->frames_unused_.push(buffer);
+      return_unused_frame(buffer);
       break;
     }
-    {
-      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-      driver->frames_unused_.push(buffer);
-    }
+    return_unused_frame(buffer);
 
     auto ret = driver->semaphore_->Release(1, nullptr);
     assert_true(ret);
