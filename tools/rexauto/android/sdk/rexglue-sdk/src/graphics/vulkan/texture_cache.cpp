@@ -171,6 +171,44 @@ void VulkanTextureCache::ClearTexturePlaceholder(const TextureKey& key) {
   placeholder_texture_keys_.erase(key);
 }
 
+// (Hunt v1.4.6 round 5, T-R5-02.) See texture_cache.h. The callback only
+// clears the texture's resume progress; the shared memory has already
+// cancelled the fired watch, so the handles are just forgotten, never
+// unwatched from here.
+void VulkanTextureCache::Etc2PartialLoadWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& /*global_lock*/, void* context, void* /*data*/,
+    uint64_t /*argument*/, bool /*invalidated_by_gpu*/) {
+  VulkanTexture* texture = static_cast<VulkanTexture*>(context);
+  texture->NoteEtc2PartialLoadWatchFired();
+}
+
+void VulkanTextureCache::VulkanTexture::ArmEtc2PartialLoadWatch(SharedMemory& shared_memory) {
+  if (etc2_partial_load_base_watch_handle_ || etc2_partial_load_mips_watch_handle_) {
+    return;
+  }
+  if (GetGuestBaseSize() != 0) {
+    etc2_partial_load_base_watch_handle_ = shared_memory.WatchMemoryRange(
+        key().base_page << 12, GetGuestBaseSize(),
+        VulkanTextureCache::Etc2PartialLoadWatchCallback, this, nullptr, 0);
+  }
+  if (GetGuestMipsSize() != 0) {
+    etc2_partial_load_mips_watch_handle_ = shared_memory.WatchMemoryRange(
+        key().mip_page << 12, GetGuestMipsSize(),
+        VulkanTextureCache::Etc2PartialLoadWatchCallback, this, nullptr, 1);
+  }
+}
+
+void VulkanTextureCache::VulkanTexture::DisarmEtc2PartialLoadWatch(SharedMemory& shared_memory) {
+  if (etc2_partial_load_base_watch_handle_) {
+    shared_memory.UnwatchMemoryRange(etc2_partial_load_base_watch_handle_);
+    etc2_partial_load_base_watch_handle_ = nullptr;
+  }
+  if (etc2_partial_load_mips_watch_handle_) {
+    shared_memory.UnwatchMemoryRange(etc2_partial_load_mips_watch_handle_);
+    etc2_partial_load_mips_watch_handle_ = nullptr;
+  }
+}
+
 void VulkanTextureCache::RecordEtc2TranscodeFailure(const TextureKey& key,
                                                     uint64_t submission) {
   // (Audit A-3b.) A transcode failure is transient (staging allocation
@@ -250,6 +288,14 @@ void VulkanTextureCache::ReadGuestBcBlock(
 // blocks, so the sample finds it; the documented tradeoff is that 1-bit
 // alpha confined to a handful of blocks that all fall between sampled
 // blocks is missed and renders opaque.
+// (Hunt v1.4.6 round 5, T-R5-08.) The sample spans the whole base level
+// in all three axes: z planes for 3D textures (a BC block is 4x4x1, so
+// z_extent is the number of z block-planes) and array slices for stacked
+// textures. Before this fix only slice 0 / z plane 0 was scanned, so
+// 1-bit alpha living only in a deeper slice rendered opaque. The cap is
+// still kDxt1AlphaScanMaxBlocks sampled blocks in total, so a big 3D or
+// array texture samples each plane more sparsely -- same tradeoff as
+// within one plane, now spread over the whole volume.
 // Caveat: if a texture's contents change from opaque to 1-bit-alpha under
 // the same key (dynamic texture reuse), the memoized answer goes stale and
 // the transparent texels render opaque. Game textures are static data, so
@@ -267,21 +313,38 @@ bool VulkanTextureCache::Dxt1TextureHasOneBitAlpha(
   uint32_t guest_base = key.base_page << 12;
   bool is_3d = key.dimension == xenos::DataDimension::k3D;
   uint8_t block[8];
-  const uint32_t total_blocks =
-      level_layout.x_extent_blocks * level_layout.y_extent_blocks;
+  // (Hunt v1.4.6 round 5, T-R5-08.) Sample every z plane and every array
+  // slice, not just slice 0: for 3D textures the third axis is z_extent
+  // block-planes (BC blocks are 4x4x1); for stacked textures it is the
+  // array layers, addressed by the slice parameter of ReadGuestBcBlock.
+  const uint32_t z_planes =
+      is_3d ? std::max(level_layout.z_extent, UINT32_C(1)) : UINT32_C(1);
+  const uint32_t array_slices =
+      is_3d ? UINT32_C(1) : std::max(key.GetDepthOrArraySize(), UINT32_C(1));
+  const uint32_t plane_blocks = level_layout.x_extent_blocks * level_layout.y_extent_blocks;
+  // 64-bit: a bogus fetch constant could make x*y*z*slices exceed 2^32
+  // (e.g. 8192x8192 x 2048 slices); the sampled loop below only ever
+  // visits kDxt1AlphaScanMaxBlocks of them, but the total itself must not
+  // wrap.
+  const uint64_t total_blocks = uint64_t(plane_blocks) * z_planes * array_slices;
   // Stride in blocks, row-major over the whole level: 1 while the level
   // fits in the cap, larger for big levels (1024x1024 -> stride 16).
   // total_blocks == 0 skips the loop entirely (x_extent_blocks == 0).
-  const uint32_t stride = std::max(
-      (total_blocks + kDxt1AlphaScanMaxBlocks - 1) / kDxt1AlphaScanMaxBlocks, UINT32_C(1));
-  for (uint32_t block_index = 0; block_index < total_blocks && !has_alpha;
+  const uint64_t stride = std::max(
+      (total_blocks + kDxt1AlphaScanMaxBlocks - 1) / kDxt1AlphaScanMaxBlocks, uint64_t(1));
+  for (uint64_t block_index = 0; block_index < total_blocks && !has_alpha;
        block_index += stride) {
-    const uint32_t bx = block_index % level_layout.x_extent_blocks;
-    const uint32_t by = block_index / level_layout.x_extent_blocks;
+    const uint32_t slice = uint32_t(block_index / (uint64_t(plane_blocks) * z_planes));
+    const uint32_t z_remainder =
+        uint32_t(block_index % (uint64_t(plane_blocks) * z_planes));
+    const uint32_t bz = z_remainder / plane_blocks;
+    const uint32_t xy_index = z_remainder % plane_blocks;
+    const uint32_t bx = xy_index % level_layout.x_extent_blocks;
+    const uint32_t by = xy_index / level_layout.x_extent_blocks;
     // (Hunt v1.4.6 round 3, A1-R3-07.) No unreadable-block fallback: the
     // read always succeeds (see ReadGuestBcBlock).
-    ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, 0, 0, block,
-                     8);
+    ReadGuestBcBlock(shared_memory, level_layout, guest_base, key, is_3d, bx, by, bz, slice,
+                     block, 8);
     if (etc2::Bc1BlockHasOneBitAlpha(block)) {
       has_alpha = true;
       break;
@@ -636,6 +699,9 @@ VulkanTextureCache::~VulkanTextureCache() {
   if (null_image_view_3d_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, null_image_view_3d_, nullptr);
   }
+  if (null_image_view_2d_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, null_image_view_2d_, nullptr);
+  }
   if (null_image_view_cube_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, null_image_view_cube_, nullptr);
   }
@@ -755,6 +821,28 @@ void VulkanTextureCache::EndFrame() {
                  unsupported_features & kUnsupportedUnormBit ? " unsigned" : "",
                  unsupported_features & kUnsupportedSnormBit ? " signed" : "");
   }
+}
+
+void VulkanTextureCache::ClearCache() {
+  // (Hunt v1.4.6 round 5, T-R5-09.) ClearCache destroys every texture, so
+  // every per-key side entry is stale: a recreated texture with the same
+  // key must re-scan DXT1 alpha, re-earn its ETC2 failure streak and
+  // re-mark its placeholder from scratch, instead of inheriting a
+  // decision made for a texture that no longer exists.
+  placeholder_texture_keys_.clear();
+  etc2_failed_textures_.clear();
+  dxt1_alpha_memo_.clear();
+  TextureCache::ClearCache();
+}
+
+void VulkanTextureCache::OnTextureEvicted(const TextureKey& key) {
+  // (Hunt v1.4.6 round 5, T-R5-09.) Same pruning as ClearCache, for one
+  // key: without this the three side maps grow without bound for the
+  // whole session (one entry per distinct key ever seen), even though the
+  // texture itself is long gone.
+  placeholder_texture_keys_.erase(key);
+  etc2_failed_textures_.erase(key);
+  dxt1_alpha_memo_.erase(key);
 }
 
 void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -1226,7 +1314,44 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
     return VK_NULL_HANDLE;
   }
   if (!LoadTextureData(*texture)) {
-    return VK_NULL_HANDLE;
+    // (Hunt v1.4.6 round 5, T-R5-03.) No fallback existed here: a load
+    // failure returned VK_NULL_HANDLE and IssueSwap aborted the present
+    // on every frame (permanent black screen for a deterministic failure,
+    // e.g. no loader for the format). Serve the cache's 1x1 null image
+    // instead, at the real frontbuffer size, so the present still runs
+    // and shows a degraded (black) frame. A plain 2D view is required:
+    // the swap gamma shaders declare `texture2D`, and the 2D_ARRAY null
+    // view used for shader fetches would be a view-type mismatch there.
+    // The texture is left outdated (and is NOT marked placeholder for a
+    // transient failure), so the next frame retries the load.
+    // Caveat: the swap gamma shaders texelFetch() by output pixel, so
+    // reads past (0,0) of this 1x1 image are out of bounds; the view
+    // swizzle is all-zero, so in practice they read black. A full-size
+    // black fallback image would need a per-present allocation and is
+    // out of scope for this fix.
+    if (null_image_view_2d_ == VK_NULL_HANDLE) {
+      return VK_NULL_HANDLE;
+    }
+    static bool swap_null_fallback_logged = false;
+    if (!swap_null_fallback_logged) {
+      swap_null_fallback_logged = true;
+      REXGPU_WARN(
+          "VulkanTextureCache: Frontbuffer texture failed to load; presenting "
+          "the 1x1 null image instead");
+    }
+    const TextureKey& texture_key = texture->key();
+    if (width_unscaled_out) {
+      *width_unscaled_out = texture_key.GetWidth();
+    }
+    if (height_unscaled_out) {
+      *height_unscaled_out = texture_key.GetHeight();
+    }
+    width_scaled_out =
+        texture_key.GetWidth() * (texture_key.scaled_resolve ? draw_resolution_scale_x() : 1);
+    height_scaled_out =
+        texture_key.GetHeight() * (texture_key.scaled_resolve ? draw_resolution_scale_y() : 1);
+    format_out = texture_key.format;
+    return null_image_view_2d_;
   }
   texture->MarkAsUsed();
   VulkanTexture::Usage old_usage = texture->SetUsage(VulkanTexture::Usage::kSwapSampled);
@@ -1732,6 +1857,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     // there is nothing to upload and the texture simply retries next
     // submission.
     if (uploads.empty()) {
+      // (Hunt v1.4.6 round 5, T-R5-02.) Nothing was transcoded this call
+      // and the load is incomplete: arm the partial-load watch so a guest
+      // rewrite before the next submission invalidates the saved resume
+      // position instead of silently mixing two guest generations.
+      if (vulkan_texture.etc2_progress_active()) {
+        vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
+      }
       return false;
     }
     // Make the CPU writes visible to the device before recording the copies
@@ -1828,12 +1960,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     if (!etc2_load_complete) {
       // Not done yet: more slices are pending, and the texture stays
       // outdated so the next submission resumes at the saved position.
+      // (Hunt v1.4.6 round 5, T-R5-02.) Arm the partial-load watch (see
+      // above): a guest rewrite before the next submission must drop
+      // the saved position, or the resume would mix slices from two
+      // guest generations.
+      vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
       return false;
     }
 
     // (Audit A-3b.) Transcode succeeded: forget any earlier failures for
     // this key so a later failure starts counting from zero again, and
     // drop the progress -- the load is complete.
+    vulkan_texture.DisarmEtc2PartialLoadWatch(shared_memory());
     vulkan_texture.ClearEtc2Progress();
     etc2_failed_textures_.erase(texture_key);
     ClearTexturePlaceholder(texture_key);
@@ -2509,8 +2647,18 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+  // (Hunt v1.4.6 round 5, T-R5-02.) Drop the partial-load watch, if armed:
+  // the base Texture destructor below only unwatches the up-to-date
+  // base/mips watches, and a watch outliving its texture would fire into
+  // a destroyed object.
+  // (V-R5-01, second sweep: the Disarm must go through the
+  // VulkanTextureCache reference, not texture_cache().shared_memory():
+  // shared_memory() is protected in TextureCache and this destructor is a
+  // VulkanTexture member, so the base-class reference does not grant
+  // access; through the derived reference it does.)
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
+  DisarmEtc2PartialLoadWatch(vulkan_texture_cache.shared_memory());
   const ui::vulkan::VulkanDevice* const vulkan_device =
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2671,16 +2819,21 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     texture_3d_as_2d_.reset(
         new VulkanTexture(vulkan_texture_cache, key_2d, image_2d, allocation_2d, false));
     texture_3d_as_2d_->SetForceLoad3DTiling(true);
+  }
 
+  if (!texture_3d_as_2d_loaded_) {
+    // (Hunt v1.4.6 round 5, T-R5-01.) REGRESSION of the A1-R3-03 fix: R3-03
+    // kept the wrapper across a failed first load and promised a retry on
+    // the next submission, but the load only ran inside `if
+    // (!texture_3d_as_2d_)`, so a wrapper that failed once never loaded
+    // again -- and the code below then built and cached an image view over
+    // an image that was never loaded (layout UNDEFINED, texels
+    // uninitialized) forever. Retry the load on EVERY call until it
+    // succeeds; only then set texture_3d_as_2d_loaded_ and fall through
+    // to view creation. A deterministic failure just retries like any
+    // other unloaded texture (the wrapper is a single slice, so it
+    // completes as soon as budget or scratch is free).
     if (!vulkan_texture_cache.LoadTextureData(*texture_3d_as_2d_)) {
-      // (Hunt v1.4.6 round 3, A1-R3-03.) LoadTextureData returns false on
-      // transient deferrals too (ETC2 budget exhausted, scratch buffer
-      // already used this submission): keep the wrapper and retry on the
-      // next submission instead of destroying it, which logged an ERROR
-      // and paid a full vmaCreateImage + re-transcode per submission. The
-      // wrapper is a single slice, so it completes as soon as budget or
-      // scratch is free; a deterministic failure just retries like any
-      // other unloaded texture.
       return VK_NULL_HANDLE;
     }
 
@@ -2693,6 +2846,7 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
       return VK_NULL_HANDLE;
     }
     texture_3d_as_2d_->SetUsage(Usage::kGuestShaderSampled);
+    texture_3d_as_2d_loaded_ = true;
   }
 
   const HostFormatPair& host_format_pair = vulkan_texture_cache.GetHostFormatPair(key());
@@ -3892,6 +4046,20 @@ bool VulkanTextureCache::Initialize() {
     if (dfn.vkCreateImageView(device, &null_image_view_create_info, nullptr,
                               &null_image_view_3d_) != VK_SUCCESS) {
       REXGPU_ERROR("VulkanTextureCache: Failed to create the null 3D image view");
+      return false;
+    }
+
+    // (Hunt v1.4.6 round 5, T-R5-03.) Plain 2D view of the same 1x1 null
+    // image, for the swap path (see RequestSwapTexture): the swap gamma
+    // shaders declare `texture2D`, so the 2D_ARRAY view above cannot be
+    // bound there. The image has 6 layers (cube-compatible); a 2D view
+    // takes exactly layer 0.
+    null_image_view_create_info.image = null_image_2d_array_cube_;
+    null_image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    null_image_view_create_info.subresourceRange.layerCount = 1;
+    if (dfn.vkCreateImageView(device, &null_image_view_create_info, nullptr,
+                              &null_image_view_2d_) != VK_SUCCESS) {
+      REXGPU_ERROR("VulkanTextureCache: Failed to create the null 2D image view");
       return false;
     }
 
