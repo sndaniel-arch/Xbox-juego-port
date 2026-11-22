@@ -836,11 +836,20 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 }
 
 TextureCache::Texture::~Texture() {
-  if (mips_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
-  }
-  if (base_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+  // (Hunt v1.4.6 round 8, A2-R8-01.) Disarm under the global critical
+  // region, covering the handle read AND the unwatch: without the lock a
+  // guest write can fire the watch between the read and the unwatch, and
+  // UnwatchMemoryRange would then unlink the same WatchRange a second
+  // time (it is not idempotent). The lock is the single process-wide
+  // recursive mutex (rex::thread::global_critical_region::mutex()), so
+  // taking it here cannot deadlock against FireWatches or any other
+  // holder of the same lock, and the scope covers only the disarm -- the
+  // usage-list unlink below runs unlocked, as before. Reuses DisarmWatch
+  // (same API as the R7-01 call site), which nulls each handle.
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    DisarmWatch(global_lock, true);
+    DisarmWatch(global_lock, false);
   }
 
   if (in_usage_list_) {
@@ -907,12 +916,18 @@ void TextureCache::Texture::MarkAsUsed() {
 
 void TextureCache::Texture::DisarmWatch(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
-  // (Hunt v1.4.6 round 7, A2-R7-01.) Same API as ~Texture below: a
-  // non-null handle means the range is still registered (WatchCallback
-  // nulls it when the watch fires, and FireWatches unlinks the range
-  // before calling the callback, so a null handle is never unlinked
-  // twice). UnwatchMemoryRange unlinks the range and returns it to the
-  // free list, so after this the handle is null AND the range is gone:
+  // (Hunt v1.4.6 round 7, A2-R7-01.) Same API as ~Texture above: the
+  // caller holds the global critical region (see cache.h), so a non-null
+  // handle means the range is still registered -- the only paths that
+  // null it (WatchCallback via FireWatches, and this function) run under
+  // the same lock, so no fire can interleave between the read and the
+  // unwatch, and a null handle is never unlinked twice.
+  // (Hunt v1.4.6 round 8, A2-R8-02.) Correction to the R7-01 comment:
+  // FireWatches calls the callback FIRST and unlinks the range AFTER it
+  // (shared_memory.cpp:249-251). The old comment had the order
+  // backwards; the safety here comes from the lock, not from the order.
+  // UnwatchMemoryRange unlinks the range and returns it to the free
+  // list, so after this the handle is null AND the range is gone:
   // MakeUpToDateAndWatch can install a fresh watch, and destroying the
   // texture can no longer leave an orphan behind.
   SharedMemory::WatchHandle& watch_handle = is_mip ? mips_watch_handle_ : base_watch_handle_;
