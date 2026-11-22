@@ -10,10 +10,13 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Graphics / performance options exposed by the launcher. Each maps 1:1 to a
@@ -55,7 +58,19 @@ public final class GraphicsSettings {
         s = Math.max(1, Math.min(3, s));
         if (s <= 1) return null;
         int mb = 512 * s * s;
-        String size = mb >= 1024 ? (mb / 1024) + " GiB" : mb + " MiB";
+                // (Caza ronda 6, A4-R6-01 — regresion de C-R5-01.) mb/1024 era
+                // division entera: a 3x 4608/1024 = 4 y el texto decia "4 GiB"
+                // cuando el buffer real es 4,5 GiB. Un decimal con coma, con
+                // aritmetica entera (sin Locale: el texto es espanol y debe decir
+                // "4,5", no "4.5" segun la locale del telefono). A 2x sigue
+                // diciendo "2 GiB" exactos (resto 0).
+                String size;
+                if (mb >= 1024) {
+                                int whole = mb / 1024, rem = mb % 1024;
+                                size = rem == 0 ? whole + " GiB" : whole + "," + (rem * 10 / 1024) + " GiB";
+                } else {
+                                size = mb + " MiB";
+                }
         return "A " + s + "x la GPU reserva un buffer de " + size
                 + " que puede no caber en este teléfono: si no cabe, el juego arranca a 1x.";
     }
@@ -357,6 +372,38 @@ public final class GraphicsSettings {
         return m;
     }
 
+        // (Caza ronda 6, A4-R6-02.) Union of every key asCvars() can emit, in
+        // any branch: the always-on knobs, the preset bundle (accuracy and
+        // performance/balanced share the same base keys), the preset-only
+        // keys (anisotropic/occlusion/MSAA/gamma), the Mali overlay keys,
+        // the conditional env keys (FPS cap, tolerant) and the language
+        // keys. write() must never "preserve" one of these from the old
+        // settings.txt: a key asCvars() no longer emits is a knob the user
+        // turned OFF (tolerant, FPS cap) or a preset that changed
+        // (performance -> balanced on a non-Mali GPU), not a hand-added
+        // line. Keys from the "extra" box are already inside the cvars map
+        // itself, so they are rewritten from prefs, never preserved — a
+        // hand-added line survives only when its key is in NEITHER set.
+        private static final Set<String> OWNED_CVAR_KEYS = new HashSet<>(Arrays.asList(
+                        "resolution_scale", "draw_resolution_scale_x", "draw_resolution_scale_y",
+                        "vsync", "present_effect", "video_mode_width", "video_mode_height",
+                        "present_letterbox",
+                        "vulkan_require_fragment_stores_and_atomics",
+                        "vulkan_require_vertex_pipeline_stores_and_atomics",
+                        "license_mask",
+                        "readback_memexport", "vulkan_readback_memexport", "vulkan_readback_resolve",
+                        "texture_cache_memory_limit_soft", "texture_cache_memory_limit_hard",
+                        "texture_cache_memory_limit_render_to_texture",
+                        "async_shader_compilation", "vulkan_async_skip_incomplete_frames",
+                        "vulkan_allow_present_mode_immediate", "vulkan_allow_present_mode_mailbox",
+                        "vulkan_allow_present_mode_fifo_relaxed",
+                        "log_level", "vulkan_log_debug_messages", "gpu_debug_markers",
+                        "vulkan_dynamic_rendering",
+                        "anisotropic_override", "occlusion_query_enable", "native_2x_msaa",
+                        "gamma_render_target_as_unorm16",
+                        "env.REX_FPS_CAP", "env.REX_HEAL_DISCOVER",
+                        "user_language", "user_country"));
+    
     /** Writes settings.txt for the native side. */
     public void write(Context ctx) throws IOException {
         File f = GameFiles.settingsFile(ctx);
@@ -382,7 +429,12 @@ public final class GraphicsSettings {
                     int eq = t.indexOf('=');
                     if (eq <= 0) continue;
                     String key = t.substring(0, eq).trim();
-                    if (!cvars.containsKey(key)) {
+                                        // (Caza ronda 6, A4-R6-02.) Only preserve keys we do
+                                        // not own: a key in OWNED_CVAR_KEYS that asCvars()
+                                        // did not emit this time was deliberately turned off
+                                        // or left behind by a preset change, and preserving
+                                        // it would resurrect it on the next boot.
+                                        if (!cvars.containsKey(key) && !OWNED_CVAR_KEYS.contains(key)) {
                         preserved.add(key + "=" + t.substring(eq + 1).trim());
                     }
                 }
