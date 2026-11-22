@@ -436,7 +436,13 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
   // the latest axis value wins and button state converges from the newest
   // events. The SDL-side queue is still flushed above, so this only bounds
   // our own buffer, not SDL's.
-  if (pending_events_.size() > kMaxPendingEvents) {
+  // (Ronda 5, V-C-01.) Amortize the drop: erasing from the front is a
+  // memmove of the whole queue, so trimming one event per HandleEvent
+  // while over the cap paid up to ~56 KiB of memmove per event. Only trim
+  // once the queue overshoots the cap by a full batch (64 events), back
+  // down to the cap: same bound (1024..1088 events, ~60 KiB), one memmove
+  // per 64 events instead of one per event.
+  if (pending_events_.size() > kMaxPendingEvents + 64) {
     pending_events_.erase(pending_events_.begin(),
                           pending_events_.begin() + static_cast<ptrdiff_t>(pending_events_.size() -
                                                                             kMaxPendingEvents));
@@ -452,6 +458,25 @@ std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
   std::unique_lock<std::mutex> guard(controllers_mutex_);
   for (const auto& event : events) {
     ProcessEventLocked(event);
+  }
+  // (Ronda 5, C-R5-07.) Keep the drained buffer instead of freeing it:
+  // the local vector used to be destroyed here, so the next poll paid a
+  // fresh malloc (up to 1024 events, ~56 KiB) on every guest poll. Hand
+  // the empty-but-allocated buffer back to pending_events_ when nothing
+  // arrived while processing -- clear() first so the swap only moves
+  // capacity, not the processed events. If events DID arrive during
+  // processing, pending_events_ is non-empty and must keep them; the
+  // buffer is freed this once and the next drain regrows it. No new
+  // member, no lock-order change: DrainAndLock stays callable from any
+  // guest thread (a member scratch would let two concurrent drains steal
+  // each other's events), and the retained buffer is still bounded by
+  // the A4-R4-11 cap (kMaxPendingEvents = 1024).
+  events.clear();
+  {
+    std::lock_guard<std::mutex> queue_guard(event_queue_mutex_);
+    if (pending_events_.empty()) {
+      events.swap(pending_events_);
+    }
   }
   return guard;
 }
