@@ -749,6 +749,15 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kHostFormatDXT5AUna
     false};
 
 VulkanTextureCache::~VulkanTextureCache() {
+  // (Hunt v1.4.6 round 7, A1-R7-01.) Drain the deferred 3D-as-2D
+  // destruction queues first, while the device and the VMA allocator
+  // are still alive: ShutdownContext awaited all queue operations
+  // before destroying the cache, so no submission can still reference
+  // these resources. Must run before DestroyAllTextures() /
+  // vmaDestroyAllocator() below, like
+  // VulkanCommandProcessor::ShutdownContext drains its destroy_* queues.
+  DestroyAllDeferred3DAs2DResources();
+
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -851,6 +860,73 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
     }
     null_images_cleared_ = true;
   }
+}
+
+void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+
+  // (Hunt v1.4.6 round 7, A1-R7-01.) Reclaim the 3D-as-2D resources
+  // deferred by DeferDestroy3DAs2DImageView/DeferDestroy3DAs2DWrapper.
+  // The rule is the same as the normal texture eviction
+  // (pipeline/texture/cache.cpp: a texture is only destroyed once
+  // last_usage_submission_index() <= completed_submission_index) and as
+  // VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss reclaims
+  // its destroy_* queues: an entry stamped with submission S is
+  // destroyed only once completed_submission_index >= S. The stamp is
+  // GetCurrentSubmission() at defer time -- the index the currently
+  // open submission will get -- so this covers both UAF cases: draws
+  // already recorded in the open submission (same submission, no fence
+  // in between) and draws in any of the up to kMaxFramesInFlight = 3
+  // submissions already in flight (all stamped with a smaller index).
+  // Entries are appended in non-decreasing stamp order (like the
+  // command processor queues), so reclaiming from the front is enough.
+  // This runs on the command processor thread, like the enqueue sites,
+  // so no lock is needed.
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  while (!deferred_3d_as_2d_image_views_.empty()) {
+    const auto& destroy_pair = deferred_3d_as_2d_image_views_.front();
+    if (destroy_pair.first > completed_submission_index) {
+      break;
+    }
+    dfn.vkDestroyImageView(device, destroy_pair.second, nullptr);
+    deferred_3d_as_2d_image_views_.pop_front();
+  }
+  while (!deferred_3d_as_2d_wrappers_.empty()) {
+    const auto& destroy_pair = deferred_3d_as_2d_wrappers_.front();
+    if (destroy_pair.first > completed_submission_index) {
+      break;
+    }
+    // Destroying the unique_ptr runs ~VulkanTexture, which destroys the
+    // wrapper image (vmaDestroyImage), its views and its allocation.
+    deferred_3d_as_2d_wrappers_.pop_front();
+  }
+}
+
+void VulkanTextureCache::DeferDestroy3DAs2DImageView(VkImageView image_view) {
+  deferred_3d_as_2d_image_views_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                              image_view);
+}
+
+void VulkanTextureCache::DeferDestroy3DAs2DWrapper(
+    std::unique_ptr<VulkanTexture> wrapper) {
+  deferred_3d_as_2d_wrappers_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                           std::move(wrapper));
+}
+
+void VulkanTextureCache::DestroyAllDeferred3DAs2DResources() {
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (const auto& destroy_pair : deferred_3d_as_2d_image_views_) {
+    dfn.vkDestroyImageView(device, destroy_pair.second, nullptr);
+  }
+  deferred_3d_as_2d_image_views_.clear();
+  // Destroying the unique_ptrs runs ~VulkanTexture for each wrapper.
+  deferred_3d_as_2d_wrappers_.clear();
 }
 
 void VulkanTextureCache::BeginFrame() {
@@ -1761,6 +1837,26 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     // least one slice (the `blocks_used > 0` guard lets the first slice
     // through), and the texture is only marked up-to-date once every
     // requested slice is uploaded.
+    // (Hunt v1.4.6 round 7, A2-R7-02.) Arm the partial-load watch BEFORE
+    // the resume read below and the transcode loop, and clear the
+    // invalidation flag first. Until now the watch was only armed when a
+    // load came out incomplete, so on the first submission -- and during
+    // the transcode of any submission -- no watch was registered at all:
+    // a guest write mid-loop mixed the old generation (blocks already
+    // transcoded) with the new one (blocks read after the write) and the
+    // load still completed as up-to-date. Arming here makes the write
+    // observable (NoteEtc2PartialLoadWatchFired sets the flag), and the
+    // checks after the loop discard the mixed work. The clear+arm go
+    // BEFORE the resume read on purpose: a write that fires between
+    // them is still observed, because the callback clears the progress
+    // and the resume read below then restarts from slice 0 (the flag
+    // itself is only needed for writes that land once the loop is
+    // running). Ordering otherwise: any write before the arm is fully
+    // visible to the whole loop (every block is read after it), and any
+    // write after the arm fires the callback. Arm is a no-op for a
+    // range whose watch survived the previous submission.
+    vulkan_texture.ClearEtc2TranscodeInvalidated();
+    vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
     uint32_t resume_loop_level = loop_level_first;
     uint32_t resume_slice = 0;
     if (vulkan_texture.etc2_progress_active()) {
@@ -1924,6 +2020,23 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                           level_depth, loop_level, slice});
       }
     }
+    // (Hunt v1.4.6 round 7, A2-R7-02.) The guest rewrote the range while
+    // this call was transcoding: the slices in `uploads` mix the old
+    // guest generation (blocks read before the write) with the new one,
+    // and slices uploaded by earlier submissions are all old-generation.
+    // Drop this call's work entirely -- the staging pages are simply
+    // never copied -- and restart from slice 0 next submission. The
+    // progress is cleared HERE, on the graphics thread, because the
+    // callback's own clear can be masked by a SetEtc2Progress() on a
+    // budget-deferral break later in the same call (plain members, no
+    // ordering between the two threads); only this explicit clear makes
+    // the restart deterministic. The watch is re-armed (per-range
+    // no-op for the surviving range) so the next attempt is covered too.
+    if (vulkan_texture.etc2_transcode_invalidated()) {
+      vulkan_texture.ClearEtc2Progress();
+      vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
+      return false;
+    }
     // (Audit A1-R6-01.) Upload the slices transcoded in this call, if any
     // -- including on a budget deferral or a transient failure, so
     // completed work is kept. When the loop stopped at the very first
@@ -2031,6 +2144,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     flush_copy_regions();
 
+    // (Hunt v1.4.6 round 7, A2-R7-02.) A guest write may also have fired
+    // after the check above, while the copies were being recorded: the
+    // recorded copies are a self-consistent snapshot of the old
+    // generation, but the guest data has moved on. The resume position
+    // below would keep the already-uploaded old-generation slices and
+    // mix them with new-generation slices, so drop the progress and
+    // restart from slice 0 instead (the retry overwrites the recorded
+    // copies before the texture is ever marked up-to-date).
+    if (vulkan_texture.etc2_transcode_invalidated()) {
+      vulkan_texture.ClearEtc2Progress();
+      vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
+      return false;
+    }
+
     if (!etc2_load_complete) {
       // Not done yet: more slices are pending, and the texture stays
       // outdated so the next submission resumes at the saved position.
@@ -2047,6 +2174,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     // drop the progress -- the load is complete.
     vulkan_texture.DisarmEtc2PartialLoadWatch(shared_memory());
     vulkan_texture.ClearEtc2Progress();
+    // (Hunt v1.4.6 round 7, A2-R7-02.) Same as the check above, for the
+    // last few statements: a guest write fired after that check but
+    // before the disarm. The recorded copies are a self-consistent
+    // snapshot of the old generation, but the guest data has moved on,
+    // so the texture must NOT be marked up-to-date. The progress is
+    // already cleared (restart from slice 0) and the retry overwrites
+    // the recorded copies before the texture is ever marked up-to-date;
+    // re-arm the partial watch so the retry is covered.
+    if (vulkan_texture.etc2_transcode_invalidated()) {
+      vulkan_texture.ArmEtc2PartialLoadWatch(shared_memory());
+      return false;
+    }
     etc2_failed_textures_.erase(texture_key);
     ClearTexturePlaceholder(texture_key);
     return true;
@@ -2851,16 +2990,27 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
   // and the next call retries. outdated_mask() is atomic, so no global
   // lock is needed to read it here.
   if (texture_3d_as_2d_ && texture_3d_as_2d_->outdated_mask() != 0) {
-    const ui::vulkan::VulkanDevice* const vulkan_device =
-        vulkan_texture_cache.command_processor_.GetVulkanDevice();
-    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    const VkDevice device = vulkan_device->device();
+    // (Hunt v1.4.6 round 7, A1-R7-01.) REGRESSION of the A2-R6-02 fix
+    // above: destroying the cached views here, immediately, is a
+    // use-after-free. The views were just bound by draws in the
+    // currently open submission (via UpdateTextureBindingsImpl), and up
+    // to kMaxFramesInFlight = 3 already-submitted submissions may still
+    // reference them; the outdated flag itself is set by a guest-memory
+    // watch, asynchronously with respect to the command processor
+    // thread. So the views are NOT destroyed here: they are handed to
+    // the deferred-destruction queue (stamped with the current
+    // submission) and destroyed once that submission has completed,
+    // with the same rule as the normal texture eviction
+    // (pipeline/texture/cache.cpp) and as the command processor's own
+    // destroy_image_views_ queue. The wrapper itself is kept, only
+    // texture_3d_as_2d_loaded_ is reset, so the reload below reuses it
+    // exactly as the A2-R6-02 fix intended.
     if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
-      dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
+      vulkan_texture_cache.DeferDestroy3DAs2DImageView(image_view_3d_as_2d_unsigned_);
       image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     }
     if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
-      dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+      vulkan_texture_cache.DeferDestroy3DAs2DImageView(image_view_3d_as_2d_signed_);
       image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
     }
     texture_3d_as_2d_loaded_ = false;
@@ -2941,7 +3091,16 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
             VK_PIPELINE_STAGE_TRANSFER_BIT, vulkan_texture_cache.guest_shader_pipeline_stages_,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
-      texture_3d_as_2d_.reset();
+      // (Hunt v1.4.6 round 7, A1-R7-01.) Same deferred-destruction rule
+      // as for the views above: texture_3d_as_2d_.reset() would run
+      // ~VulkanTexture immediately, destroying the wrapper image while
+      // the views deferred above (which sample that image) and any
+      // in-flight draws are still using it. Move the whole wrapper to
+      // the deferred queue instead; it is destroyed once the current
+      // submission has completed, and the next call rebuilds it from
+      // scratch (texture_3d_as_2d_loaded_ is already false here, so the
+      // T-R5-01 retry still applies).
+      vulkan_texture_cache.DeferDestroy3DAs2DWrapper(std::move(texture_3d_as_2d_));
       return VK_NULL_HANDLE;
     }
     texture_3d_as_2d_->SetUsage(Usage::kGuestShaderSampled);
