@@ -193,7 +193,10 @@ public final class StfsExtractor {
                 String rel = relPath(entries, i);
                 if (rel.isEmpty()) continue;
                 File out = new File(dest, rel);
-                if (!out.getCanonicalPath().startsWith(dest.getCanonicalPath())) continue;
+                                // (Caza ronda 6, A4-R6-06.) startsWith sin separador dejaba
+                                // pasar un hermano con prefijo (game-evil pasa como game):
+                                // exigir el separador tras el destino.
+                                if (!out.getCanonicalPath().startsWith(dest.getCanonicalPath() + File.separator)) continue;
                 if (e.directory) { out.mkdirs(); continue; }
                 File parent = out.getParentFile();
                 if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("mkdir " + parent);
@@ -203,14 +206,27 @@ public final class StfsExtractor {
                         while (remaining > 0 && bi != END) {
                             int n = (int) Math.min(BLOCK, remaining);
                             ByteBuffer b = readAt(blockToOffset(bi), n);
-                            os.write(b.array(), 0, b.limit());
+                                                        // (Caza ronda 6, A4-R6-03.) La lectura corta y
+                                                        // la cadena de bloques rota terminaban el bucle
+                                                        // en silencio y dejaban un archivo corto que
+                                                        // pasaba la validacion de titulo (solo mira
+                                                        // 16 KiB de cabecera). El ISO y GoD SI tiran
+                                                        // en lectura corta (R7-F3 / R8-F3): misma
+                                                        // convencion aqui, antes de escribir nada.
+                                                        if (b.limit() < n) throw new IOException("STFS: short read at block " + bi + " (truncated package?)");
+                        
+                        os.write(b.array(), 0, b.limit());
                             done += b.limit();
-                            if (b.limit() < n) break;
                             remaining -= n;
                             bi = e.contiguous ? bi + 1 : nextBlock(bi);
                         }
+                                                if (remaining > 0) throw new IOException("STFS: truncated file " + rel + ": block chain ended at " + (e.length - remaining) + " of " + e.length + " bytes");
                     }
-                    if (progress != null) progress.onProgress(rel, done, total);
+                                        // (Caza ronda 6, A4-R6-03.) Comprobacion final: el
+                                        // archivo en disco debe medir exactamente lo que la
+                                        // tabla promete, aunque el bucle de arriba no fallara.
+                                        if (out.length() != e.length) throw new IOException("STFS: truncated file " + rel + ": wrote " + out.length() + " of " + e.length + " bytes");               
+                if (progress != null) progress.onProgress(rel, done, total);
                 } else {
                     done += e.length;
                     if (progress != null) progress.onProgress(rel, done, total);
@@ -441,7 +457,19 @@ public final class StfsExtractor {
                     return a[1].compareTo(b[1]);
                 });
                 if (parts.size() != dataFileCount)
-                    throw new IOException("GoD: header expects " + dataFileCount + " data files, folder holds " + parts.size() + " (incomplete copy?)");
+                                    ption("GoD: header expects " + dataFileCount + " data files, folder holds " + parts.size() + " (incomplete copy?)");
+                                // (Caza ronda 6, A4-R6-11.) El conteo solo no basta: una
+                                // carpeta con el numero justo pero la secuencia rota (falta
+                                // Data0000 y sobra Data0005) desplazaba todo el volumen
+                                // sin error legible, porque Svod lee por orden de nombre.
+                                // Exigir exactamente Data0000..Data{count-1}.
+                                for (int i = 0; i < parts.size(); i++) {
+                                                        String num = Integer.toString(i);
+                                                        while (num.length() < 4) num = "0" + num;
+                                                        String want = "Data" + num;
+                                                        if (!want.equalsIgnoreCase(parts.get(i)[1]))
+                                                                                    throw new IOException("GoD: data files out of sequence: expected " + want + ", found " + parts.get(i)[1] + " (incomplete copy?)");
+                                }
                 for (String[] part : parts) {
                     // (Ronda 5, auditor F — R5-F2.) Igual que el header: un pfd
                     // null aqui llegaba al constructor Svod y tiraba NPE.
