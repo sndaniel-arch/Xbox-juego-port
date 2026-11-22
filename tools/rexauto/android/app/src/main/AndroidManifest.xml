@@ -27,16 +27,23 @@
              smallestScreenSize (pantalla dividida) o de uiMode (modo oscuro)
              recreaba SetupActivity a mitad de un import y el hilo de import
              se quedaba con la actividad destruida. Misma lista que
-             MainActivity, que ya la lleva completa. -->
+             MainActivity, que ya la lleva completa.
+             (Caza ronda 6, A4-R6-04.) Faltaban locale|fontScale|
+             layoutDirection en AMBAS activities: un cambio de idioma o de
+             tamano de fuente del sistema a mitad de partida recreaba la
+             activity y SDLActivity.onDestroy mataba el juego (progreso no
+             guardado perdido). CAMBIO DE COMPORTAMIENTO VISIBLE: la
+             activity ya no se recrea en esos cambios; el onConfiguration-
+             Changed de SDLActivity (onNativeLocaleChanged) por fin corre. -->
         <activity
             android:name=".SetupActivity"
-            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|locale|fontScale|layoutDirection"
             android:exported="false"
             android:screenOrientation="sensorLandscape" />
 
         <activity
             android:name=".MainActivity"
-            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|locale|fontScale|layoutDirection"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="sensorLandscape">
