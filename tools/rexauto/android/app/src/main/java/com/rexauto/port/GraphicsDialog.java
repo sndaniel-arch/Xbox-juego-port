@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
+import android.view.View;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -114,6 +116,38 @@ public final class GraphicsDialog {
                 activity.getResources().getStringArray(R.array.gfx_scale_options)));
         scale.setSelection(gs.resolutionScale() - 1);
         box.addView(scale);
+        // (Ronda 5, C-R5-01.) Warn under the spinner when 2x/3x is
+        // picked: on Mali without sparse residency the native side
+        // reserves 512 MiB x scale^2 (2 GiB at 2x, 4,5 GiB at 3x) and
+        // falls back to 1x on its own if it does not fit, so the user
+        // should know the choice may silently run at 1x. The text
+        // follows the spinner live; at 1x there is no warning to show.
+        final TextView scaleWarn = new TextView(activity);
+        scaleWarn.setTextSize(12);
+        // Ice blue #8CCBEB: the port palette has no yellow/gold anywhere
+        // (user rule), so the warning uses ice blue, not amber.
+        scaleWarn.setTextColor(0xFF8CCBEB);
+        scaleWarn.setPadding(0, 2, 0, 4);
+        box.addView(scaleWarn);
+        final Runnable updateScaleWarn = new Runnable() {
+            @Override
+            public void run() {
+                String w = GraphicsSettings.resolutionScaleWarningFor(
+                        scale.getSelectedItemPosition() + 1);
+                scaleWarn.setText(w == null ? "" : w);
+                scaleWarn.setVisibility(w == null ? View.GONE : View.VISIBLE);
+            }
+        };
+        updateScaleWarn.run();
+        scale.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                updateScaleWarn.run();
+            }
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
 
         label(activity, box, R.string.gfx_effect);
         Spinner effect = new Spinner(activity);
