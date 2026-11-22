@@ -522,7 +522,7 @@ class VulkanPipelineCache {
   // getters never call each other, and the shader compile / module
   // creation inside does not call back into this cache, so holding it
   // across the creation is deadlock-free.
-// (V-A1-01, same round, second sweep: layouts_mutex_ below is also
+  // (V-A1-01, same round, second sweep: layouts_mutex_ below is also
   // taken for the texture-binding-layout map in TranslateAnalyzedShader.)
   std::mutex lazy_shader_cache_mutex_;
 
