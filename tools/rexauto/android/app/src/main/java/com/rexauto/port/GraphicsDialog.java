@@ -79,6 +79,10 @@ public final class GraphicsDialog {
     public static void show(Activity activity) {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
         if (isShowing(sDialog, sDialogActivity)) return;
+        // (Caza ronda 6, A4-R6-07.) Sin este guard, un show() sobre una
+        // activity terminada/destruida tira WindowManager$BadTokenException;
+        // mismo guard que showRestartDialog ya usa.
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         GraphicsSettings gs = new GraphicsSettings(activity);
         float dp = activity.getResources().getDisplayMetrics().density;
         int pad = (int) (16 * dp);
@@ -303,6 +307,9 @@ public final class GraphicsDialog {
     public static void showDriverDialog(Activity activity) {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
         if (isShowing(sDriverDialog, sDriverActivity)) return;
+        // (Caza ronda 6, A4-R6-07.) Igual que en show(): no mostrar nada
+        // sobre una activity terminada/destruida (BadTokenException).
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         // Experimental gate (user rule: risky core changes behind a switch).
         // The switch lives in the graphics dialog; offer to turn it on here.
         GraphicsSettings gs = new GraphicsSettings(activity);
@@ -322,6 +329,9 @@ public final class GraphicsDialog {
                     })
                     .setNegativeButton(android.R.string.cancel, null)
                     .create();
+            // (Caza ronda 6, A4-R6-07.) Guard antes de mostrar el prompt
+            // de experimental-off (misma familia que el de la entrada).
+            if (activity.isFinishing() || activity.isDestroyed()) return;
             trackDriverDialog(activity, prompt);
             prompt.show();
             return;
@@ -365,6 +375,9 @@ public final class GraphicsDialog {
         AlertDialog dlg = b.create();
         // getListView() is null until the dialog is shown (the ListView is
         // created in onCreate): show first, then attach the listener.
+        // (Caza ronda 6, A4-R6-07.) Guard antes de dlg.show(), como en la
+        // entrada de este metodo.
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         trackDriverDialog(activity, dlg);
         dlg.show();
         dlg.getListView().setOnItemLongClickListener((p, v, pos, id) -> {
