@@ -350,21 +350,21 @@ class VulkanTextureCache final : public TextureCache {
       } else {
         etc2_partial_load_mips_watch_handle_ = nullptr;
       }
-           // (Hunt v1.4.6 round 7, A2-R7-02.) Also flag the in-flight
-           // transcode as invalidated (see etc2_transcode_invalidated_ below):
-           // the store is last, so the plain-member writes above
-           // happen-before any graphics-thread load that observes the flag.
-           etc2_transcode_invalidated_.store(true, std::memory_order_release);
+      // (Hunt v1.4.6 round 7, A2-R7-02.) Also flag the in-flight
+      // transcode as invalidated (see etc2_transcode_invalidated_ below):
+      // the store is last, so the plain-member writes above
+      // happen-before any graphics-thread load that observes the flag.
+      etc2_transcode_invalidated_.store(true, std::memory_order_release);
     }
     // Whether a guest write fired the partial-load watch since the
     // current ETC2 load started (see LoadTextureDataFromResidentMemoryImpl).
     bool etc2_transcode_invalidated() const {
-           return etc2_transcode_invalidated_.load(std::memory_order_acquire);
+      return etc2_transcode_invalidated_.load(std::memory_order_acquire);
     }
     // Clears the flag above. Only the graphics thread calls this, at the
     // start of an ETC2 load, before arming the watch and transcoding.
     void ClearEtc2TranscodeInvalidated() {
-           etc2_transcode_invalidated_.store(false, std::memory_order_relaxed);
+      etc2_transcode_invalidated_.store(false, std::memory_order_relaxed);
     }
 
    private:
