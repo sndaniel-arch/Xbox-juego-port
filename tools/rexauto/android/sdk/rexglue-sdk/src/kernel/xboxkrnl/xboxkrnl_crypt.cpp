@@ -42,6 +42,90 @@ extern "C" {
 
 namespace rex::kernel::xboxkrnl {
 
+// (Hunt v1.4.6, ronda 7, A3-R7-01.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/read/write.
+// Same heap validation as A3-R4-09 (see xam_net.cpp for the full
+// comment), copied here because this file had no range helper at all:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 7, A3-R7-01.) The XeKeys*/XeCryptRc4 entries
+// below call each other with MappedPtr::from_host() pointers into
+// stack/static host storage (the deobscured key, the local RC4/AES
+// state, the retail key table). from_host() carries
+// guest_address() == 0, so a plain guest-range check would reject
+// every one of those trusted host buffers and break the internal
+// paths CoL uses at boot. A genuine guest pointer to address 0
+// instead translates into the virtual mapping (from virtual_membase
+// to physical_membase), so tell the two apart by the host address:
+// inside the mapping it is guest memory and gets
+// validated as guest address 0; outside it is a host buffer and
+// there is no guest range to validate.
+static bool GuestPtrRangeValid(const void* host_ptr, uint32_t guest_address, size_t length,
+                             bool writable) {
+  if (!host_ptr) {
+    return false;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  auto host = reinterpret_cast<uintptr_t>(host_ptr);
+  if (host < reinterpret_cast<uintptr_t>(memory->virtual_membase()) ||
+      host >= reinterpret_cast<uintptr_t>(memory->physical_membase())) {
+    return true;
+  }
+  return GuestRangeAccessible(guest_address, length, writable);
+}
+
+template <typename T>
+static bool GuestPtrReadable(const MappedPtr<T>& ptr, size_t length) {
+  return GuestPtrRangeValid(ptr.host_address(), ptr.guest_address(), length, false);
+}
+
+template <typename T>
+static bool GuestPtrWritable(const MappedPtr<T>& ptr, size_t length) {
+  return GuestPtrRangeValid(ptr.host_address(), ptr.guest_address(), length, true);
+}
+
 typedef struct {
   uint8_t S[256];  // 0x0
   uint8_t i;       // 0x100
@@ -53,6 +137,13 @@ void XeCryptRc4Key_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void key, 
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) NULL rc4_ctx/key used to write
   // rc4_ctx->S and read key[x] unconditionally. Void entry: skip.
   if (!rc4_ctx || !key) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The loop below reads key[0..15]
+  // (key[x % 0x10]) no matter what key_size is, so validate 16 readable
+  // bytes, not key_size; the state is written in full.
+  if (!GuestPtrWritable(rc4_ctx, sizeof(XECRYPT_RC4_STATE)) ||
+      !GuestPtrReadable(key, 16)) {
     return;
   }
   // Setup RC4 state
@@ -73,6 +164,14 @@ void XeCryptRc4Key_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void key, 
 void XeCryptRc4Ecb_entry(ppc_ptr_t<XECRYPT_RC4_STATE> rc4_ctx, mapped_void data, u32 size) {
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) As above: NULL rc4_ctx/data.
   if (!rc4_ctx || !data) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) data is read and written for
+  // `size` bytes (a guest u32, up to 4 GiB): validate the whole range
+  // both ways; a range that does not fit the mapping is rejected here
+  // instead of faulting mid-loop.
+  if (!GuestPtrWritable(rc4_ctx, sizeof(XECRYPT_RC4_STATE)) ||
+      !GuestPtrReadable(data, size) || !GuestPtrWritable(data, size)) {
     return;
   }
   // Crypt data
@@ -122,6 +221,11 @@ void XeCryptShaInit_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state) {
   if (!sha_state) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The state (0x58 bytes) is
+  // zeroed and written below.
+  if (!GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA_STATE))) {
+    return;
+  }
   sha_state.Zero();
 
   sha_state->state[0] = 0x67452301;
@@ -136,6 +240,13 @@ void XeCryptShaUpdate_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, mapped_void 
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) InitSha1 dereferences
   // sha_state and processBytes reads through input.
   if (!sha_state || (!input && input_size)) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) InitSha1/StoreSha1 read and
+  // write the whole state; processBytes reads input_size bytes.
+  if (!GuestPtrReadable(sha_state, sizeof(XECRYPT_SHA_STATE)) ||
+      !GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA_STATE)) ||
+      !GuestPtrReadable(input, input_size)) {
     return;
   }
   sha1::SHA1 sha;
@@ -153,6 +264,13 @@ void XeCryptShaFinal_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, ppc_ptr_t<uin
   if (!sha_state || !out) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The state is read and written
+  // in full; the digest copy writes min(20, out_size) bytes.
+  if (!GuestPtrReadable(sha_state, sizeof(XECRYPT_SHA_STATE)) ||
+      !GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA_STATE)) ||
+      !GuestPtrWritable(out, std::min<uint32_t>(out_size, 0x14u))) {
+    return;
+  }
   sha1::SHA1 sha;
   InitSha1(&sha, sha_state);
 
@@ -166,6 +284,15 @@ void XeCryptShaFinal_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, ppc_ptr_t<uin
 void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2, u32 input_2_size,
                       mapped_void input_3, u32 input_3_size, mapped_void output, u32 output_size) {
   sha1::SHA1 sha;
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) Each input is hashed for its
+  // full size and the digest copy writes min(20, output_size) bytes.
+  if ((input_1 && !GuestPtrReadable(input_1, input_1_size)) ||
+      (input_2 && !GuestPtrReadable(input_2, input_2_size)) ||
+      (input_3 && !GuestPtrReadable(input_3, input_3_size)) ||
+      (output && !GuestPtrWritable(output, std::min<uint32_t>(output_size, 0x14u)))) {
+    return;
+  }
 
   if (input_1 && input_1_size) {
     sha.processBytes(input_1, input_1_size);
@@ -199,8 +326,12 @@ void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
   if (!sha_state) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The state is zeroed and
+  // written below (sizeof(XECRYPT_SHA256_STATE) bytes).
+  if (!GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA256_STATE))) {
+    return;
+  }
   sha_state.Zero();
-
   sha_state->state[0] = 0x6a09e667;
   sha_state->state[1] = 0xbb67ae85;
   sha_state->state[2] = 0x3c6ef372;
@@ -216,6 +347,13 @@ void XeCryptSha256Update_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, mapped
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) sha_state->state/buffer are
   // read before the hash runs; sha.add reads through input.
   if (!sha_state || (!input && input_size)) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The state is read and written
+  // in full; sha.add reads input_size bytes.
+  if (!GuestPtrReadable(sha_state, sizeof(XECRYPT_SHA256_STATE)) ||
+      !GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA256_STATE)) ||
+      !GuestPtrReadable(input, input_size)) {
     return;
   }
   sha256::SHA256 sha;
@@ -235,6 +373,13 @@ void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) sha_state is read and the hash
   // is copied through out.
   if (!sha_state || !out) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The state is read and written
+  // in full; the hash copy writes min(32, out_size) bytes.
+  if (!GuestPtrReadable(sha_state, sizeof(XECRYPT_SHA256_STATE)) ||
+      !GuestPtrWritable(sha_state, sizeof(XECRYPT_SHA256_STATE)) ||
+      !GuestPtrWritable(out, std::min<uint32_t>(out_size, 32u))) {
     return;
   }
   sha256::SHA256 sha;
@@ -257,6 +402,13 @@ void XeCryptBnQw_SwapDwQwLeBe_entry(ppc_ptr_t<uint64_t> qw_inp, ppc_ptr_t<uint64
   if (!qw_inp || !qw_out) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) copy_and_swap<uint64_t> moves
+  // `size` qwords, i.e. size * 8 bytes each way (64-bit math: the
+  // byte count itself must not wrap).
+  if (!GuestPtrReadable(qw_inp, static_cast<size_t>(size) * 8) ||
+      !GuestPtrWritable(qw_out, static_cast<size_t>(size) * 8)) {
+    return;
+  }
   memory::copy_and_swap<uint64_t>(qw_out, qw_inp, size);
 }
 
@@ -275,6 +427,18 @@ u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t>
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) The Win32 branch below reads
   // rsa->size and the qw pointers; a NULL one used to crash the host.
   if (!qw_a || !qw_b || !rsa) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The Win32 branch reads the
+  // 0x10-byte RSA header (rsa->size) and then moves rsa->size qwords
+  // through qw_a/qw_b; validate the header first, then both operands
+  // for the modulus size (64-bit math: a guest size field wraps in
+  // u32). On this platform the call still fails honestly with 0.
+  if (!GuestPtrReadable(rsa, sizeof(XECRYPT_RSA))) {
+    return 0;
+  }
+  const size_t modulus_size = static_cast<size_t>(uint32_t(rsa->size)) * 8;
+  if (!GuestPtrReadable(qw_a, modulus_size) || !GuestPtrWritable(qw_b, modulus_size)) {
     return 0;
   }
 #if !REX_PLATFORM_WIN32
@@ -388,6 +552,11 @@ void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
   if (!buf) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) memset writes buf_size bytes
+  // (a guest u32, up to 4 GiB): validate the whole range first.
+  if (!GuestPtrWritable(buf, buf_size)) {
+    return;
+  }
   std::memset(buf, 0xFD, buf_size);
 }
 
@@ -402,6 +571,11 @@ void XeCryptDesParity_entry(mapped_void inp, u32 inp_size, mapped_void out_ptr) 
   if (!inp || !out_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) set_parity reads/writes
+  // inp_size bytes each way.
+  if (!GuestPtrReadable(inp, inp_size) || !GuestPtrWritable(out_ptr, inp_size)) {
+    return;
+  }
   DES::set_parity(inp, inp_size, out_ptr);
 }
 
@@ -414,6 +588,12 @@ void XeCryptDes3Key_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 ke
   // state_ptr->des_state[i] are dereferenced below; the Des3Ecb/Cbc
   // sisters already carry this guard (R6-06).
   if (!state_ptr || !key) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) key[0..2] are 3 qwords
+  // (24 bytes); the whole DES3 state is written below.
+  if (!GuestPtrWritable(state_ptr, sizeof(XECRYPT_DES3_STATE)) ||
+      !GuestPtrReadable(key, 3 * sizeof(uint64_t))) {
     return;
   }
   DES3 des3(key[0], key[1], key[2]);
@@ -433,6 +613,13 @@ void XeCryptDes3Ecb_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 in
   if (!state_ptr || !inp || !out) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) One 8-byte block is read and
+  // written; the key schedule is read from the state.
+  if (!GuestPtrReadable(state_ptr, sizeof(XECRYPT_DES3_STATE)) ||
+      !GuestPtrReadable(inp, sizeof(uint64_t)) ||
+      !GuestPtrWritable(out, sizeof(uint64_t))) {
+    return;
+  }
   DES3 des3((ui64*)state_ptr->des_state[0].keytab, (ui64*)state_ptr->des_state[1].keytab,
             (ui64*)state_ptr->des_state[2].keytab);
 
@@ -448,6 +635,14 @@ void XeCryptDes3Cbc_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 in
   // (Audit A3, ronda 6, R6-06, sweep.) As above: NULL buffers used to
   // read/write guest address 0, including the chaining value `feed`.
   if (!state_ptr || !inp || !out || !feed) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) inp_size bytes are read and
+  // written; feed is one qword, read and written.
+  if (!GuestPtrReadable(state_ptr, sizeof(XECRYPT_DES3_STATE)) ||
+      !GuestPtrReadable(inp, inp_size) || !GuestPtrWritable(out, inp_size) ||
+      !GuestPtrReadable(feed, sizeof(uint64_t)) ||
+      !GuestPtrWritable(feed, sizeof(uint64_t))) {
     return;
   }
   // (Hunt v1.4.6, ronda 4, A3-R4-25.) The loop below processes exactly
@@ -494,6 +689,12 @@ void XeCryptAesKey_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void key
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) aes_key_schedule_128 reads key
   // and state_ptr->keytabenc is written throughout.
   if (!state_ptr || !key) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The key is one 16-byte AES
+  // block; the whole 0x160-byte state is written.
+  if (!GuestPtrWritable(state_ptr, sizeof(XECRYPT_AES_STATE)) ||
+      !GuestPtrReadable(key, 16)) {
     return;
   }
   aes_key_schedule_128(key, reinterpret_cast<uint8_t*>(state_ptr->keytabenc));
@@ -565,6 +766,12 @@ void XeCryptAesEcb_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
   if (!state_ptr || !inp_ptr || !out_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) One 16-byte block is read and
+  // written; the key schedule is read from the state.
+  if (!GuestPtrReadable(state_ptr, sizeof(XECRYPT_AES_STATE)) ||
+      !GuestPtrReadable(inp_ptr, 16) || !GuestPtrWritable(out_ptr, 16)) {
+    return;
+  }
   const uint8_t* keytab = reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
   if (encrypt) {
     aes_encrypt_128(keytab, inp_ptr, out_ptr);
@@ -578,6 +785,13 @@ void XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE> state_ptr, mapped_void inp
   // (Hunt v1.4.6, ronda 3, A3-R3-05.) feed[j] ^= inp[j] and the
   // memcpy(out, feed, 16) below all dereference these pointers.
   if (!state_ptr || !inp_ptr || !out_ptr || !feed_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) inp_size bytes are read and
+  // written; feed is one 16-byte block, read and written.
+  if (!GuestPtrReadable(state_ptr, sizeof(XECRYPT_AES_STATE)) ||
+      !GuestPtrReadable(inp_ptr, inp_size) || !GuestPtrWritable(out_ptr, inp_size) ||
+      !GuestPtrReadable(feed_ptr, 16) || !GuestPtrWritable(feed_ptr, 16)) {
     return;
   }
   // (Hunt v1.4.6, ronda 4, A3-R4-10.) Both loops below process exactly
@@ -626,6 +840,16 @@ void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u
   // all without a check. A pointer is only required when its size is
   // non-zero, matching the XeCryptSha shape above.
   if ((!key && key_size_in) || (!out && out_size)) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The key is hashed/memcpied for
+  // key_size bytes and each input for its full size; the digest copy
+  // writes min(20, out_size) bytes.
+  if ((key && !GuestPtrReadable(key, key_size_in)) ||
+      (inp_1 && !GuestPtrReadable(inp_1, inp_1_size)) ||
+      (inp_2 && !GuestPtrReadable(inp_2, inp_2_size)) ||
+      (inp_3 && !GuestPtrReadable(inp_3, inp_3_size)) ||
+      (out && !GuestPtrWritable(out, std::min<uint32_t>(out_size, 0x14u)))) {
     return;
   }
   uint32_t key_size = key_size_in;
@@ -699,6 +923,15 @@ u32 XeKeysHmacSha_entry(u32 key_num, mapped_void inp_1, u32 inp_1_size, mapped_v
       (!out && out_size)) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The inputs/out funnel into
+  // XeCryptHmacSha_entry, which validates them too -- but without a
+  // guard here a bad call would still return SUCCESS for a no-op.
+  if ((inp_1 && !GuestPtrReadable(inp_1, inp_1_size)) ||
+      (inp_2 && !GuestPtrReadable(inp_2, inp_2_size)) ||
+      (inp_3 && !GuestPtrReadable(inp_3, inp_3_size)) ||
+      (out && !GuestPtrWritable(out, std::min<uint32_t>(out_size, 0x14u)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   const uint8_t* key = nullptr;
   if (key_num == 0x19) {
     key = key19;
@@ -737,6 +970,14 @@ u32 XeKeysAesCbcUsingKey_entry(mapped_void obscured_key, mapped_void inp_ptr, u3
   if (inp_size % 16 != 0) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The obscured key is one AES
+  // block; the CBC pass reads/writes inp_size bytes and the feed is
+  // one 16-byte block, read and written.
+  if (!GuestPtrReadable(obscured_key, 16) || !GuestPtrReadable(inp_ptr, inp_size) ||
+      !GuestPtrWritable(out_ptr, inp_size) || !GuestPtrReadable(feed_ptr, 16) ||
+      !GuestPtrWritable(feed_ptr, 16)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint8_t key[16];
 
   // Deobscure key
@@ -759,6 +1000,11 @@ u32 XeKeysObscureKey_entry(mapped_void input, mapped_void output) {
   // XeCryptAesEcb; without a guard here a NULL one would make the
   // callee silently no-op and this entry still return SUCCESS.
   if (!input || !output) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) One AES block (16 bytes) is
+  // read and written; the callee validates them too.
+  if (!GuestPtrReadable(input, 16) || !GuestPtrWritable(output, 16)) {
     return X_STATUS_INVALID_PARAMETER;
   }
   // Based on HvxKeysObscureKey
@@ -786,6 +1032,18 @@ u32 XeKeysHmacShaUsingKey_entry(mapped_void obscured_key, mapped_void inp_1, u32
       (!out && out_size)) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-01.) The obscured key is one AES
+  // block; the inputs/out funnel into XeCryptHmacSha_entry, which
+  // validates them too -- but without a guard here a bad call would
+  // still return SUCCESS for a no-op.
+  if (!GuestPtrReadable(obscured_key, 16) ||
+      (inp_1 && !GuestPtrReadable(inp_1, inp_1_size)) ||
+      (inp_2 && !GuestPtrReadable(inp_2, inp_2_size)) ||
+      (inp_3 && !GuestPtrReadable(inp_3, inp_3_size)) ||
+      (out && !GuestPtrWritable(out, std::min<uint32_t>(out_size, 0x14u)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
 
   uint8_t key[16];
 
