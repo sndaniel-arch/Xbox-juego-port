@@ -394,16 +394,16 @@ public final class GraphicsSettings {
             "readback_memexport", "vulkan_readback_memexport", "vulkan_readback_resolve",
             "texture_cache_memory_limit_soft", "texture_cache_memory_limit_hard",
             "texture_cache_memory_limit_render_to_texture",
-                        "async_shader_compilation", "vulkan_async_skip_incomplete_frames",
-                        "vulkan_allow_present_mode_immediate", "vulkan_allow_present_mode_mailbox",
-                        "vulkan_allow_present_mode_fifo_relaxed",
-                        "log_level", "vulkan_log_debug_messages", "gpu_debug_markers",
-                        "vulkan_dynamic_rendering",
-                        "anisotropic_override", "occlusion_query_enable", "native_2x_msaa",
-                        "gamma_render_target_as_unorm16",
-                        "env.REX_FPS_CAP", "env.REX_HEAL_DISCOVER",
-                        "user_language", "user_country"));
-    
+            "async_shader_compilation", "vulkan_async_skip_incomplete_frames",
+            "vulkan_allow_present_mode_immediate", "vulkan_allow_present_mode_mailbox",
+            "vulkan_allow_present_mode_fifo_relaxed",
+            "log_level", "vulkan_log_debug_messages", "gpu_debug_markers",
+            "vulkan_dynamic_rendering",
+            "anisotropic_override", "occlusion_query_enable", "native_2x_msaa",
+            "gamma_render_target_as_unorm16",
+            "env.REX_FPS_CAP", "env.REX_HEAL_DISCOVER",
+            "user_language", "user_country"));
+
     /** Writes settings.txt for the native side. */
     public void write(Context ctx) throws IOException {
         File f = GameFiles.settingsFile(ctx);
