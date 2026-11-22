@@ -189,6 +189,28 @@ inline AuditResult Audit(const uint32_t* words, size_t word_count) {
         }
         break;
       }
+      case kOpMemberDecorate: {
+                // Operands: struct type id, member index literal, decoration,
+                // [literals...]. NOTE: unlike OpDecorate, the decoration is the
+                // FOURTH word (words[i + 3]) — words[i + 2] is the member index,
+                // not the decoration; reading words[i + 2] here would never match
+                // NonUniform (and could misread a member index as a decoration).
+                // (Caza v1.4.6 ronda 8, A1-R8-02.) NonUniform on a struct member
+                // must count exactly like NonUniform on a whole variable: if the
+                // module declares a descriptor-indexing capability, stripping it
+                // while a member still carries NonUniform would leave an invalid
+                // module, and PatchForVulkan11() must refuse instead. The
+                // translator emits neither NonUniform nor OpMemberDecorate today,
+                // so this changes no current audit result — defense in depth only.
+                // Only NonUniform is scanned here: DescriptorSet/Binding apply to
+                // variables, not struct members, so they cannot appear in
+                // OpMemberDecorate.
+                if (word_count_instruction >= 4 &&
+                              words[i + 3] == kDecorationNonUniform) {
+                            result.uses_non_uniform = true;
+                }
+                break;
+      }
       default:
         break;
     }
