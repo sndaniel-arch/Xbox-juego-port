@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.StatFs;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
@@ -356,6 +357,10 @@ public class SetupActivity extends Activity {
         new Thread(() -> {
             File dest = GameFiles.gameDir(this);
             File staging = importStagingDir(dest);
+            // (Caza ronda 6, A4-R6-08.) Si la promocion falla, staging
+            // guarda la unica copia buena del import completo: el finally
+            // NO debe borrarlo (ver el catch de promoteStagedImport abajo).
+            boolean promotionFailed = false;
             try {
                 // (Hunt v1.4.6 ronda 4, A4-R4-02.) Everything below used to
                 // write straight into dest: a failure after default.xex
@@ -381,6 +386,15 @@ public class SetupActivity extends Activity {
                     // importPackage/importTree SI cierran en finally; esta
                     // era la unica que no.
                     try {
+                        // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio
+                        // libre con el total del listado, antes de escribir
+                        // nada. list() se recorre dos veces (aqui y en
+                        // extractAll): solo son metadatos de directorio.
+                        // Dentro del try para que un fallo aqui tambien
+                        // cierre el canal (R7-F1).
+                        long total = 0;
+                        for (IsoExtractor.Entry e : iso.list()) total += e.size;
+                        requireFreeSpace(staging, total);
                         xex = iso.extractAll(staging, this::postProgress);
                     } finally {
                         iso.close();
@@ -399,6 +413,10 @@ public class SetupActivity extends Activity {
                             throw new Exception(getString(R.string.err_not_iso, name));
                     }
                     xex = new File(staging, "default.xex");
+                    // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre
+                    // con el tamano del documento (0 si el provider no lo
+                    // da: entonces solo se exige el margen).
+                    requireFreeSpace(staging, pickedFileSize(uri));
                     try (InputStream in = getContentResolver().openInputStream(uri)) {
                         // (Ronda 5, auditor F — R5-F2.) Igual que el probe de
                         // arriba: copyStream(null, ...) tira NPE en in.read().
@@ -411,13 +429,22 @@ public class SetupActivity extends Activity {
                 // the old install, while game_root.txt still points at the
                 // same path — a wrong-title import would then boot as valid.
                 checkXexTitle(xex);
-                promoteStagedImport(staging, dest);
+                try {
+                    promoteStagedImport(staging, dest);
+                } catch (java.io.IOException e) {
+                    // (Caza ronda 6, A4-R6-08.) La promocion fallo con el
+                    // import completo en staging: conservarlo para un
+                    // reintento (el proximo import lo borra primero) en
+                    // vez de borrarlo en el finally.
+                    promotionFailed = true;
+                    throw e;
+                }
                 finish(promotedXex(staging, dest, xex));
             } catch (Exception e) {
                 fail(e.getMessage());
             } finally {
                 sImportRunning = false;
-                deleteTree(staging);
+                if (!promotionFailed) deleteTree(staging);
             }
         }, "import").start();
     }
@@ -458,6 +485,10 @@ public class SetupActivity extends Activity {
             post(getString(R.string.status_reading, name + " (Games on Demand)"));
             IsoExtractor god = StfsExtractor.openSvod(getContentResolver(), f, null);
             try {
+                // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre.
+                long total = 0;
+                for (IsoExtractor.Entry e : god.list()) total += e.size;
+                requireFreeSpace(dest, total);
                 File xex = god.extractAll(dest, this::postProgress);
                 if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
                 return xex;
@@ -465,7 +496,15 @@ public class SetupActivity extends Activity {
         }
         post(getString(R.string.status_reading, name + " (STFS)"));
         try {
-            File xex = new StfsExtractor.Stfs(ch, hdr).extractAll(dest, this::postProgress);
+            // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre con el
+            // total de la tabla de archivos, antes de escribir nada.
+            // Dentro del try para que un fallo aqui tambien cierre el
+            // canal y el PFD (misma familia que R6-F2).
+            StfsExtractor.Stfs stfs = new StfsExtractor.Stfs(ch, hdr);
+            long total = 0;
+            for (StfsExtractor.Stfs.Entry e : stfs.fileTable()) total += e.length;
+            requireFreeSpace(dest, total);
+            File xex = stfs.extractAll(dest, this::postProgress);
             if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_stfs, name));
             return xex;
         } finally { ch.close(); pfd.close(); }
@@ -481,6 +520,9 @@ public class SetupActivity extends Activity {
         new Thread(() -> {
             File dest = GameFiles.gameDir(this);
             File staging = importStagingDir(dest);
+            // (Caza ronda 6, A4-R6-08.) Igual que en importFile: si la
+            // promocion falla, staging guarda la unica copia buena.
+            boolean promotionFailed = false;
             try {
                 // (Hunt v1.4.6 ronda 4, A4-R4-02.) Staging dir, same as
                 // importFile: nothing is written into dest until the
@@ -493,7 +535,13 @@ public class SetupActivity extends Activity {
                     // Games on Demand dump: <id>/<header> + <header>.data/Data0000..
                     post(getString(R.string.status_reading, pkg.name + " (Games on Demand)"));
                     IsoExtractor god = StfsExtractor.openSvod(getContentResolver(), pkg, tree);
-                    try { xex = god.extractAll(staging, this::postProgress); } finally { god.close(); }
+                    try {
+                        // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre.
+                        long total = 0;
+                        for (IsoExtractor.Entry e : god.list()) total += e.size;
+                        requireFreeSpace(staging, total);
+                        xex = god.extractAll(staging, this::postProgress);
+                    } finally { god.close(); }
                     if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_iso));
                 } else if (pkg != null) {
                     post(getString(R.string.status_reading, pkg.name + " (STFS)"));
@@ -504,23 +552,41 @@ public class SetupActivity extends Activity {
                     // import por carpeta de un STFS fallaba con err_generic.
                     if (pfd == null) throw new java.io.IOException("cannot open " + pkg.headerDoc);
                     java.nio.channels.FileChannel ch = new java.io.FileInputStream(pfd.getFileDescriptor()).getChannel();
-                    try { xex = new StfsExtractor.Stfs(ch, pkg.hdr).extractAll(staging, this::postProgress); }
+                    try {
+                        // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio
+                        // libre con el total de la tabla de archivos.
+                        StfsExtractor.Stfs stfs = new StfsExtractor.Stfs(ch, pkg.hdr);
+                        long total = 0;
+                        for (StfsExtractor.Stfs.Entry e : stfs.fileTable()) total += e.length;
+                        requireFreeSpace(staging, total);
+                        xex = stfs.extractAll(staging, this::postProgress);
+                    }
                     finally { ch.close(); pfd.close(); }
                     if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_stfs, pkg.name));
                 } else {
                     long[] counter = {0};
+                    // (Caza ronda 6, A4-R6-05.) Pre-cheque de espacio libre
+                    // con el tamano total del arbol (solo metadatos).
+                    requireFreeSpace(staging, treeSize(tree, DocumentsContract.getTreeDocumentId(tree), 0));
                     copyTree(tree, DocumentsContract.getTreeDocumentId(tree), staging, counter, 0);
                     xex = findXex(staging, 0);
                 }
                 if (xex == null) throw new Exception(getString(R.string.err_no_xex_in_folder));
                 checkXexTitle(xex);
-                promoteStagedImport(staging, dest);
+                try {
+                    promoteStagedImport(staging, dest);
+                } catch (java.io.IOException e) {
+                    // (Caza ronda 6, A4-R6-08.) Igual que en importFile:
+                    // conservar staging para un reintento.
+                    promotionFailed = true;
+                    throw e;
+                }
                 finish(promotedXex(staging, dest, xex));
             } catch (Exception e) {
                 fail(e.getMessage());
             } finally {
                 sImportRunning = false;
-                deleteTree(staging);
+                if (!promotionFailed) deleteTree(staging);
             }
         }, "import-tree").start();
     }
@@ -564,6 +630,66 @@ public class SetupActivity extends Activity {
         return null;
     }
 
+    // --- free-space pre-check (Caza ronda 6, A4-R6-05) --------------------
+    // Un ISO 360 ronda 7 GB y el import moria a mitad de copia con una
+    // IOException generica tras minutos de trabajo. El chequeo corre ANTES
+    // de escribir nada, con el tamano total que list()/fileTable()/el
+    // arbol SAF ya conocen, y el error dice "falta espacio" con cifras.
+    // UMBRAL: espacio libre >= tamano total + 256 MiB fijos. Fijos, no un
+    // %: un 10% de 7 GB (700 MB) castigaria al juego grande sin motivo, y
+    // 256 MiB cubren de sobra el resto de escrituras del import
+    // (game_root.txt, settings.txt) mas el primer arranque (shader cache).
+    // El staging es hermano del destino en el mismo almacenamiento, asi
+    // que el total extraido ES lo que tiene que caber; no hay copia
+    // temporal aparte. Si el tamano no se puede medir (0) el chequeo solo
+    // exige el margen. Si StatFs falla, no se bloquea el import: se sigue
+    // como antes (el fallo a mitad de copia sigue siendo posible, pero ya
+    // no es el camino normal).
+    private static final long FREE_SPACE_MARGIN_BYTES = 256L << 20;
+
+    private static void requireFreeSpace(File dir, long neededBytes) throws java.io.IOException {
+        long free;
+        try {
+            free = new StatFs(dir.getAbsolutePath()).getAvailableBytes();
+        } catch (Exception e) {
+            return;
+        }
+        long want = neededBytes + FREE_SPACE_MARGIN_BYTES;
+        if (free < want) throw new java.io.IOException("Falta espacio libre: hacen falta "
+                + (want >> 20) + " MB y quedan " + (free >> 20)
+                + " MB. Libera espacio e inténtalo de nuevo.");
+    }
+
+    /** Size of a picked document via OpenableColumns.SIZE; 0 when unknown. */
+    private long pickedFileSize(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst()) return c.getLong(0);
+        } catch (Exception ignored) { }
+        return 0;
+    }
+
+    /** Total bytes of a picked folder tree (metadata only, nothing is read). */
+    private long treeSize(Uri tree, String docId, int depth) {
+        if (depth > 12) return 0;
+        long total = 0;
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
+        try (Cursor c = getContentResolver().query(children, new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE}, null, null, null)) {
+            List<String[]> rows = new ArrayList<>();
+            while (c != null && c.moveToNext()) rows.add(new String[]{c.getString(0), c.getString(1), c.getString(2)});
+            for (String[] r : rows) {
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(r[1])) {
+                    total += treeSize(tree, r[0], depth + 1);
+                } else {
+                    try { total += r[2] == null ? 0 : Long.parseLong(r[2]); } catch (NumberFormatException ignored) { }
+                }
+            }
+        } catch (Exception ignored) { }
+        return total;
+    }
+
     // --- staged import (Hunt v1.4.6 ronda 4, A4-R4-02) ----------------------
 
     /** Sibling of the game dir that holds an import in progress. */
@@ -592,20 +718,27 @@ public class SetupActivity extends Activity {
      * leaves a half-written game dir behind. On failure the old install
      * is restored when possible. A stale backup from a killed import is
      * dropped: the new import replaces it anyway.
+     *
+     * (Caza ronda 6, A4-R6-08.) El fallback viejo borraba el arbol viejo
+     * cuando el rename fallaba, y si ese borrado fallaba a medias la
+     * excepcion hacia que el finally del import borrase staging — la
+     * unica copia buena — y quedaba un gameDir parcial. Ahora NO hay
+     * fallback destructivo: si el rename a backup falla, se tira SIN
+     * tocar el destino (la instalacion anterior queda intacta) y el
+     * llamador conserva staging para un reintento (el proximo import lo
+     * borra primero). Si falla el rename de staging, el backup se
+     * restaura como antes y staging tambien se conserva.
      */
     private static void promoteStagedImport(File staging, File dest) throws java.io.IOException {
         File backup = importBackupDir(dest);
         deleteTree(backup);
         boolean hadDest = dest.exists();
         if (hadDest && !dest.renameTo(backup)) {
-            // A rename can fail on some providers; fall back to deleting
-            // the old tree — the import itself is complete in staging.
-            deleteTree(dest);
-            if (dest.exists()) throw new java.io.IOException("cannot replace old game dir");
+            throw new java.io.IOException("cannot replace old game dir - the previous install was left untouched and the new import was kept for a retry");
         }
         if (!staging.renameTo(dest)) {
             if (hadDest && backup.exists()) backup.renameTo(dest);
-            throw new java.io.IOException("cannot install imported game");
+            throw new java.io.IOException("cannot install imported game - the previous install was restored and the new import was kept for a retry");
         }
         deleteTree(backup);
     }
