@@ -29,10 +29,64 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// (Hunt v1.4.6, ronda 7, A3-R7-03.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/read/write.
+// Same heap validation as A3-R4-09 (see xam_net.cpp for the full
+// comment), copied here because this file had no range helper at all:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+
 u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL mask_ptr used to write the mask
   // to guest address 0.
   if (!mask_ptr) {
+    return X_E_INVALIDARG;
+  }
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) Same class, same file: the
+  // 4-byte mask out-param had only the NULL-check above.
+  if (!GuestRangeWritable(mask_ptr.guest_address(), sizeof(uint32_t))) {
     return X_E_INVALIDARG;
   }
 
@@ -52,6 +106,14 @@ u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_p
 
 u32 XamContentResolve_entry(u32 user_index, mapped_void content_data_ptr, mapped_void buffer_ptr,
                             u32 buffer_size, u32 unk1, u32 unk2, u32 unk3) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as a
+  // 0x134-byte XCONTENT_DATA below. (buffer_ptr is never dereferenced
+  // here -- the resolve itself is unimplemented -- so there is no
+  // range to validate for it.)
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), sizeof(XCONTENT_DATA))) {
+    return X_E_INVALIDARG;
+  }
   auto content_data = content_data_ptr.as<XCONTENT_DATA*>();
 
   // Result of buffer_ptr is sent to RtlInitAnsiString.
@@ -69,6 +131,17 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
   assert_not_null(handle_out);
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) handle_out is written on every
+  // exit and buffer_size_ptr on the early ones: validate both 4-byte
+  // ranges before anything writes through them.
+  if (buffer_size_ptr &&
+      !GuestRangeWritable(buffer_size_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_E_INVALIDARG;
+  }
+  if (!handle_out || !GuestRangeWritable(handle_out.guest_address(), sizeof(uint32_t))) {
+    return X_E_INVALIDARG;
+  }
+
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
   if ((device_id && device_info == nullptr) || !handle_out) {
     if (buffer_size_ptr) {
@@ -78,7 +151,16 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   }
 
   if (buffer_size_ptr) {
-    *buffer_size_ptr = sizeof(XCONTENT_DATA) * items_per_enumerate;
+    // (Hunt v1.4.6, ronda 7, A3-R7-03.) The multiplication used to
+    // wrap in u32 (0x134 * ~14M items already turns over): compute it
+    // in 64 bits; a total that does not fit the u32 out-param cannot
+    // be reported, so reject the call.
+    const uint64_t total_size =
+        static_cast<uint64_t>(sizeof(XCONTENT_DATA)) * items_per_enumerate;
+    if (total_size > UINT32_MAX) {
+      return X_E_INVALIDARG;
+    }
+    *buffer_size_ptr = static_cast<uint32_t>(total_size);
   }
 
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
@@ -130,6 +212,27 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
                        mapped_void overlapped_ptr) {
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as
+  // either a 0x134-byte XCONTENT_DATA or a 0x148-byte
+  // XCONTENT_AGGREGATE_DATA, and the deferred lambda below writes the
+  // disposition/license out-params: validate all of them up front
+  // (the lambda may run later, on the overlapped completion path).
+  // content_data_size only ever arrives as one of the two sizes
+  // above, so validating exactly that many bytes is exact; any other
+  // size is rejected here instead of in the else branch below.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), content_data_size)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (disposition_ptr &&
+      !GuestRangeWritable(disposition_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (license_mask_ptr &&
+      !GuestRangeWritable(license_mask_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
   XCONTENT_AGGREGATE_DATA content_data;
   if (content_data_size == sizeof(XCONTENT_DATA)) {
@@ -315,6 +418,17 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as a
+  // 0x134-byte XCONTENT_DATA below; is_creator_ptr (4 bytes) and
+  // creator_xuid_ptr (8 bytes, when present) are written.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), sizeof(XCONTENT_DATA)) ||
+      !GuestRangeWritable(is_creator_ptr.guest_address(), sizeof(uint32_t)) ||
+      (creator_xuid_ptr &&
+       !GuestRangeWritable(creator_xuid_ptr.guest_address(), sizeof(uint64_t)))) {
+    return X_E_INVALIDARG;
+  }
+
   auto result = X_ERROR_SUCCESS;
 
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
@@ -356,6 +470,15 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) buffer_size_ptr is read and
+  // written (4 bytes) and content_data_ptr is read as a 0x134-byte
+  // XCONTENT_DATA: validate both before the first dereference.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), sizeof(XCONTENT_DATA)) ||
+      !GuestRangeWritable(buffer_size_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_E_INVALIDARG;
+  }
+
   uint32_t buffer_size = *buffer_size_ptr;
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
@@ -374,6 +497,12 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
       if (buffer_size < buffer.size()) {
         // Dest buffer too small.
         result = X_ERROR_INSUFFICIENT_BUFFER;
+      } else if (!GuestRangeWritable(buffer_ptr.guest_address(), buffer.size())) {
+        // (Hunt v1.4.6, ronda 7, A3-R7-03.) Validate the destination
+        // against the bytes actually copied (buffer.size()), not the
+        // guest-provided buffer_size. The error still flows through
+        // the overlapped completion below, like the other failures.
+        result = X_E_INVALIDARG;
       } else {
         // Copy data.
         std::memcpy((uint8_t*)buffer_ptr, buffer.data(), buffer.size());
@@ -392,6 +521,16 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
 u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
                                  mapped_void buffer_ptr, u32 buffer_size,
                                  mapped_void overlapped_ptr) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as a
+  // 0x134-byte XCONTENT_DATA, and the vector below reads buffer_size
+  // bytes (a guest u32) from buffer_ptr: validate both ranges first,
+  // so a ~4 GiB size is rejected instead of trying to reserve 4 GiB.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), sizeof(XCONTENT_DATA)) ||
+      (buffer_ptr && !GuestRangeReadable(buffer_ptr.guest_address(), buffer_size)) ||
+      (!buffer_ptr && buffer_size)) {
+    return X_E_INVALIDARG;
+  }
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
@@ -410,6 +549,12 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
 
 u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
                            mapped_void overlapped_ptr) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as a
+  // 0x134-byte XCONTENT_DATA below.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(), sizeof(XCONTENT_DATA))) {
+    return X_E_INVALIDARG;
+  }
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
@@ -426,6 +571,13 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
 u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void overlapped_ptr) {
   // INFO: Analysis of xam.xex shows that "internal" functions are wrappers with
   // 0xFE as user_index
+  // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as a
+  // 0x148-byte XCONTENT_AGGREGATE_DATA below.
+  if (!content_data_ptr ||
+      !GuestRangeReadable(content_data_ptr.guest_address(),
+                          sizeof(XCONTENT_AGGREGATE_DATA))) {
+    return X_E_INVALIDARG;
+  }
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
 
