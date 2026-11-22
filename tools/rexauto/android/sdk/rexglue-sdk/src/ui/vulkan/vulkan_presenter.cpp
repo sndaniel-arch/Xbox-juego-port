@@ -1595,14 +1595,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       break;
     case VK_TIMEOUT:
       // No image became available within the timeout: treat the
-    // connection as outdated so Presenter::PaintAndPresent marks it
-    // kConnectedOutdated and the UI thread recreates the swapchain on
-    // the next paint tick, releasing paint_mode_mutex_ in the meantime.
-    REXLOG_INFO(
-    "VulkanPresenter: Timed out acquiring a swapchain image; "
-    "treating the connection as outdated so the swapchain is "
-    "recreated");
-    return PaintResult::kNotPresentedConnectionOutdated;
+      // connection as outdated so Presenter::PaintAndPresent marks it
+      // kConnectedOutdated and the UI thread recreates the swapchain on
+      // the next paint tick, releasing paint_mode_mutex_ in the meantime.
+      REXLOG_INFO(
+          "VulkanPresenter: Timed out acquiring a swapchain image; "
+          "treating the connection as outdated so the swapchain is "
+          "recreated");
+      return PaintResult::kNotPresentedConnectionOutdated;
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
