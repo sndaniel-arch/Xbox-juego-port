@@ -1569,13 +1569,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  // (Caza v1.4.6 ronda 8, A1-R8-01.) Finite acquire timeout instead of
+  // UINT64_MAX: the guest thread holds paint_mode_mutex_ for the whole of
+  // PaintAndPresent, and the UI thread needs that same mutex in
+  // SetPaintModeFromUIThread to disconnect/recreate the swapchain. With an
+  // infinite timeout, an acquire that never returns (all swapchain images
+  // held, compositor no longer releasing them — surface lost during
+  // rotation or backgrounding) blocks the guest thread forever with the
+  // mutex held, and the UI thread blocks behind it: ANR instead of a
+  // swapchain recreate. 1 s is ~60 vsyncs, far above any healthy acquire
+  // (bounded by one vsync in FIFO / immediate in IMMEDIATE), so the
+  // timeout only fires when the swapchain is genuinely stuck. On
+  // VK_TIMEOUT no image is acquired and the semaphore is not signaled
+  // (Vulkan spec), so reusing the same semaphore on the next paint is
+  // safe, and the command buffer begun above is reset by
+  // vkResetCommandPool on the next paint exactly like the existing early
+  // returns below — the timeout path needs no extra cleanup.
+  constexpr uint64_t kAcquireNextImageTimeoutNs = 1000000000;
   VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, kAcquireNextImageTimeoutNs,
+                                acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
+    case VK_TIMEOUT:
+      // No image became available within the timeout: treat the
+    // connection as outdated so Presenter::PaintAndPresent marks it
+    // kConnectedOutdated and the UI thread recreates the swapchain on
+    // the next paint tick, releasing paint_mode_mutex_ in the meantime.
+    REXLOG_INFO(
+    "VulkanPresenter: Timed out acquiring a swapchain image; "
+    "treating the connection as outdated so the swapchain is "
+    "recreated");
+    return PaintResult::kNotPresentedConnectionOutdated;
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
