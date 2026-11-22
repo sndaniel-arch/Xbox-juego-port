@@ -1378,18 +1378,18 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
   // (Caza v1.4.6 ronda 5, S-R5-02.) A translation that is valid but has
-      // no module yet — vkCreateShaderModule failed transiently (e.g. driver
-      // OOM) and deliberately did not poison is_valid_ — must retry the
-      // module creation here instead of passing a VK_NULL_HANDLE downstream.
-      // Re-running TranslateAnalyzedShader is safe: the translator clears its
-      // error list and overwrites the binary on every run. The retry rate is
-      // bounded by the pipeline-creation cooldown (R8-C1) and the
-      // one-sync-retry-per-submission budget, like any other failing
-      // pipeline. A deterministically invalid translation (is_valid_ false,
-      // e.g. the spirv_patch rejection) never enters this branch.
-      if (!vertex_shader->is_translated() ||
-          (vertex_shader->is_valid() && vertex_shader->shader_module() == VK_NULL_HANDLE)) {
-        vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+  // no module yet — vkCreateShaderModule failed transiently (e.g. driver
+  // OOM) and deliberately did not poison is_valid_ — must retry the
+  // module creation here instead of passing a VK_NULL_HANDLE downstream.
+  // Re-running TranslateAnalyzedShader is safe: the translator clears its
+  // error list and overwrites the binary on every run. The retry rate is
+  // bounded by the pipeline-creation cooldown (R8-C1) and the
+  // one-sync-retry-per-submission budget, like any other failing
+  // pipeline. A deterministically invalid translation (is_valid_ false,
+  // e.g. the spirv_patch rejection) never enters this branch.
+  if (!vertex_shader->is_translated() ||
+      (vertex_shader->is_valid() && vertex_shader->shader_module() == VK_NULL_HANDLE)) {
+    vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
@@ -1401,7 +1401,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   }
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated() ||
-        (pixel_shader->is_valid() && pixel_shader->shader_module() == VK_NULL_HANDLE)) {        
+        (pixel_shader->is_valid() && pixel_shader->shader_module() == VK_NULL_HANDLE)) {
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
@@ -1470,7 +1470,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
               "(flash is slower than shader creation; the shader is re-derived next launch)",
               kMaxStorageWriteQueueEntries, storage_write_dropped_shader_count);
         }
-      }          
+      }
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1492,7 +1492,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
               "(flash is slower than shader creation; the shader is re-derived next launch)",
               kMaxStorageWriteQueueEntries, storage_write_dropped_shader_count);
         }
-      }          
+      }
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1825,7 +1825,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
               "launch)",
               kMaxStorageWriteQueueEntries, storage_write_dropped_pipeline_count);
         }
-      }          
+      }
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1896,7 +1896,7 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   // the deterministic spirv_patch rejection), and EnsureShadersTranslated
   // retries the creation on the next call. Returning false without
   // touching is_translated_ / is_valid_ is what makes that retry
-  // possible.    
+  // possible.
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
@@ -2364,7 +2364,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
   // creation threads — EnsurePipelineCreated only consumes the
   // pre-looked-up arguments. The lock stays as defense in depth: it
   // serializes the attempted_ / shader_module_ pair if this path ever
-  // moves off the processor thread, and it is never contended today.    
+  // moves off the processor thread, and it is never contended today.
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   bool& attempted = adaptive ? tessellation_adaptive_vertex_shader_attempted_
                              : tessellation_indexed_vertex_shader_attempted_;
@@ -2421,7 +2421,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
   // creation threads — EnsurePipelineCreated only consumes the
   // pre-looked-up arguments. The lock stays as defense in depth: it
   // serializes the find + emplace below if this path ever moves off the
-  // processor thread, and it is never contended today.    
+  // processor thread, and it is never contended today.
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   TessellationControlShaderKey key;
   key.host_vertex_shader_type = host_vertex_shader_type;
@@ -2521,7 +2521,7 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   // creation threads — EnsurePipelineCreated only consumes the
   // pre-looked-up arguments. The lock stays as defense in depth: it
   // serializes the find + emplace below if this path ever moves off the
-  // processor thread, and it is never contended today.    
+  // processor thread, and it is never contended today.
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   auto it = geometry_shaders_.find(key);
   if (it != geometry_shaders_.end()) {
@@ -2565,9 +2565,9 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       // emits kPointList/kRectangleList/kQuadList, kNone is filtered by
       // GetGeometryShaderKey, and stored descriptions are XXH3-checked),
       // so this is defense only — but without it an unexpected value
-      // silently builds a broken shader.        
+      // silently builds a broken shader.
       assert_unhandled_case(key.type);
-      return VK_NULL_HANDLE;      
+      return VK_NULL_HANDLE;
   }
 
   uint32_t clip_distance_count = key.user_clip_plane_cull ? 0 : key.user_clip_plane_count;
@@ -3604,9 +3604,9 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       // (S-R5-03, same function, second switch.) Unreachable once the
       // modes switch above returns: key.type is never reassigned between
       // the two switches. Fail here too rather than emitting a main
-      // function for an unknown primitive type.        
+      // function for an unknown primitive type.
       assert_unhandled_case(key.type);
-      return VK_NULL_HANDLE;      
+      return VK_NULL_HANDLE;
   }
 
   // End the main function.
@@ -3669,7 +3669,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   auto* vertex_shader = static_cast<VulkanShader::VulkanTranslation*>(
       vertex_shader_it->second->GetTranslation(description.vertex_shader_modification));
   if (!vertex_shader || !vertex_shader->is_translated() || !vertex_shader->is_valid() ||
-      vertex_shader->shader_module() == VK_NULL_HANDLE) {      
+      vertex_shader->shader_module() == VK_NULL_HANDLE) {
     return fail("vertex_shader_translation_missing_or_invalid");
   }
   SpirvShaderTranslator::Modification vertex_shader_modification(
@@ -3687,7 +3687,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     pixel_shader = static_cast<VulkanShader::VulkanTranslation*>(
         pixel_shader_it->second->GetTranslation(description.pixel_shader_modification));
     if (!pixel_shader || !pixel_shader->is_translated() || !pixel_shader->is_valid() ||
-        pixel_shader->shader_module() == VK_NULL_HANDLE) {        
+        pixel_shader->shader_module() == VK_NULL_HANDLE) {
       return fail("pixel_shader_translation_missing_or_invalid");
     }
   }
