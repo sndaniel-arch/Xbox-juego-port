@@ -1,5 +1,6 @@
 package com.rexauto.port;
 
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
@@ -16,6 +17,19 @@ import org.libsdl.app.SDLActivity;
 public class MainActivity extends SDLActivity {
     private VirtualPadView mGamepad;
     private boolean mDeferSdlStart;
+
+    // (Hunt v1.4.6 ronda 7, A4-R7-01.) True while the guest is paused by
+    // one of the lifecycle/focus paths below. The native Pause()/Resume()
+    // calls are idempotent on their own (see pauseEmulation()), but the
+    // flag keeps the JNI crossing to one per transition: focus loss,
+    // onPause and onStop can all fire for a single Home press, and
+    // without it the pause would be issued three times.
+    private boolean mEmulationPaused;
+
+    // (Hunt v1.4.6 ronda 7, A4-R7-02.) Live instance of the exit-confirm
+    // dialog, so a second gesture back while it is up does not stack
+    // another one on top.
+    private AlertDialog mExitConfirmDialog;
 
     // (Ronda 3, auditor E — mitigación de X-A-1.) While a crash-guard /
     // crash-report dialog is up, the SDL thread must not start behind it:
@@ -215,29 +229,39 @@ public class MainActivity extends SDLActivity {
     @Override
     protected void onPause() {
         if (mGamepad != null) mGamepad.onHostPause();
-        if (!mHasMultiWindow) pauseEmulation();
+        // (Hunt v1.4.6 ronda 7, A4-R7-01.) The !mHasMultiWindow gate is
+        // gone: it is (SDK_INT >= 24) and minSdk is 28, so it was true on
+        // every device and this pause never ran. Pause on every onPause.
+        pauseEmulation();
         super.onPause();
     }
 
     /**
-     * (Hunt v1.4.6 ronda 3, A4-R3-03.) Focus loss pauses the SDL thread
-     * but NOT the guest: opening any in-game dialog (gear menu, graphics
-     * / logs / driver) froze rendering while the simulation kept
-     * advancing behind it. Mirror the onPause/onResume split on focus
-     * change, only when not multi-window — the same split SDLActivity's
-     * own onWindowFocusChanged uses for its native pause. Emulation goes
-     * first (as in onPause/onResume below), then SDL's own handling, so
-     * the guest stops before the SDL thread parks and resumes before it
-     * unparks. Pause/resume are idempotent natively, so a focus change
-     * arriving together with onPause/onResume (Home, incoming call,
-     * screen-off) is a harmless second call, and a focus change before
-     * the runtime exists is a no-op.
+     * (Hunt v1.4.6 ronda 3, A4-R3-03, fixed in ronda 7 by A4-R7-01.)
+     * Focus loss pauses the guest: pulling down the notification shade,
+     * opening quick settings, a system dialog or the assistant takes
+     * window focus without calling onStop, so the onPause/onStop paths
+     * never fired and the game kept running with audio behind the shade.
+     * The original A4-R3-03 split was gated on !mHasMultiWindow, but
+     * mHasMultiWindow is (SDK_INT >= 24) and minSdk is 28 -- true on
+     * every device that can install this APK -- so the gate made this
+     * whole override dead code and the fix never paused anything.
+     * Focus now pauses unconditionally, and the mEmulationPaused guard
+     * in pauseEmulation()/resumeEmulation() absorbs the overlap with
+     * onPause/onResume/onStop (Home, incoming call, screen-off fire
+     * several of them for one event). An AlertDialog opened by the game
+     * itself does NOT take window focus from the activity, so the
+     * in-game menus (gear, graphics, logs, driver) still do not pause --
+     * same as before. SDL's own focus handling
+     * (SDLActivity.onWindowFocusChanged) is untouched: the SDL thread
+     * keeps pumping events while the guest (graphics + audio) is
+     * parked, which is what the player experiences as paused.
+     * Emulation goes first, then SDL's own handling, so the guest stops
+     * before the SDL thread parks and resumes before it unparks.
      */
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
-        if (!mHasMultiWindow) {
-            if (hasFocus) resumeEmulation(); else pauseEmulation();
-        }
+        if (hasFocus) resumeEmulation(); else pauseEmulation();
         super.onWindowFocusChanged(hasFocus);
     }
 
@@ -248,7 +272,9 @@ public class MainActivity extends SDLActivity {
         // onPause: the guest CPU threads ran a window while the CP was
         // still suspended and vblank interrupts resumed. Resume the
         // emulation first, mirroring onPause.
-        if (!mHasMultiWindow) resumeEmulation();
+        // (Hunt v1.4.6 ronda 7, A4-R7-01.) Same dead gate as onPause:
+        // resume on every onResume.
+        resumeEmulation();
         super.onResume();
     }
 
@@ -271,22 +297,87 @@ public class MainActivity extends SDLActivity {
      * before this, Home / screen-off / switching apps left the game
      * running (audio included) in the background. The native side reaches
      * the runtime via Runtime::instance() and is a no-op before the
-     * runtime exists (crash-guard dialogs, first launch). The split
-     * mirrors SDLActivity's own: onPause/onResume when not multi-window,
-     * onStop/onStart when it is (mHasMultiWindow is SDLActivity's own
-     * public static flag, API 24+; minSdk here is 28). The native calls
+     * runtime exists (crash-guard dialogs, first launch). The native calls
      * are best-effort: a missing lib (mBrokenLibraries) must not crash
      * the lifecycle.
+     * (Hunt v1.4.6 ronda 7, A4-R7-01.) The !mHasMultiWindow split the old
+     * comment described is gone: the flag is (SDK_INT >= 24) and minSdk
+     * is 28, so onPause/onResume used to never pause/resume and onStop
+     * was the only real pause. Now onPause, onResume and focus loss all
+     * pause/resume unconditionally; onStop/onStart keep their branches
+     * as a safety net and the overlap collapses to one native call via
+     * mEmulationPaused. Idempotence, verified in the SDK sources rather
+     * than assumed: AudioSystem::Pause/Resume, CommandProcessor::
+     * Pause/Resume and XmaDecoder::Pause/Resume all early-return on
+     * their paused_ flag, and GraphicsSystem::Pause only delegates to
+     * the (idempotent) command-processor pause. Deliberate asymmetry:
+     * pause is guarded by the flag, resume is not -- resume always
+     * reaches native code, so a pause that outlived its activity
+     * instance (system killed the activity while paused, process
+     * survived) self-heals on the next onStart instead of leaving the
+     * guest parked forever under a fresh flag.
      */
     private static native void nativePauseEmulation();
     private static native void nativeResumeEmulation();
 
     private void pauseEmulation() {
+        if (mEmulationPaused) return;
+        mEmulationPaused = true;
         try { nativePauseEmulation(); } catch (Throwable t) { Log.w("MainActivity", "pause emulation failed", t); }
     }
 
     private void resumeEmulation() {
+        // (A4-R7-01.) Deliberately unguarded: see the comment above.
+        mEmulationPaused = false;
         try { nativeResumeEmulation(); } catch (Throwable t) { Log.w("MainActivity", "resume emulation failed", t); }
+    }
+    /**
+     * (Hunt v1.4.6 ronda 7, A4-R7-02.) The Android gesture back (edge
+     * swipe, the default navigation on Android 16) reaches here, while
+     * the hardware back key never does: SDL's key dispatch consumes
+     * KEYCODE_BACK (SDLActivity.java:1535-1541) and returns true, so it
+     * never reaches the system. Before this, the gesture ran
+     * SDLActivity.onBackPressed(), whose super.onBackPressed() finished
+     * the activity and killed the game with no confirmation and no save
+     * -- an accidental swipe mid-fight lost all unsaved progress. Ask
+     * first; only a confirmed "Salir" takes the old exit path
+     * (super.onBackPressed(), i.e. SDLActivity's, which finishes the
+     * activity and sends QUIT in onDestroy).
+     *
+     * Why an onBackPressed() override and not the two alternatives:
+     * - SDL_ANDROID_TRAP_BACK_BUTTON (SDLActivity.java:736-754) would
+     *   only swallow the gesture: with the hint on, the gesture does
+     *   nothing at all and the player has no way out of the game short
+     *   of Home, because the game itself never handles the back key.
+     *   There is also no Java-side nativeSetHint in this tree (the only
+     *   SDL_SetHint call is the orientations hint in android_main.cpp),
+     *   so the hint could not even be set from here without new JNI.
+     * - OnBackPressedCallback needs getOnBackPressedDispatcher(), which
+     *   android.app.Activity (SDLActivity's base class, no AppCompat
+     *   here) only gained in API 33; minSdk is 28, so it would need an
+     *   SDK guard plus a second path for older devices. The override
+     *   works on every API level with a single path.
+     * manualBackButton() (SDLActivity.java:791-796, the JNI path by which
+     * the game itself asks to exit) calls superOnBackPressed() directly
+     * and bypasses this override, so a game-requested exit is still
+     * immediate and never shows the dialog. A showing AlertDialog
+     * (crash guard, graphics, ...) consumes the gesture itself to
+     * dismiss, so this only fires while actually playing. The game
+     * keeps running behind the dialog, like behind every other in-game
+     * dialog (an AlertDialog does not take window focus, so the A4-R7-01
+     * focus pause does not fire either).
+     */
+    @Override
+    public void onBackPressed() {
+        if (isFinishing() || isDestroyed()) return;
+        if (mExitConfirmDialog != null && mExitConfirmDialog.isShowing()) return;
+        mExitConfirmDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.exit_confirm_title)
+                .setMessage(R.string.exit_confirm_msg)
+                .setPositiveButton(R.string.exit_confirm_yes, (d, w) -> super.onBackPressed())
+                .setNegativeButton(android.R.string.cancel, null)
+                .create();
+        mExitConfirmDialog.show();
     }
 
     @Override
