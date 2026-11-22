@@ -173,9 +173,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
 
-     // (Hunt v1.4.6 round 5, T-R5-07.) Only an unknown guest format is a
-     // deterministic creation failure in Vulkan (see render_target_cache.cpp).
-     bool ShouldCacheFailedRenderTarget(RenderTargetKey key) const override;
+  // (Hunt v1.4.6 round 5, T-R5-07.) Only an unknown guest format is a
+  // deterministic creation failure in Vulkan (see render_target_cache.cpp).
+  bool ShouldCacheFailedRenderTarget(RenderTargetKey key) const override;
 
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
 
