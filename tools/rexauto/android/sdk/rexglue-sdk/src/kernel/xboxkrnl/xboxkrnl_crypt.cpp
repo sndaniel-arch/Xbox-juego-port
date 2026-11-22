@@ -332,6 +332,7 @@ void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
     return;
   }
   sha_state.Zero();
+
   sha_state->state[0] = 0x6a09e667;
   sha_state->state[1] = 0xbb67ae85;
   sha_state->state[2] = 0x3c6ef372;
@@ -1043,7 +1044,6 @@ u32 XeKeysHmacShaUsingKey_entry(mapped_void obscured_key, mapped_void inp_1, u32
       (out && !GuestPtrWritable(out, std::min<uint32_t>(out_size, 0x14u)))) {
     return X_STATUS_INVALID_PARAMETER;
   }
-
 
   uint8_t key[16];
 
