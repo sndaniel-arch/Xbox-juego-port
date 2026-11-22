@@ -26,6 +26,55 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// (Hunt v1.4.6, ronda 7, A3-R7-05.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/read/write.
+// Same heap validation as A3-R4-09 (see xam_net.cpp for the full
+// comment), copied here because this file had no range helper at all:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+
 uint32_t ToXdkProtectFlags(uint32_t protect) {
   uint32_t result = 0;
   if (!(protect & memory::kMemoryProtectRead) && !(protect & memory::kMemoryProtectWrite)) {
@@ -75,6 +124,16 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   // _In_     ULONG Protect
   // _In_     BOOLEAN DebugMemory
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-05.) Both pointers are IN/OUT 4-byte
+  // values, read below and written back at the end: validate their
+  // ranges before the first dereference. (A NULL one still reports
+  // INVALID_PARAMETER through the check below, as before.)
+  if ((base_addr_ptr &&
+       !GuestRangeWritable(base_addr_ptr.guest_address(), sizeof(uint32_t))) ||
+      (region_size_ptr &&
+       !GuestRangeWritable(region_size_ptr.guest_address(), sizeof(uint32_t)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   assert_not_null(base_addr_ptr);
   assert_not_null(region_size_ptr);
 
@@ -202,6 +261,17 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
 
 u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
                                  u32 protect_bits, mapped_u32 old_protect, u32 debug_memory) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-05.) base_addr_ptr/region_size_ptr
+  // are read and written back (4 bytes each); old_protect is written
+  // when non-NULL. Validate all three ranges before the first read.
+  if ((base_addr_ptr &&
+       !GuestRangeWritable(base_addr_ptr.guest_address(), sizeof(uint32_t))) ||
+      (region_size_ptr &&
+       !GuestRangeWritable(region_size_ptr.guest_address(), sizeof(uint32_t))) ||
+      (old_protect &&
+       !GuestRangeWritable(old_protect.guest_address(), sizeof(uint32_t)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Set to TRUE when this memory refers to devkit memory area.
   assert_true(debug_memory == 0);
 
@@ -253,6 +323,13 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-05.) Same pointers, same class: the
+  // NULL-check above does not prove the 4-byte ranges are mapped.
+  if (!GuestRangeWritable(base_addr_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(region_size_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  
   uint32_t base_addr_value = *base_addr_ptr;
   uint32_t region_size_value = *region_size_ptr;
   REXKRNL_IMPORT_TRACE("NtFreeVirtualMemory", "base={:#x} size={:#x} type={:#x} debug={}",
@@ -319,6 +396,15 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
       return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-05.) The output struct used to be
+  // written with not even a NULL-check (~28 bytes at guest address 0
+  // or past the end of the mapping).
+  if (!memory_basic_information_ptr ||
+      !GuestRangeWritable(memory_basic_information_ptr.guest_address(),
+                          sizeof(X_MEMORY_BASIC_INFORMATION))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
   memory::HeapAllocationInfo alloc_info;
   if (heap == nullptr || !heap->QueryRegionInfo(base_address, &alloc_info)) {
@@ -499,6 +585,14 @@ u32 MmQueryStatistics_entry(ppc_ptr_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-05.) stats_ptr->size is read and the
+  // whole 104-byte struct is then zeroed and filled: validate the
+  // range before the first field read.
+  if (!GuestRangeWritable(stats_ptr.guest_address(),
+                          sizeof(X_MM_QUERY_STATISTICS_RESULT))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  
   const uint32_t size = sizeof(X_MM_QUERY_STATISTICS_RESULT);
 
   if (stats_ptr->size != size) {
