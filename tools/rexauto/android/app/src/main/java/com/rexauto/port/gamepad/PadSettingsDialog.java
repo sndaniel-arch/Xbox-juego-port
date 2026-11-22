@@ -255,7 +255,7 @@ final class PadSettingsDialog {
             // no show() on a finishing/destroyed activity
             // (WindowManager$BadTokenException).
             if (activity.isFinishing() || activity.isDestroyed()) return;
-                new AlertDialog.Builder(activity)
+            new AlertDialog.Builder(activity)
                 .setMessage(R.string.reset_confirm)
                 .setPositiveButton(android.R.string.ok, (d, w) -> {
                     // (Ronda 7, auditor F — R7-F7.) delete() devuelve
