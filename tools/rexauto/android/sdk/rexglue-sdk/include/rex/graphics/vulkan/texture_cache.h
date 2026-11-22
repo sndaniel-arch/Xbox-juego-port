@@ -330,9 +330,10 @@ class VulkanTextureCache final : public TextureCache {
     // forgotten here). Only clears state; never watches or unwatches.
     void NoteEtc2PartialLoadWatchFired() {
       ClearEtc2Progress();
-      etc2_partial_load_base_watch_handle_= nullptr;
-      etc2_partial_load_mips_watch_handle_= nullptr;
+      etc2_partial_load_base_watch_handle_ = nullptr;
+      etc2_partial_load_mips_watch_handle_ = nullptr;
     }
+
    private:
     union ViewKey {
       uint32_t key;
@@ -384,8 +385,7 @@ class VulkanTextureCache final : public TextureCache {
     VkImage image_;
     VmaAllocation allocation_;
 
-
-Usage usage_ = Usage::kUndefined;
+    Usage usage_ = Usage::kUndefined;
 
     // (Audit A1-R6-01.) See the accessors above.
     bool etc2_progress_active_ = false;
@@ -394,8 +394,8 @@ Usage usage_ = Usage::kUndefined;
     // (Hunt v1.4.6 round 5, T-R5-02.) Partial-load watches, armed while
     // etc2_progress_active_. They are separate from the base Texture
     // base/mips watches, which only exist once the texture is up to date.
-    SharedMemory::WatchHandle etc2_partial_load_base_watch_handle_= nullptr;
-    SharedMemory::WatchHandle etc2_partial_load_mips_watch_handle_= nullptr;
+    SharedMemory::WatchHandle etc2_partial_load_base_watch_handle_ = nullptr;
+    SharedMemory::WatchHandle etc2_partial_load_mips_watch_handle_ = nullptr;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
@@ -405,7 +405,7 @@ Usage usage_ = Usage::kUndefined;
     // RETRIED on every call: creating the image view over an unloaded
     // wrapper (layout UNDEFINED, texels uninitialized) and caching it
     // forever was the R3-03 regression.
-    bool texture_3d_as_2d_loaded_= false;
+    bool texture_3d_as_2d_loaded_ = false;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };
@@ -502,7 +502,7 @@ Usage usage_ = Usage::kUndefined;
   // 2D_ARRAY view bound there is a view-type mismatch (spec: the view
   // type must match the OpTypeImage Dim/Arrayed), so the 2D_ARRAY null
   // view used for shader fetches cannot serve the present path.
-  VkImageView null_image_view_2d_= VK_NULL_HANDLE;
+  VkImageView null_image_view_2d_ = VK_NULL_HANDLE;
   bool null_images_cleared_ = false;
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
