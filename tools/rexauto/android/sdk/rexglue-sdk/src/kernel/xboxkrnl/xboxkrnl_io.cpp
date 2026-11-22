@@ -47,6 +47,53 @@ struct CreateOptions {
   static const uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
 
+// (Hunt v1.4.6, caza ronda 6, A3-R6-02.) TranslateVirtual never
+// validates and never returns null, so a guest pointer + length that
+// runs past the end of the mapping SIGSEGVs the host on the
+// memcpy/read/write. Same heap validation as A3-R4-09 (see xam_net.cpp
+// for the full comment), copied here because this file had no range
+// helper at all: reject a range that wraps past 4 GiB, starts or ends
+// outside any heap, or spans heaps of different kinds (or two physical
+// heaps); inside a single heap, require the pages to be accessible
+// (read/write for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
   // TODO(gibbed): validate path components individually
   bool got_asterisk = false;
@@ -742,6 +789,34 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, caza ronda 6, A3-R6-02.) The NULL check above does
+  // not cover a non-NULL buffer at the end of the mapping: QueryDirectory
+  // writes length bytes (>= 72, guest-controlled, no upper bound) through
+  // it, which SIGSEGVs the host. Validate the output range first.
+  if (!GuestRangeWritable(file_info_ptr.guest_address(), length)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, caza ronda 6, segundo barrido, V-R6-01.) Same class as
+  // A3-R6-02/A3-R6-04, in this same function: io_status_block is only
+  // null-checked but written (8 bytes) at the end, and file_name's struct
+  // (8 bytes) and its nested string (pointer + length) are read by
+  // TranslateAnsiPath with no range check. A non-NULL pointer at the end
+  // of the mapping SIGSEGVs the host. Validate both ranges first; a NULL
+  // file_name is a valid "no filter" (TranslateAnsiString returns ""), and
+  // length 0 reads nothing, so both skip the nested check.
+  if (io_status_block &&
+      !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (file_name && !GuestRangeReadable(file_name.guest_address(), sizeof(X_ANSI_STRING))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (file_name && file_name->length &&
+      !GuestRangeReadable(static_cast<uint32_t>(file_name->pointer), file_name->length)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   X_STATUS result = X_STATUS_UNSUCCESSFUL;
   uint32_t info = 0;
 
@@ -865,9 +940,20 @@ u32 NtQuerySymbolicLinkObject_entry(u32 handle, ppc_ptr_t<X_ANSI_STRING> target)
   if (!target) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, caza ronda 6, A3-R6-02.) The NULL check does not cover
+  // a non-NULL struct at the end of the mapping: target->maximum_length
+  // is read and target->length written below, and target->pointer is
+  // memcpy'd into. Validate the 8-byte struct range before the first
+  // field access, and the target buffer range before the memcpy.
+  if (!GuestRangeWritable(target.guest_address(), sizeof(X_ANSI_STRING))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto length = std::min(static_cast<size_t>(target->maximum_length), symlink->target().size());
   if (length > 0) {
     if (!target->pointer) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
+    if (!GuestRangeWritable(static_cast<uint32_t>(target->pointer), length)) {
       return X_STATUS_INVALID_PARAMETER;
     }
     auto target_buf = REX_KERNEL_MEMORY()->TranslateVirtual(target->pointer);
