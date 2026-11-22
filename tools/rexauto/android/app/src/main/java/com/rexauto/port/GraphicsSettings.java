@@ -36,6 +36,30 @@ public final class GraphicsSettings {
     public int resolutionScale() { return Math.max(1, Math.min(3, prefs.getInt("resolution_scale", 1))); }
     public void setResolutionScale(int v) { prefs.edit().putInt("resolution_scale", Math.max(1, Math.min(3, v))).apply(); }
 
+    /**
+     * (Ronda 5, C-R5-01.) Warning text for a resolution scale above 1x,
+     * or null at 1x. On GPUs without sparse residency (Mali-G57) the
+     * native side reserves ONE non-sparse buffer of 512 MiB x scale^2 for
+     * the scaled resolve: 2 GiB at 2x, 4,5 GiB at 3x. If it does not fit,
+     * the native side now falls back to 1x on its own (probe in
+     * VulkanCommandProcessor::SetupContext) instead of failing the boot,
+     * but the user should still know 2x/3x may silently run at 1x on this
+     * phone. GraphicsDialog shows this under the scale spinner.
+     */
+    public String resolutionScaleWarning() {
+        return resolutionScaleWarningFor(resolutionScale());
+    }
+
+    /** Same warning for a scale value that is not stored yet (dialog preview). */
+    public static String resolutionScaleWarningFor(int s) {
+        s = Math.max(1, Math.min(3, s));
+        if (s <= 1) return null;
+        int mb = 512 * s * s;
+        String size = mb >= 1024 ? (mb / 1024) + " GiB" : mb + " MiB";
+        return "A " + s + "x la GPU reserva un buffer de " + size
+                + " que puede no caber en este teléfono: si no cabe, el juego arranca a 1x.";
+    }
+
     public boolean vsync() { return prefs.getBoolean("vsync", true); }
     public void setVsync(boolean v) { prefs.edit().putBoolean("vsync", v).apply(); }
 
