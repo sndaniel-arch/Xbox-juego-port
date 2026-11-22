@@ -5025,6 +5025,14 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      // (Hunt v1.4.6, caza ronda 6, A3-R6-01.) This host memcpy writes
+      // through the raw physical mapping, which bypasses the access
+      // callbacks (see Memory::AccessViolationCallback), so without this
+      // the resolved range stays marked valid in the texture cache and
+      // the game keeps sampling the stale texture. memexport (:4468)
+      // and the scaled-resolve (pipeline/texture/cache.cpp:394)
+      // invalidate; the readback-resolve path was the one that did not.
+      shared_memory_->RangeWrittenByGpu(written_address, written_length);
     }
   }
 
