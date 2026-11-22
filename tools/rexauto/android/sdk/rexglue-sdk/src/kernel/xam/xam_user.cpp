@@ -91,6 +91,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   if (!xuid_ptr) {
     return X_E_INVALIDARG;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-08.) The 8-byte xuid out-param is
+  // written at the end with only a NULL-check.
+  if (!GuestRangeWritable(xuid_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_E_INVALIDARG;
+  }
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
@@ -137,6 +142,12 @@ static_assert_size(X_USER_SIGNIN_INFO, 40);
 
 i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNIN_INFO> info) {
   if (!info) {
+    return X_E_INVALIDARG;
+  }
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-08.) The 40-byte struct is memsets
+  // and filled with only a NULL-check.
+  if (!GuestRangeWritable(info.guest_address(), sizeof(X_USER_SIGNIN_INFO))) {
     return X_E_INVALIDARG;
   }
 
