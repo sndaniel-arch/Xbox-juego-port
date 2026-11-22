@@ -329,7 +329,7 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
       !GuestRangeWritable(region_size_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  
+
   uint32_t base_addr_value = *base_addr_ptr;
   uint32_t region_size_value = *region_size_ptr;
   REXKRNL_IMPORT_TRACE("NtFreeVirtualMemory", "base={:#x} size={:#x} type={:#x} debug={}",
@@ -404,7 +404,7 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
                           sizeof(X_MEMORY_BASIC_INFORMATION))) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  
+
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
   memory::HeapAllocationInfo alloc_info;
   if (heap == nullptr || !heap->QueryRegionInfo(base_address, &alloc_info)) {
@@ -592,7 +592,7 @@ u32 MmQueryStatistics_entry(ppc_ptr_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
                           sizeof(X_MM_QUERY_STATISTICS_RESULT))) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  
+
   const uint32_t size = sizeof(X_MM_QUERY_STATISTICS_RESULT);
 
   if (stats_ptr->size != size) {
