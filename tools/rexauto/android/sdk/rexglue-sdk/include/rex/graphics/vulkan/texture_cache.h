@@ -339,9 +339,9 @@ class VulkanTextureCache final : public TextureCache {
     void NoteEtc2PartialLoadWatchFired(uint64_t argument) {
       ClearEtc2Progress();
       if (argument == 0) {
-       etc2_partial_load_base_watch_handle_ = nullptr;
+        etc2_partial_load_base_watch_handle_ = nullptr;
       } else {
-       etc2_partial_load_mips_watch_handle_ = nullptr;
+        etc2_partial_load_mips_watch_handle_ = nullptr;
       }
     }
 
