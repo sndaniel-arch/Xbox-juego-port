@@ -2274,6 +2274,21 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(const PipelineDescription& 
     return false;
   }
 
+  // (Caza v1.4.6 ronda 6, A1-R6-02.) sampleShadingEnable requires the
+  // sampleRateShading feature (VUID 00658): EnsurePipelineCreated sets it
+  // whenever the description asks for sample-rate shading with MSAA above
+  // 1x, so without the feature that vkCreateGraphicsPipelines would fail
+  // on every draw of the pipeline. Fail the pipeline here instead, like
+  // the depthClamp / fillModeNonSolid gates above — the msaa_samples !=
+  // k1X clause mirrors the creation condition exactly (at 1x the
+  // creation never sets the flag). The transfer path already checks the
+  // same feature (render_target_cache.cpp, masked samples); this is the
+  // draws path catching up.
+  if (!device_properties.sampleRateShading && description.sample_rate_shading &&
+      description.render_pass_key.msaa_samples != xenos::MsaaSamples::k1X) {
+    return false;
+  }
+
   // (Ronda 5, auditor E — R5-E1.) Real independentBlend gate, replacing
   // the dead assert_true (compiled out in Release builds by -DNDEBUG, so
   // it never gated anything shipped). Without independentBlend the Vulkan
