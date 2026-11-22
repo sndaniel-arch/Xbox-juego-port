@@ -15,6 +15,7 @@
 #include <rex/audio/audio_system.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
@@ -23,6 +24,53 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+// (Hunt v1.4.6, caza ronda 6, A3-R6-02.) TranslateVirtual never
+// validates and never returns null, so a guest pointer + length that
+// runs past the end of the mapping SIGSEGVs the host on the
+// memcpy/read/write. Same heap validation as A3-R4-09 (see xam_net.cpp
+// for the full comment), copied here because this file had no range
+// helper at all: reject a range that wraps past 4 GiB, starts or ends
+// outside any heap, or spans heaps of different kinds (or two physical
+// heaps); inside a single heap, require the pages to be accessible
+// (read/write for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
 
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL config_ptr used to write the
@@ -79,6 +127,15 @@ u32 XAudioRegisterRenderDriverClient_entry(mapped_u32 callback_ptr, mapped_u32 d
   // (*driver_ptr = 0x41550000 | index) but was never checked, unlike
   // callback_ptr just above.
   if (!driver_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  // (Hunt v1.4.6, caza ronda 6, A3-R6-02.) The NULL checks do not cover
+  // non-NULL pointers at the end of the mapping: callback_ptr[0..1]
+  // (8 bytes) is read below and *driver_ptr (4 bytes) is written, which
+  // SIGSEGVs the host. Validate both ranges before the first access.
+  if (!GuestRangeReadable(callback_ptr.guest_address(), 2 * sizeof(uint32_t)) ||
+      !GuestRangeWritable(driver_ptr.guest_address(), sizeof(uint32_t))) {
     return X_E_INVALIDARG;
   }
 
