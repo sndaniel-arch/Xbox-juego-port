@@ -686,7 +686,7 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
   // non-NULL pointer at the end of the mapping wrote past it.
   // copy_truncating writes at most string_size bytes.
   if (!string_out || !string_size ||
-        !GuestRangeWritable(string_out.guest_address(), string_size)) {
+      !GuestRangeWritable(string_out.guest_address(), string_size)) {
     return;
   }
   rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
