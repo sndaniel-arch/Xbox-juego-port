@@ -58,7 +58,14 @@ public final class IsoExtractor {
             for (long b : BASES) {
                 if (b + 0x10000 + 20 > ch.size()) continue;
                 ByteBuffer m = ByteBuffer.allocate(20);
-                ch.read(m, b + 0x10000);
+                // (Caza ronda 6, A4-R6-09.) El retorno de ch.read se
+                // ignoraba: una lectura corta dejaba ceros al final del
+                // buffer, la magia no casaba y un ISO truncado se
+                // reportaba como "no es ISO" (err_not_iso). Misma
+                // convencion que el camino de sectores (R7-F3): leer
+                // hasta llenar y tirar en lectura corta.
+                while (m.hasRemaining()) { if (ch.read(m, b + 0x10000 + m.position()) <= 0) break; }
+                if (m.hasRemaining()) throw new IOException("short read at offset 0x" + Long.toHexString(b + 0x10000) + " (truncated ISO?)");
                 if (java.util.Arrays.equals(m.array(), GDFX_MAGIC)) {
                     final long base = b;
                     return new IsoExtractor(new SectorSource() {
@@ -128,13 +135,24 @@ public final class IsoExtractor {
         long rootSector = vd.getInt(0x14) & 0xFFFFFFFFL;
         long rootSize = vd.getInt(0x18) & 0xFFFFFFFFL;
         List<Entry> out = new ArrayList<>();
-        walk(rootSector, rootSize, "", out, 0);
+        walk(rootSector, rootSize, "", out, 0, 0);
         return out;
     }
 
-    private void walk(long sector, long size, String prefix, List<Entry> out, int depth) throws IOException {
+    // Total directory buffers retained along one recursion path, in bytes.
+    // (Caza ronda 6, A4-R6-10.) Cada nivel alocaba hasta 64 MiB y el buffer
+    // del padre se retiene mientras se recorre el hijo: 16 niveles x 64 MiB
+    // son ~1 GiB transitorio en un ISO corrupto con rootSize cerca del tope.
+    // El tope por nivel se mantiene; este presupuesto TOTAL acota el peor
+    // caso a 128 MiB retenidos en un camino. Un ISO real tiene directorios
+    // de KiB, asi que el tope no muerde en datos sanos. El OOM no esta
+    // probado: el arreglo es acotar, no demostrarlo.
+    private static final long WALK_TOTAL_BUDGET = 128L << 20;
+
+    private void walk(long sector, long size, String prefix, List<Entry> out, int depth, long retained) throws IOException {
         if (depth > 16 || size <= 0 || size > (64L << 20)) return;
         int n = (int) ((size + 0x7FF) & ~0x7FFL);
+        if (retained + n > WALK_TOTAL_BUDGET) return;
         ByteBuffer d = readSector(sector, n);
         HashSet<Integer> seen = new HashSet<>();
         ArrayDeque<Integer> stack = new ArrayDeque<>();
@@ -156,7 +174,7 @@ public final class IsoExtractor {
             if (name.isEmpty() || name.equals(".") || name.equals("..") || name.contains("/") || name.contains("\\")) continue;
             String rel = prefix.isEmpty() ? name : prefix + "/" + name;
             if ((attr & 0x10) != 0) {
-                if (sz > 0) walk(sec, sz, rel, out, depth + 1);
+                if (sz > 0) walk(sec, sz, rel, out, depth + 1, retained + n);
             } else {
                 out.add(new Entry(rel, sec, sz));
             }
@@ -173,7 +191,10 @@ public final class IsoExtractor {
         byte[] chunk = new byte[1 << 20];
         for (Entry e : files) {
             File out = new File(dest, e.rel);
-            if (!out.getCanonicalPath().startsWith(dest.getCanonicalPath())) continue;
+            // (Caza ronda 6, A4-R6-06.) startsWith sin separador dejaba
+            // pasar un hermano con prefijo (game-evil pasa como game):
+            // exigir el separador tras el destino.
+            if (!out.getCanonicalPath().startsWith(dest.getCanonicalPath() + File.separator)) continue;
             File parent = out.getParentFile();
             if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("mkdir " + parent);
             if (!(out.isFile() && out.length() == e.size)) {
