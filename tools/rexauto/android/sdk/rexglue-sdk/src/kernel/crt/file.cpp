@@ -30,6 +30,55 @@ using rex::X_STATUS;
 
 namespace rex::kernel::crt {
 
+// (Hunt v1.4.6, ronda 7, A3-R7-07.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/read/write.
+// Same heap validation as A3-R4-09 (see xam_net.cpp for the full
+// comment), copied here because this file had no range helper at all:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+
 constexpr uint32_t kCreateNew = 1;
 constexpr uint32_t kCreateAlways = 2;
 constexpr uint32_t kOpenExisting = 3;
@@ -137,6 +186,13 @@ u32 ReadFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToRead,
     return 0;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-07.) The OVERLAPPED is read (ov[2]/ov[3])
+  // and written (ov[0]/ov[1]) -- 16 bytes -- with only a NULL-check.
+  // (The data buffer itself is validated inside XFile::Read.)
+  if (lpOverlapped && !GuestRangeWritable(lpOverlapped.guest_address(), 16)) {
+    return 0;
+  }
+
   uint64_t offset = static_cast<uint64_t>(-1);
   if (lpOverlapped) {
     auto* ov = reinterpret_cast<rex::be<uint32_t>*>(
@@ -167,6 +223,13 @@ u32 WriteFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToWrite,
   if (!file) {
     if (lpNumberOfBytesWritten)
       *lpNumberOfBytesWritten = 0;
+    return 0;
+  }
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-07.) Same 16-byte OVERLAPPED as
+  // ReadFile above, with only a NULL-check. (The data buffer itself
+  // is validated inside XFile::Write.)
+  if (lpOverlapped && !GuestRangeWritable(lpOverlapped.guest_address(), 16)) {
     return 0;
   }
 
@@ -215,6 +278,14 @@ u32 SetFilePointer_entry(u32 hFile, u32 lDistanceToMove, mapped_u32 lpDistanceTo
     return kInvalidHandleValue;
   }
 
+  // (Hunt v1.4.6, ronda 7, A3-R7-07.) As GetFileSizeEx above: the
+  // 8-byte out-param is written with only a NULL-check. Validate it
+  // before the seek takes effect, so a bad pointer fails without
+  // moving the file position.
+  if (lpNewFilePointer && !GuestRangeWritable(lpNewFilePointer.guest_address(), 8)) {
+    return 0;
+  }
+
   file->set_position(new_pos);
   if (lpDistanceToMoveHigh)
     *lpDistanceToMoveHigh = static_cast<uint32_t>(new_pos >> 32);
@@ -236,6 +307,12 @@ u32 GetFileSizeEx_entry(u32 hFile, mapped_void lpFileSize) {
   auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file)
     return 0;
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-07.) The 8-byte out-param (high/low
+  // dwords) is written with only a NULL-check.
+  if (lpFileSize && !GuestRangeWritable(lpFileSize.guest_address(), 8)) {
+    return 0;
+  }
 
   uint64_t size = file->entry()->size();
   if (lpFileSize) {
