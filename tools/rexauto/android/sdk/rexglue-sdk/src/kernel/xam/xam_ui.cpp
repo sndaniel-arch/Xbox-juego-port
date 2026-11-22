@@ -80,6 +80,49 @@ static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, false);
 }
 
+// (Hunt v1.4.6, caza ronda 6, A3-R6-05.) load_and_swap<std::u16string>
+// scans for NUL with no cap (include/rex/memory/utils.h:245-255), so a
+// guest string pointer near the end of the mapping with no NUL inside
+// it reads past the mapping (SIGSEGV in the host) while growing the
+// host string without bound. Read through this bounded reader instead:
+// same 4096 UTF-16 code-unit cap the keyboard dialog buffer uses below
+// (A3-R4-06), validated one page at a time so a short string at the end
+// of a heap is not rejected for the unmapped pages after it. A unit
+// never straddles a page boundary here: the address stays 2-aligned
+// (an odd address is corrupt input for a UTF-16 string) and each chunk
+// ends on a page boundary. Returns false on an invalid range; on
+// success *out holds the string, truncated at the cap if it has no NUL
+// within 4096 code units.
+constexpr size_t kMaxGuestUiStringCodeUnits = 4096;
+
+static bool ReadGuestU16String(uint32_t guest_address, std::u16string* out) {
+  out->clear();
+  if ((guest_address & 1) != 0) {
+    return false;
+  }
+  size_t remaining = kMaxGuestUiStringCodeUnits;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_units = (0x1000 - (address & 0xFFF)) / sizeof(uint16_t);
+    size_t chunk_units = remaining < page_units ? remaining : page_units;
+    if (!GuestRangeReadable(address, chunk_units * sizeof(uint16_t))) {
+      return false;
+    }
+    const uint16_t* host_ptr =
+        REX_KERNEL_MEMORY()->TranslateVirtual<const uint16_t*>(address);
+    for (size_t i = 0; i < chunk_units; ++i) {
+      uint16_t c = rex::memory::load_and_swap<uint16_t>(host_ptr + i);
+      if (!c) {
+        return true;
+      }
+      out->push_back(static_cast<wchar_t>(c));
+    }
+    address += static_cast<uint32_t>(chunk_units * sizeof(uint16_t));
+    remaining -= chunk_units;
+  }
+  return true;
+}
+
 // TODO(gibbed): This is all one giant WIP that seems to work better than the
 // previous immediate synchronous completion of dialogs.
 //
@@ -394,15 +437,27 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
       result_ptr.guest_address(), overlapped.guest_address());
   std::string title;
   if (title_ptr) {
-    title = rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-        REX_KERNEL_MEMORY()->TranslateVirtual(title_ptr.guest_address())));
+    // (Hunt v1.4.6, caza ronda 6, A3-R6-05.) Bounded read: the old
+    // load_and_swap<std::u16string> scanned for NUL with no cap.
+    std::u16string title_u16;
+    if (!ReadGuestU16String(title_ptr.guest_address(), &title_u16)) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    title = rex::string::to_utf8(title_u16);
   } else {
     title = "";  // TODO(gibbed): default title based on flags?
   }
-  std::string text_str = text_ptr
-                             ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                                   REX_KERNEL_MEMORY()->TranslateVirtual(text_ptr.guest_address())))
-                             : "";
+  std::string text_str;
+  if (text_ptr) {
+    // (Hunt v1.4.6, caza ronda 6, A3-R6-05.) Bounded read, as title above.
+    std::u16string text_u16;
+    if (!ReadGuestU16String(text_ptr.guest_address(), &text_u16)) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    text_str = rex::string::to_utf8(text_u16);
+  } else {
+    text_str = "";
+  }
 
   std::vector<std::string> buttons;
   // (Hunt v1.4.6, ronda 3, A3-R3-12.) button_ptrs was the one
@@ -423,9 +478,15 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   }
   for (uint32_t i = 0; i < button_count; ++i) {
     uint32_t button_ptr = button_ptrs[i];
-    auto button = rex::memory::load_and_swap<std::u16string>(
-        REX_KERNEL_MEMORY()->TranslateVirtual(button_ptr));
-    buttons.push_back(rex::string::to_utf8(button));
+    // (Hunt v1.4.6, caza ronda 6, A3-R6-05.) Bounded read, as title
+    // above: each button string was another unbounded NUL scan. A NULL
+    // button pointer is corrupt input and is rejected here (the array
+    // itself was validated above, not the strings it points to).
+    std::u16string button_u16;
+    if (!ReadGuestU16String(button_ptr, &button_u16)) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    buttons.push_back(rex::string::to_utf8(button_u16));
   }
 
   X_RESULT result;
@@ -639,18 +700,32 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
 
     // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
-    std::string title_str = title
-                                ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                                      REX_KERNEL_MEMORY()->TranslateVirtual(title.guest_address())))
-                                : "";
-    std::string desc_str =
-        description ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                          REX_KERNEL_MEMORY()->TranslateVirtual(description.guest_address())))
-                    : "";
-    std::string def_text_str =
-        default_text ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                           REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
-                     : "";
+    // (Hunt v1.4.6, caza ronda 6, A3-R6-05.) Bounded reads: these were
+    // the same unbounded NUL scans as the message-box strings above.
+    std::string title_str;
+    if (title) {
+      std::u16string title_u16;
+      if (!ReadGuestU16String(title.guest_address(), &title_u16)) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+      title_str = rex::string::to_utf8(title_u16);
+    }
+    std::string desc_str;
+    if (description) {
+      std::u16string desc_u16;
+      if (!ReadGuestU16String(description.guest_address(), &desc_u16)) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+      desc_str = rex::string::to_utf8(desc_u16);
+    }
+    std::string def_text_str;
+    if (default_text) {
+      std::u16string def_text_u16;
+      if (!ReadGuestU16String(default_text.guest_address(), &def_text_u16)) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+      def_text_str = rex::string::to_utf8(def_text_u16);
+    }
 
     if (imgui_drawer) {
       // (Hunt v1.4.6, ronda 4, A3-R4-06.) +1 in size_t: the old u32
