@@ -164,13 +164,22 @@ jobs:
     # documents 360 min as the job default and the GitHub-hosted execution
     # limit is 6 h, so 360 is the most this job can ever get. The six step
     # timeouts below sum to 350 (10 + 10 + 30 + 60 + 60 + 180), so every
-    # step budget is honourable inside the job budget, with 10 min left
-    # for the untimed steps (checkouts, manifest/functions injection,
-    # localize, pack -- typically ~10 min in a normal run). Previously the
+    # long step budget is honourable inside the job budget. Previously the
     # steps summed to 510 against a 350-min job (phase 1 + phase 2 alone
     # were 360 > 350), so the 240-min phase-2 budget could never be
     # honoured in full. (V-A5-01 added the Python-deps timeout to the
     # count: it was untimed before, so the old sum missed it.)
+    # (A5-R7-11, ronda 7.) The old comment also assumed the steps WITHOUT
+    # a timeout (checkouts, injections, localize, pack, uploads, ...) fit
+    # in the 10 min left over -- an untested hypothesis. Every step in
+    # this job now carries its own timeout-minutes (5-15 min each, 175 in
+    # total across 19 steps). Step timeouts are per-step ATTRIBUTION caps,
+    # NOT an additive budget: their sum (350 + 175 = 525) exceeds the job
+    # ceiling by design -- steps run sequentially and the job timeout
+    # (360) is still the hard ceiling that fires first if the run as a
+    # whole overruns. A step cap only fires when that single step hangs
+    # past its own cap, so the failure names the hanging step instead of
+    # dying anonymously at the job timeout.
     timeout-minutes: 360
     outputs:
       title: ${{ steps.meta.outputs.title }}
@@ -196,15 +205,34 @@ jobs:
       REXGLUE_BUNDLE_SHA256: c3fdf06b6e55271591b52ba6ab1fb5c1fd6de7f88032299117cac94e099bb241
       REXAUTO_SDK_PIN: "0"
     steps:
+      - name: Guard CI versionCode stays below the FULL range (A5-R4-01, fail-fast)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          # (A5-R7-08, ronda 7.) The SAME guard also lives in the apk job
+          # (defense in depth -- it is kept there), but it used to run only
+          # after the whole windows codegen job plus the apk-job setup: a
+          # run_number >= 1000000 would burn up to 3 h of codegen before
+          # failing. Fail here, as the FIRST step of job 1, before any
+          # checkout or codegen -- run_number needs no checkout. CI
+          # versionCode is github.run_number and FULL releases use
+          # 1_000_000 + major*10000 + minor*100 + patch (v1.4.6 FULL =
+          # 1010406); a CI run_number >= 1_000_000 would ship a CI APK no
+          # FULL release could update over (downgrade).
+          if ([int]"${{ github.run_number }}" -ge 1000000) { Write-Host "::error::github.run_number ${{ github.run_number }} reached the FULL versionCode range (>= 1000000) -- CI codes must stay below 1_000_000; see the FULL versionCode scheme"; exit 1 }
+          Write-Host "CI versionCode ${{ github.run_number }} < 1000000 (FULL range starts at 1000000)"
+
       - name: Validate inputs
         shell: pwsh
         run: |
           if ("${{ inputs.iso_url }}".Trim() -notmatch '^https?://') { Write-Host "::error::iso_url must start with http(s)://"; exit 1 }
 
       - uses: actions/checkout@v7
+        timeout-minutes: 10
 
       - name: Checkout rexauto (pinned commit)
         uses: actions/checkout@v7
+        timeout-minutes: 10
         with:
           repository: Player124413/rexauto
           ref: ${{ env.REXAUTO_REF }}
@@ -212,6 +240,7 @@ jobs:
 
       - name: Overlay tracked ci_fetch.py (A-1)
         shell: pwsh
+        timeout-minutes: 5
         run: |
           # ci_fetch.py is upstream (Player124413/rexauto, NOT tracked there);
           # our copy under tools/rexauto/tools/ is a delta on it, exactly like
@@ -224,8 +253,24 @@ jobs:
           Copy-Item tools/rexauto/tools/ci_fetch.py rexauto/tools/ci_fetch.py
           if (-not (Select-String -Path rexauto/tools/ci_fetch.py -Pattern "downloaded_sha256" -Quiet)) { Write-Host "::error::tracked ci_fetch.py does not emit downloaded_sha256"; exit 1 }
 
+      - name: Overlay tracked ci_sdk.py (A5-R7-03)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          # (A5-R7-03, ronda 7.) ci_sdk.py is upstream (Player124413/rexauto,
+          # NOT tracked there); our copy under tools/rexauto/tools/ is a delta
+          # on it, exactly like ci_fetch.py (A-1) above. Only cmd_verify()
+          # differs: a pin mismatch is a LOUD failure (sys.exit(1)) instead
+          # of a warning that silently disabled the pin. Without this copy,
+          # "Verify SDK pin" would run the upstream file and the pin check
+          # could never fail. The marker below proves the overlaid file is
+          # ours, not the upstream one.
+          Copy-Item tools/rexauto/tools/ci_sdk.py rexauto/tools/ci_sdk.py
+          if (-not (Select-String -Path rexauto/tools/ci_sdk.py -Pattern "refusing to build against an unpinned SDK" -Quiet)) { Write-Host "::error::tracked ci_sdk.py does not fail on pin mismatch"; exit 1 }
+
       - name: Gate codegen/runtime SDK version skew (A5-R4-04)
         shell: pwsh
+        timeout-minutes: 5
         run: |
           # (A5-R4-04, ronda 4.) Codegen runs the 0.10.1 repack bundle
           # while the Android runtime builds from SDK 0.10.0 + patches: a
@@ -250,6 +295,7 @@ jobs:
           Write-Host "SDK major.minor match ($codegen); patch-level skew is known and accepted"
 
       - uses: actions/setup-python@v7
+        timeout-minutes: 10
         with:
           python-version: "3.12"
 
@@ -276,6 +322,7 @@ jobs:
 
       - name: Toolchain
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
@@ -308,6 +355,7 @@ jobs:
       - name: Resolve pinned SDK URL
         id: sdk
         shell: pwsh
+        timeout-minutes: 5
         working-directory: rexauto
         run: |
           $url = (python tools/ci_sdk.py url)
@@ -361,9 +409,47 @@ jobs:
             Write-Host "::warning::SDK install attempt $attempt failed, retrying in 30s..."
             Start-Sleep -Seconds 30
           }
+          # (A5-R7-03, ronda 7.) Integrity marker: the cache path above
+          # (rexauto/rexglue) is saved wholesale by actions/cache, so this
+          # file travels with the cached tree. The "Verify cached SDK
+          # integrity" step below reads it on EVERY run (cache-hit or not)
+          # and fails if it is missing or does not match
+          # REXGLUE_BUNDLE_SHA256 -- a restored cache entry is only
+          # trusted if it proves it came from the audited bundle.
+          "${{ env.REXGLUE_BUNDLE_SHA256 }}" | Out-File -FilePath "rexglue/.bundle-sha256" -Encoding utf8 -NoNewline
+          Write-Host "SDK integrity marker written: rexglue/.bundle-sha256"
+
+      - name: Verify cached SDK integrity (A5-R7-03)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          # (A5-R7-03, ronda 7.) Runs on EVERY run (no `if:`): the
+          # "Verify ReXGlue SDK bundle SHA-256" and "Install ReXGlue SDK"
+          # steps above are skipped on a cache-hit, so a restored tree
+          # used to reach codegen with no integrity check at all (and
+          # "Verify SDK pin" only checks tool presence -- a pin mismatch
+          # there is now fatal too, see tools/rexauto/tools/ci_sdk.py,
+          # but it still inspects no SDK content). The marker was written
+          # by the Install step inside the cached path (rexauto/rexglue),
+          # so it travels with the cache entry; a mismatch means the
+          # restored tree is not the audited sdk-v0.10.1-repack bundle.
+          # NOTE: a cache entry written BEFORE this marker existed has no
+          # marker file and fails here on purpose -- delete that stale
+          # entry once (`gh cache delete` the rexglue-sdk key) and re-run;
+          # the next entry carries the marker.
+          $marker = "rexauto/rexglue/.bundle-sha256"
+          if (-not (Test-Path $marker -PathType Leaf)) { Write-Host "::error::cached SDK integrity: marker $marker is missing -- the restored rexauto/rexglue tree was cached before A5-R7-03 (or is incomplete). Delete the stale rexglue-sdk cache entry (gh cache delete) and re-run; do not build codegen against an unverified SDK."; exit 1 }
+          $marked = (Get-Content $marker -Raw).Trim()
+          $expected = "${{ env.REXGLUE_BUNDLE_SHA256 }}".Trim()
+          if ($marked -ne $expected) { Write-Host "::error::cached SDK integrity: marker says $marked, expected bundle SHA-256 $expected -- the restored rexauto/rexglue tree is not the audited sdk-v0.10.1-repack bundle. Delete the rexglue-sdk cache entry and re-run."; exit 1 }
+          if (-not (Test-Path "rexauto/rexglue" -PathType Container)) { Write-Host "::error::cached SDK integrity: rexauto/rexglue is missing after cache restore"; exit 1 }
+          $count = (Get-ChildItem "rexauto/rexglue" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+          if ($count -lt 1) { Write-Host "::error::cached SDK integrity: rexauto/rexglue is empty after cache restore"; exit 1 }
+          Write-Host "cached SDK integrity OK: marker $marked matches the audited bundle SHA-256 ($count files under rexauto/rexglue)"
 
       - name: Verify SDK pin
         shell: pwsh
+        timeout-minutes: 10
         working-directory: rexauto
         run: python tools/ci_sdk.py verify
 
@@ -397,6 +483,7 @@ jobs:
       - name: Verify ISO SHA-256 (if provided)
         if: inputs.iso_sha256 != ''
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $expected = "${{ inputs.iso_sha256 }}".Trim().ToUpper()
           # (A-1.) The tracked ci_fetch.py (see "Overlay tracked ci_fetch.py")
@@ -454,6 +541,7 @@ jobs:
 
       - name: Inject register-as-local into the manifest
         shell: pwsh
+        timeout-minutes: 5
         run: |
           # Hunt 4 P0-1: the SDK reads the *_as_local / skip_* options from
           # the [entrypoint] table of the project manifest, NOT top-level
@@ -507,6 +595,7 @@ jobs:
 
       - name: Inject phone-reported functions into functions.toml
         shell: pwsh
+        timeout-minutes: 5
         run: |
           # Run #9 seed (2026-11-18): the phone hit one more guest function
           # the recompile never emitted (0x8291FEE0 -- "Call to invalid or
@@ -669,6 +758,7 @@ jobs:
 
       - name: Localize generated code (register-as-local flush)
         shell: pwsh
+        timeout-minutes: 15
         run: |
           # tools/localize_fix_col.py runs on the GENERATED tree (after
           # codegen converged, before the pack step). It adds the cross-call
@@ -689,6 +779,7 @@ jobs:
 
       - name: Verify register-as-local codegen + localize
         shell: pwsh
+        timeout-minutes: 10
         run: |
           # Replaces the old "Guard: patched codegen required" step. That
           # guard checked recomp/col.toml, a file CI never consumes; this
@@ -723,6 +814,7 @@ jobs:
         id: meta
         if: always()
         shell: pwsh
+        timeout-minutes: 10
         working-directory: rexauto
         run: |
           $game = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\game"
@@ -733,6 +825,7 @@ jobs:
       - name: Pack generated port for the APK job
         if: always()
         shell: pwsh
+        timeout-minutes: 15
         run: |
           $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
           if (-not (Test-Path "$port\generated\default\sources.cmake")) { Write-Host "::error::no generated code -- codegen failed, see logs"; exit 1 }
@@ -749,6 +842,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         if: always()
+        timeout-minutes: 15
         with:
           name: port-src-${{ env.REX_PROJECT }}
           path: |
@@ -760,6 +854,7 @@ jobs:
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v7
+        timeout-minutes: 10
         with:
           name: logs-windows-${{ env.REX_PROJECT }}
           path: |
@@ -792,8 +887,17 @@ jobs:
           # patch, no super.onCreate fix, no Spanish, no input pulse) --
           # P0-1, hunt round 2 (2026-11-13). The copy is safe: in CI this
           # checkout holds exactly the tracked files (sdk/, build/,
-          # .gradle/, ci-release.jks, local.properties are gitignored, and
-          # settings.gradle.kts is not tracked -- the stock one stays).
+          # .gradle/, ci-release.jks, local.properties are gitignored).
+          # (A5-R7-05, ronda 7.) CORRECTION: the old comment claimed
+          # settings.gradle.kts is not tracked and the stock one stays --
+          # FALSE. settings.gradle.kts IS tracked and IS overlaid here
+          # (same for gradle.properties). Both are inert in CI per
+          # evidence R-01/R-02: the file:// local-maven repo points at a
+          # directory that does not exist on the runner (Gradle treats it
+          # as an empty repo and resolves via google()/mavenCentral()),
+          # and the MITM truststore path does not exist either (the JVM
+          # falls back to the default cacerts). If either ever stops being
+          # inert, this is the place that ships it to CI.
           cp -r tools/rexauto/android/. rexauto/android/
           cp tools/rexauto/tools/android_sdk.sh rexauto/tools/android_sdk.sh
           # Sanity: the files that must differ from stock are present.
@@ -875,7 +979,13 @@ jobs:
         id: sdk-cache
         with:
           path: rexauto/android/sdk
-          key: android-sdk-v0.10.0-${{ hashFiles('rexauto/android/patches/*.patch', 'rexauto/tools/android_sdk.sh', 'tools/rexauto/android/patches/*.patch', 'tools/rexauto/tools/android_sdk.sh', 'tools/rexauto/android/sdk/**') }}
+          # (A5-R7-06, ronda 7.) The key carries the xbmovie_probe input:
+          # the flip step below edits xbmovie_device.cpp INSIDE this
+          # cached tree, so a probe=true run used to save the flipped SDK
+          # under the same key as a normal run (only the unconditional
+          # re-overlay + the M-5 guard saved normal runs). inputs
+          # .xbmovie_probe is a workflow boolean (default false).
+          key: android-sdk-v0.10.0-${{ hashFiles('rexauto/android/patches/*.patch', 'rexauto/tools/android_sdk.sh', 'tools/rexauto/android/patches/*.patch', 'tools/rexauto/tools/android_sdk.sh', 'tools/rexauto/android/sdk/**') }}-probe-${{ inputs.xbmovie_probe }}
 
       - name: ReXGlue SDK (v0.10.0 + Android patches)
         working-directory: rexauto
@@ -1084,6 +1194,9 @@ jobs:
           # no FULL release can update over (downgrade). Fail here, before
           # Gradle, if the run number ever reaches the FULL range. The CI
           # versionName stays "1.<run_number>" by design.
+          # (A5-R7-08, ronda 7.) This guard is KEPT here as defense in
+          # depth; the same check now also runs as the FIRST step of job 1
+          # (fail-fast, before the ~3 h codegen) -- see there.
           if [ "${{ github.run_number }}" -ge 1000000 ]; then echo "::error::github.run_number ${{ github.run_number }} reached the FULL versionCode range (>= 1000000) -- CI codes must stay below 1_000_000; see the FULL versionCode scheme"; exit 1; fi
           echo "CI versionCode ${{ github.run_number }} < 1000000 (FULL range starts at 1000000)"
 
@@ -1170,12 +1283,32 @@ jobs:
           if [ ! -x "$APKSIGNER" ]; then echo "::error::apksigner not found at $APKSIGNER (AGP 8.7.3 build-tools 35.0.0) -- check the Android SDK on the runner"; exit 1; fi
           "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/verify.txt
           EXPECTED_CERT_SHA256="3768a83d38837f424138c1570f77e111bd1777ff6df049d476e562a46bb189ab"
-          ACTUAL_CERT_SHA256="$(grep -a "certificate SHA-256 digest" /tmp/verify.txt | head -1 | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
+          # (A5-R7-09, ronda 7.) grep -m1 instead of `| head -1`: under
+          # pipefail a SIGPIPE'd grep fails the step (the FULL script
+          # already fixed the same pattern with grep -m1).
+          ACTUAL_CERT_SHA256="$(grep -a -m1 "certificate SHA-256 digest" /tmp/verify.txt | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
             echo "::error::APK signed with an unexpected certificate (SHA-256 $ACTUAL_CERT_SHA256, expected heart key $EXPECTED_CERT_SHA256). It would NOT install over previous builds -- check CI_KEYSTORE_BASE64."
             exit 1
           fi
           echo "APK certificate SHA-256: $ACTUAL_CERT_SHA256 (heart key OK)"
+          # (A5-R7-02, ronda 7.) Verify the BUILT APK's versionCode with
+          # aapt2 dump badging: build.gradle.kts used to fall back silently
+          # to 1 when -PrexVersionCode was missing (now a hard Gradle
+          # failure instead), and the A5-R4-01 guard only checks
+          # github.run_number, never the APK -- a lost property would have
+          # shipped versionCode 1 while every guard stayed green. aapt2
+          # lives next to the apksigner pinned above (build-tools 35.0.0).
+          AAPT2="$ANDROID_HOME/build-tools/35.0.0/aapt2"
+          if [ ! -x "$AAPT2" ]; then echo "::error::aapt2 not found at $AAPT2 (AGP 8.7.3 build-tools 35.0.0) -- check the Android SDK on the runner"; exit 1; fi
+          _BADGING="$("$AAPT2" dump badging "$APK" | grep -a -m1 '^package:')"
+          ACTUAL_VERSION_CODE="$(echo "$_BADGING" | sed "s/.*versionCode='\([0-9]*\)'.*/\1/")"
+          ACTUAL_VERSION_NAME="$(echo "$_BADGING" | sed "s/.*versionName='\([^']*\)'.*/\1/")"
+          if [ "$ACTUAL_VERSION_CODE" != "${{ github.run_number }}" ]; then
+            echo "::error::APK versionCode is $ACTUAL_VERSION_CODE, expected github.run_number ${{ github.run_number }} -- the -PrexVersionCode property did not reach Gradle (see A5-R7-02); a wrong code would not install over previous builds."
+            exit 1
+          fi
+          echo "APK versionCode $ACTUAL_VERSION_CODE (== github.run_number) versionName $ACTUAL_VERSION_NAME OK"
           cp "$APK" "${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk"
           SIZE=$(stat -c%s "$APK")
           {
