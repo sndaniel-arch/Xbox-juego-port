@@ -1691,10 +1691,14 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Called from EnsurePipelineCreated,
-  // which runs on the pipeline creation threads as well as on the
-  // command processor thread: serialize the find + emplace below, which
-  // two threads could otherwise race (UB on unordered_map).
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.) Called
+  // from TryGetPipelineCreationArgumentsForDescription, which only runs on
+  // the command processor thread today (ConfigurePipeline / IssueDraw,
+  // and InitializeShaderStorage) — never from the pipeline creation
+  // threads, which only consume the pre-looked-up arguments in
+  // EnsurePipelineCreated. The lock stays as defense in depth: it
+  // serializes the find + emplace below if this path ever moves off the
+  // processor thread, and it is never contended today.
   std::lock_guard<std::mutex> render_pass_lock(render_pass_cache_mutex_);
   auto it = render_passes_.find(key);
   if (it != render_passes_.end()) {
@@ -1991,6 +1995,19 @@ uint32_t VulkanRenderTargetCache::GetMaxRenderTargetHeight() const {
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       command_processor_.GetVulkanDevice()->properties();
   return std::min(device_properties.maxFramebufferHeight, device_properties.maxImageDimension2D);
+}
+
+// (Hunt v1.4.6 round 5, T-R5-07.) Only an unknown guest format is a
+// deterministic render target creation failure in Vulkan: it maps to
+// VK_FORMAT_UNDEFINED and CreateRenderTarget returns nullptr before
+// allocating anything. Every other failure (image allocation, most
+// likely device OOM, or view creation) is transient and must be retried
+// by the next GetOrCreateRenderTarget call, so it must not be cached.
+bool VulkanRenderTargetCache::ShouldCacheFailedRenderTarget(RenderTargetKey key) const {
+  if (key.is_depth) {
+    return GetDepthVulkanFormat(key.GetDepthFormat()) == VK_FORMAT_UNDEFINED;
+  }
+  return GetColorVulkanFormat(key.GetColorFormat()) == VK_FORMAT_UNDEFINED;
 }
 
 RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
@@ -4390,8 +4407,13 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   std::vector<unsigned int> shader_code;
   builder.dump(shader_code);
 
-  // Create the shader module, and store the handle even if creation fails not
-  // to try to create it again later.
+  // Create the shader module.
+  // (Hunt v1.4.6 round 5, T-R5-05.) Do NOT store the handle when creation
+  // fails: caching VK_NULL_HANDLE would poison this transfer shader key
+  // for the whole session on a possibly transient failure, and
+  // GetTransferPipelines would then cache the failure one level up too
+  // (see T-R5-06). The next transfer retries the creation (same class as
+  // A1-R4-07).
   VkShaderModule shader_module = ui::vulkan::util::CreateShaderModule(
       vulkan_device, reinterpret_cast<const uint32_t*>(shader_code.data()),
       sizeof(uint32_t) * shader_code.size());
@@ -4400,6 +4422,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
         "VulkanRenderTargetCache: Failed to create the render target ownership "
         "transfer shader 0x{:08X}",
         key.key);
+    return VK_NULL_HANDLE;
   }
   transfer_shaders_.emplace(key, shader_module);
   return shader_module;
@@ -4424,14 +4447,19 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   if (!use_dynamic_rendering) {
     render_pass = GetHostRenderTargetsRenderPass(key.render_pass_key);
     if (render_pass == VK_NULL_HANDLE) {
-      transfer_pipelines_.emplace(key, std::array<VkPipeline, 4>{});
+      // (Hunt v1.4.6 round 5, T-R5-06.) Do NOT cache the empty array: the
+      // render pass failure is transient (A1-R4-07 made
+      // GetHostRenderTargetsRenderPass retry it), and caching it here
+      // would re-poison it one level up. The next transfer retries.
       return nullptr;
     }
   }
 
   VkShaderModule fragment_shader_module = GetTransferShader(key.shader_key);
   if (fragment_shader_module == VK_NULL_HANDLE) {
-    transfer_pipelines_.emplace(key, std::array<VkPipeline, 4>{});
+    // (Hunt v1.4.6 round 5, T-R5-06.) Do NOT cache the empty array: the
+    // shader failure is transient (see T-R5-05, which no longer caches
+    // it either). The next transfer retries.
     return nullptr;
   }
 
@@ -4672,7 +4700,9 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
         "VulkanRenderTargetCache: Failed to create the render target ownership "
         "transfer pipeline for render pass 0x{:08X}, shader 0x{:08X}",
         key.render_pass_key.key, key.shader_key.key);
-    transfer_pipelines_.emplace(key, std::array<VkPipeline, 4>{});
+    // (Hunt v1.4.6 round 5, T-R5-06.) Do NOT cache the empty array: a
+    // transient creation failure must be retried by the next transfer,
+    // not recorded forever (same class as A1-R4-07).
     return nullptr;
   }
   if (dest_is_masked_sample) {
@@ -4698,7 +4728,9 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
         for (uint32_t j = 0; j < i; ++j) {
           dfn.vkDestroyPipeline(device, pipelines[j], nullptr);
         }
-        transfer_pipelines_.emplace(key, std::array<VkPipeline, 4>{});
+        // (Hunt v1.4.6 round 5, T-R5-06.) Do NOT cache the empty array:
+        // a transient creation failure must be retried by the next
+        // transfer, not recorded forever (same class as A1-R4-07).
         return nullptr;
       }
     }
@@ -6096,8 +6128,11 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   std::vector<unsigned int> shader_code;
   builder.dump(shader_code);
 
-  // Create the pipeline, and store the handle even if creation fails not to try
-  // to create it again later.
+  // Create the pipeline.
+  // (Hunt v1.4.6 round 5, T-R5-04.) Do NOT store the handle when creation
+  // fails: caching VK_NULL_HANDLE would make every later DumpRenderTargets
+  // for this key fail forever on a possibly transient (e.g. driver OOM)
+  // failure. The next dump retries the creation (same class as A1-R4-07).
   VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
       command_processor_.GetVulkanDevice(),
       key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
@@ -6109,6 +6144,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         UINT32_C(1) << uint32_t(key.msaa_samples),
         key.is_depth ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
                      : xenos::GetColorRenderTargetFormatName(key.GetColorFormat()));
+    return VK_NULL_HANDLE;
   }
   dump_pipelines_.emplace(key, pipeline);
   return pipeline;
