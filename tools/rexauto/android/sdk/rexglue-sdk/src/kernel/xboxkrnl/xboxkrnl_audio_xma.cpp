@@ -30,6 +30,55 @@ using namespace rex::system;
 
 using rex::audio::XMA_CONTEXT_DATA;
 
+// (Hunt v1.4.6, ronda 7, A3-R7-06.) TranslateVirtual never validates
+// and never returns null, so a guest pointer + length that runs past
+// the end of the mapping SIGSEGVs the host on the memcpy/read/write.
+// Same heap validation as A3-R4-09 (see xam_net.cpp for the full
+// comment), copied here because this file had no range helper at all:
+// reject a range that wraps past 4 GiB, starts or ends outside any
+// heap, or spans heaps of different kinds (or two physical heaps);
+// inside a single heap, require the pages to be accessible (read/write
+// for a destination, readable for a source).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  return true;
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+
 // See audio_system.cc for implementation details.
 //
 // XMA details:
@@ -129,6 +178,15 @@ struct XMA_CONTEXT_INIT {
 static_assert_size(XMA_CONTEXT_INIT, 56);
 
 u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_INIT> context_init) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-06.) context_init (56 bytes) is read
+  // throughout and context_ptr is memsets to sizeof(XMA_CONTEXT_DATA)
+  // below; neither had even a NULL-check (the sister
+  // XMACreateContext_entry does guard its out-param, R6-06).
+  if (!context_ptr || !context_init ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA)) ||
+      !GuestRangeReadable(context_init.guest_address(), sizeof(XMA_CONTEXT_INIT))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Input buffers may be null (buffer 1 in 415607D4).
   // Convert to host endianness.
   uint32_t input_buffer_0_guest_ptr = context_init->input_buffer_0_ptr;
@@ -198,6 +256,14 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 }
 
 u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-06.) The XMA_CONTEXT_DATA ctor reads
+  // the whole 64-byte context and loop_data is read for its loop
+  // fields; neither pointer had a NULL-check.
+  if (!context_ptr || !loop_data ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA)) ||
+      !GuestRangeReadable(loop_data.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.loop_start = loop_data->loop_start;
