@@ -187,9 +187,9 @@ void VulkanTextureCache::Etc2PartialLoadWatchCallback(
 
 void VulkanTextureCache::VulkanTexture::ArmEtc2PartialLoadWatch(SharedMemory& shared_memory) {
   // (Hunt v1.4.6 round 6, A2-R6-01.) Arm PER RANGE, not both-or-nothing:
-// after one range fires, its handle is null while the other watch is
-// still registered, and the old joint early-return would have re-armed
-// the live range a second time (duplicate watch on the same range).
+  // after one range fires, its handle is null while the other watch is
+  // still registered, and the old joint early-return would have re-armed
+  // the live range a second time (duplicate watch on the same range).
   if (!etc2_partial_load_base_watch_handle_ && GetGuestBaseSize() != 0) {
     etc2_partial_load_base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(),
