@@ -12,7 +12,18 @@ val rexPortDir: String = (project.findProperty("rexPortDir") as String?)
     ?: "${rootProject.projectDir.parentFile}/autoports/$rexName/port"
 val rexSdkDir: String = (project.findProperty("rexSdkDir") as String?)
     ?: "${rootProject.projectDir}/sdk/rexglue-sdk"
-val rexVersionCode: Int = ((project.findProperty("rexVersionCode") as String?) ?: "1").toInt()
+// (A5-R7-02, ronda 7.) rexVersionCode has NO silent fallback: a missing
+// -PrexVersionCode used to default to 1, and nothing verified the APK's
+// real versionCode, so a FULL (or CI) APK could ship as versionCode 1 and
+// refuse to install over any previous FULL (INSTALL_FAILED_VERSION_DOWNGRADE)
+// while every guard stayed green. A local build without -PrexVersionCode
+// now FAILS HERE, on purpose, with this message -- pass
+// -PrexVersionCode=<run_number> (CI) or -PrexVersionCode=1010406 (FULL
+// v1.4.6) explicitly. The workflow "Verify APK" step and the FULL script
+// also check the built APK's versionCode with aapt2 dump badging.
+val rexVersionCode: Int = (project.findProperty("rexVersionCode") as String?)
+    ?.toIntOrNull()
+?: throw GradleException("A5-R7-02: missing or non-numeric -PrexVersionCode (CI: -PrexVersionCode=<github.run_number>; FULL v1.4.6: -PrexVersionCode=1010406). Refusing the silent default versionCode 1: an APK built as 1 would not install over any previous FULL.")
 val rexVersionName: String = (project.findProperty("rexVersionName") as String?) ?: "1.0"
 // Full variant (private only, never CI): the game ships inside the APK as an
 // asset and the launcher auto-imports it on first launch (-PrexFull=true).
