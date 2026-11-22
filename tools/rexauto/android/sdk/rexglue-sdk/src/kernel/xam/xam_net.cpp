@@ -227,6 +227,12 @@ XNetStartupParams xnet_startup_params = {};
 
 u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
   if (params) {
+    // (Hunt v1.4.6, ronda 7, A3-R7-08.) The 13-byte params struct is
+    // read (assert + memcpy) with only a NULL-check; skip the copy
+    // on a bad range, like the NULL case already does.
+    if (!GuestRangeReadable(params.guest_address(), sizeof(XNetStartupParams))) {
+      return 0;
+    }
     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
   }
@@ -622,6 +628,12 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   if (!addr_ptr) {
     return XnAddrStatus::XNET_GET_XNADDR_NONE;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-08.) sizeof(XNADDR) (36) bytes are
+  // written (fields plus the abEnet/abOnline memsets) with only a
+  // NULL-check.
+  if (!GuestRangeWritable(addr_ptr.guest_address(), sizeof(XNADDR))) {
+    return XnAddrStatus::XNET_GET_XNADDR_NONE;
+  }
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -650,6 +662,11 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   if (!addr_ptr) {
     return XnAddrStatus::XNET_GET_XNADDR_NONE;
   }
+  // (Hunt v1.4.6, ronda 7, A3-R7-08.) Zero() writes the whole
+  // sizeof(XNADDR) struct with only the NULL-check above.
+  if (!GuestRangeWritable(addr_ptr.guest_address(), sizeof(XNADDR))) {
+    return XnAddrStatus::XNET_GET_XNADDR_NONE;
+  }
   addr_ptr.Zero();
 
   // XNET_GET_XNADDR_NONE causes caller to gracefully return.
@@ -663,6 +680,15 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-08.) The only copy_truncating caller
+  // in the area without even a NULL-check: with string_out == NULL and
+  // string_size > 0 the memcpy wrote to guest address 0, and a
+  // non-NULL pointer at the end of the mapping wrote past it.
+  // copy_truncating writes at most string_size bytes.
+  if (!string_out || !string_size ||
+        !GuestRangeWritable(string_out.guest_address(), string_size)) {
+    return;
+  }
   rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
 }
 
