@@ -65,6 +65,24 @@ namespace rex::graphics::vulkan {
 
 namespace {
 
+// (Ronda 5, C-R5-11.) Bound for the storage-write queues
+// (storage_write_shader_queue_ / storage_write_pipeline_queue_): each new
+// shader/pipeline enqueues one flash write, and the consumer writes
+// synchronously, so a burst (zone load creating hundreds of pipelines)
+// while flash is slow grew the queues without bound. 1024 entries is
+// ~10x any realistic burst -- the consumer drains continuously -- and
+// bounds the queues to ~1 MiB (pipeline entries are stored by value).
+// Dropping is safe: a dropped entry only loses a warm-cache write, the
+// shader/pipeline is re-derived on the next launch (the shader's
+// ucode_storage_index is a generation marker, not a file offset, so a
+// missing entry cannot corrupt the storage file). The oldest entries are
+// dropped, keeping the newest. Counters are file-scope: there is exactly
+// one VulkanPipelineCache per process, and the drop log is throttled
+// (first 8, then every 1024th) like the other throttled logs in this file.
+constexpr size_t kMaxStorageWriteQueueEntries = 1024;
+size_t storage_write_dropped_shader_count = 0;
+size_t storage_write_dropped_pipeline_count = 0;
+
 constexpr std::string_view kPlaceholderPixelShaderSource = R"(#version 460
 layout(location = 0) out vec4 oC0;
 void main() {
@@ -1359,8 +1377,19 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
-  if (!vertex_shader->is_translated()) {
-    vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+  // (Caza v1.4.6 ronda 5, S-R5-02.) A translation that is valid but has
+      // no module yet — vkCreateShaderModule failed transiently (e.g. driver
+      // OOM) and deliberately did not poison is_valid_ — must retry the
+      // module creation here instead of passing a VK_NULL_HANDLE downstream.
+      // Re-running TranslateAnalyzedShader is safe: the translator clears its
+      // error list and overwrites the binary on every run. The retry rate is
+      // bounded by the pipeline-creation cooldown (R8-C1) and the
+      // one-sync-retry-per-submission budget, like any other failing
+      // pipeline. A deterministically invalid translation (is_valid_ false,
+      // e.g. the spirv_patch rejection) never enters this branch.
+      if (!vertex_shader->is_translated() ||
+          (vertex_shader->is_valid() && vertex_shader->shader_module() == VK_NULL_HANDLE)) {
+        vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
@@ -1371,7 +1400,8 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
     return false;
   }
   if (pixel_shader != nullptr) {
-    if (!pixel_shader->is_translated()) {
+    if (!pixel_shader->is_translated() ||
+        (pixel_shader->is_valid() && pixel_shader->shader_module() == VK_NULL_HANDLE)) {        
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
@@ -1428,6 +1458,19 @@ bool VulkanPipelineCache::ConfigurePipeline(
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
       storage_write_shader_queue_.push_back(&vertex_shader->shader());
+      // (Ronda 5, C-R5-11.) Bound the queue: drop the oldest entries
+      // when the consumer falls behind. A dropped shader is simply not
+      // in the warm cache next launch; it is re-translated on demand.
+      while (storage_write_shader_queue_.size() > kMaxStorageWriteQueueEntries) {
+        storage_write_shader_queue_.pop_front();
+        if (++storage_write_dropped_shader_count < 8 ||
+            (storage_write_dropped_shader_count % 1024) == 0) {
+          REXGPU_WARN(
+              "Storage write shader queue full ({} entries) - dropping oldest shader write #{} "
+              "(flash is slower than shader creation; the shader is re-derived next launch)",
+              kMaxStorageWriteQueueEntries, storage_write_dropped_shader_count);
+        }
+      }          
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1439,6 +1482,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
       storage_write_shader_queue_.push_back(&pixel_shader->shader());
+      // (Ronda 5, C-R5-11.) Same bound as the vertex shader above.
+      while (storage_write_shader_queue_.size() > kMaxStorageWriteQueueEntries) {
+        storage_write_shader_queue_.pop_front();
+        if (++storage_write_dropped_shader_count < 8 ||
+            (storage_write_dropped_shader_count % 1024) == 0) {
+          REXGPU_WARN(
+              "Storage write shader queue full ({} entries) - dropping oldest shader write #{} "
+              "(flash is slower than shader creation; the shader is re-derived next launch)",
+              kMaxStorageWriteQueueEntries, storage_write_dropped_shader_count);
+        }
+      }          
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1757,6 +1811,21 @@ bool VulkanPipelineCache::ConfigurePipeline(
       PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
       stored_description.description_hash = description.GetHash();
       std::memcpy(&stored_description.description, &description, sizeof(description));
+      // (Ronda 5, C-R5-11.) Bound the queue: drop the oldest entries
+      // when the consumer falls behind. A dropped pipeline is simply not
+      // in the warm cache next launch; it is re-created on demand from
+      // its description.
+      while (storage_write_pipeline_queue_.size() > kMaxStorageWriteQueueEntries) {
+        storage_write_pipeline_queue_.pop_front();
+        if (++storage_write_dropped_pipeline_count < 8 ||
+            (storage_write_dropped_pipeline_count % 1024) == 0) {
+          REXGPU_WARN(
+              "Storage write pipeline queue full ({} entries) - dropping oldest pipeline write "
+              "#{} (flash is slower than pipeline creation; the pipeline is re-derived next "
+              "launch)",
+              kMaxStorageWriteQueueEntries, storage_write_dropped_pipeline_count);
+        }
+      }          
     }
     storage_write_request_cond_.notify_all();
   }
@@ -1821,6 +1890,13 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
+  // (Caza v1.4.6 ronda 5, S-R5-02.) A VK_NULL_HANDLE here means the
+  // module creation failed, not the translation: the translation stays
+  // valid and module-less (GetOrCreateShaderModule only invalidates on
+  // the deterministic spirv_patch rejection), and EnsureShadersTranslated
+  // retries the creation on the next call. Returning false without
+  // touching is_translated_ / is_valid_ is what makes that retry
+  // possible.    
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
@@ -2281,9 +2357,14 @@ uint32_t VulkanPipelineCache::GetTessellationPatchControlPointCount(
 }
 
 VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
-  // as on the command processor thread: serialize the attempted_ /
-  // shader_module_ pair, which two threads could otherwise write at once.
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.) This
+  // getter only runs on the command processor thread today: it is reached
+  // from TryGetPipelineCreationArgumentsForDescription (ConfigurePipeline /
+  // IssueDraw, and InitializeShaderStorage), never from the pipeline
+  // creation threads — EnsurePipelineCreated only consumes the
+  // pre-looked-up arguments. The lock stays as defense in depth: it
+  // serializes the attempted_ / shader_module_ pair if this path ever
+  // moves off the processor thread, and it is never contended today.    
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   bool& attempted = adaptive ? tessellation_adaptive_vertex_shader_attempted_
                              : tessellation_indexed_vertex_shader_attempted_;
@@ -2333,9 +2414,14 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
 VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
     Shader::HostVertexShaderType host_vertex_shader_type,
     xenos::TessellationMode tessellation_mode) {
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
-  // as on the command processor thread: serialize the find + emplace
-  // below, which two threads could otherwise race (UB on unordered_map).
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.) This
+  // getter only runs on the command processor thread today: it is reached
+  // from TryGetPipelineCreationArgumentsForDescription (ConfigurePipeline /
+  // IssueDraw, and InitializeShaderStorage), never from the pipeline
+  // creation threads — EnsurePipelineCreated only consumes the
+  // pre-looked-up arguments. The lock stays as defense in depth: it
+  // serializes the find + emplace below if this path ever moves off the
+  // processor thread, and it is never contended today.    
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   TessellationControlShaderKey key;
   key.host_vertex_shader_type = host_vertex_shader_type;
@@ -2428,9 +2514,14 @@ bool VulkanPipelineCache::GetGeometryShaderKey(
 }
 
 VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) Runs on the creation threads as well
-  // as on the command processor thread: serialize the find + emplace
-  // below, which two threads could otherwise race (UB on unordered_map).
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01.) This
+  // getter only runs on the command processor thread today: it is reached
+  // from TryGetPipelineCreationArgumentsForDescription (ConfigurePipeline /
+  // IssueDraw, and InitializeShaderStorage), never from the pipeline
+  // creation threads — EnsurePipelineCreated only consumes the
+  // pre-looked-up arguments. The lock stays as defense in depth: it
+  // serializes the find + emplace below if this path ever moves off the
+  // processor thread, and it is never contended today.    
   std::lock_guard<std::mutex> lock(lazy_shader_cache_mutex_);
   auto it = geometry_shaders_.find(key);
   if (it != geometry_shaders_.end()) {
@@ -2468,7 +2559,15 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       output_max_vertices = 4;
       break;
     default:
+      // (Caza v1.4.6 ronda 5, S-R5-03.) No valid geometry-shader type:
+      // fail instead of building SPIR-V with zeroed execution modes.
+      // No live path produces another value today (the producer only
+      // emits kPointList/kRectangleList/kQuadList, kNone is filtered by
+      // GetGeometryShaderKey, and stored descriptions are XXH3-checked),
+      // so this is defense only — but without it an unexpected value
+      // silently builds a broken shader.        
       assert_unhandled_case(key.type);
+      return VK_NULL_HANDLE;      
   }
 
   uint32_t clip_distance_count = key.user_clip_plane_cull ? 0 : key.user_clip_plane_count;
@@ -3502,7 +3601,12 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     } break;
 
     default:
+      // (S-R5-03, same function, second switch.) Unreachable once the
+      // modes switch above returns: key.type is never reassigned between
+      // the two switches. Fail here too rather than emitting a main
+      // function for an unknown primitive type.        
       assert_unhandled_case(key.type);
+      return VK_NULL_HANDLE;      
   }
 
   // End the main function.
@@ -3564,7 +3668,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   }
   auto* vertex_shader = static_cast<VulkanShader::VulkanTranslation*>(
       vertex_shader_it->second->GetTranslation(description.vertex_shader_modification));
-  if (!vertex_shader || !vertex_shader->is_translated() || !vertex_shader->is_valid()) {
+  if (!vertex_shader || !vertex_shader->is_translated() || !vertex_shader->is_valid() ||
+      vertex_shader->shader_module() == VK_NULL_HANDLE) {      
     return fail("vertex_shader_translation_missing_or_invalid");
   }
   SpirvShaderTranslator::Modification vertex_shader_modification(
@@ -3581,7 +3686,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     }
     pixel_shader = static_cast<VulkanShader::VulkanTranslation*>(
         pixel_shader_it->second->GetTranslation(description.pixel_shader_modification));
-    if (!pixel_shader || !pixel_shader->is_translated() || !pixel_shader->is_valid()) {
+    if (!pixel_shader || !pixel_shader->is_translated() || !pixel_shader->is_valid() ||
+        pixel_shader->shader_module() == VK_NULL_HANDLE) {        
       return fail("pixel_shader_translation_missing_or_invalid");
     }
   }
