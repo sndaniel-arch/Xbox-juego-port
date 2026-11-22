@@ -2,8 +2,12 @@ package com.rexauto.port;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -15,6 +19,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.lang.ref.WeakReference;
 import java.util.List;
 
 /**
@@ -382,6 +387,11 @@ public final class GraphicsDialog {
         dlg.show();
         dlg.getListView().setOnItemLongClickListener((p, v, pos, id) -> {
             if (pos == 0) return true;
+            // (Caza ronda 7, A4-R7-03.) Same guard as show() (A4-R6-07):
+            // the long-click fires from a live dialog, but the activity
+            // can have died under it; no show() on a finishing/destroyed
+            // activity (WindowManager$BadTokenException).
+            if (activity.isFinishing() || activity.isDestroyed()) return true;
             GpuDriver.Info d = list.get(pos - 1);
             new AlertDialog.Builder(activity).setMessage(activity.getString(R.string.gpu_driver_remove, d.name))
                     .setPositiveButton(android.R.string.ok, (dd, ww) -> {
@@ -397,17 +407,33 @@ public final class GraphicsDialog {
     public static void onDriverPicked(Activity activity, Intent data) {
         if (data == null || data.getData() == null) return;
         Uri uri = data.getData();
+        // (Caza ronda 7, A4-R7-04.) The import thread below used to capture
+        // the activity (new GpuDriver(activity), activity.getContent-
+        // Resolver(), activity.runOnUiThread(...)), so a destroyed
+        // activity was retained until the driver zip finished importing.
+        // The thread now holds only a WeakReference to the activity plus
+        // the application context (all the import needs: prefs, files
+        // dir, ContentResolver). The completion callback posts on the
+        // static main looper and dereferences the weak reference there,
+        // keeping the R8-F2 liveness guard: if the activity died mid-
+        // import there is no Toast to show and no dialog to reopen, and
+        // the driver is installed all the same (importZip + select
+        // already ran on the application context).
+        final WeakReference<Activity> selfRef = new WeakReference<>(activity);
+        final Context appCtx = activity.getApplicationContext();
+        final ContentResolver appResolver = appCtx.getContentResolver();
         new Thread(() -> {
             try {
-                GpuDriver gd = new GpuDriver(activity);
+                GpuDriver gd = new GpuDriver(appCtx);
                 // (Ronda 6, auditor F — R6-F7.) getLastPathSegment() puede
                 // devolver null (content:// sin segmento): el null llegaba
                 // a importZip como displayName y a los mensajes como "null".
                 String name = uri.getLastPathSegment();
                 if (name == null) name = "driver.zip";
-                GpuDriver.Info info = gd.importZip(activity.getContentResolver(), uri, name);
+                GpuDriver.Info info = gd.importZip(appResolver, uri, name);
                 gd.select(info.slug);
-                activity.runOnUiThread(() -> {
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    Activity a = selfRef.get();
                     // (Ronda 8, auditor F - R8-F2.) El import corre en un
                     // hilo: si la actividad murio antes de que el callback
                     // llegara (el usuario salio de la app a mitad del
@@ -416,14 +442,15 @@ public final class GraphicsDialog {
                     // crashea el hilo principal. Sin dialogo que reabrir
                     // ni toast que mostrar: el driver quedo instalado
                     // igual (importZip + select ya corrieron).
-                    if (activity.isFinishing() || activity.isDestroyed()) return;
-                    Toast.makeText(activity, activity.getString(R.string.gpu_driver_installed, info.name), Toast.LENGTH_LONG).show();
-                    showDriverDialog(activity);
+                    if (a == null || a.isFinishing() || a.isDestroyed()) return;
+                    Toast.makeText(a, a.getString(R.string.gpu_driver_installed, info.name), Toast.LENGTH_LONG).show();
+                    showDriverDialog(a);
                 });
             } catch (Exception e) {
-                activity.runOnUiThread(() -> {
-                    if (activity.isFinishing() || activity.isDestroyed()) return;
-                    Toast.makeText(activity, e.getMessage() == null ? activity.getString(R.string.err_generic) : e.getMessage(), Toast.LENGTH_LONG).show();
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    Activity a = selfRef.get();
+                    if (a == null || a.isFinishing() || a.isDestroyed()) return;
+                    Toast.makeText(a, e.getMessage() == null ? a.getString(R.string.err_generic) : e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         }, "import-driver").start();
