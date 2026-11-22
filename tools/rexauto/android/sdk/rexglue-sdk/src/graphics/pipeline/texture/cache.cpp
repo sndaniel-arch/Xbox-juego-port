@@ -300,6 +300,10 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     }
     ++destroyed_count;
     destroyed_host_memory_usage += texture->GetHostMemoryUsage();
+    // (Hunt v1.4.6 round 5, T-R5-09.) Let subclasses prune per-key side
+    // state (Vulkan placeholder / ETC2-failure / DXT1-alpha maps) for the
+    // evicted key before the texture is gone.
+    OnTextureEvicted(texture->key());
     // Remove the texture from the map and destroy it via its unique_ptr.
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
@@ -471,11 +475,33 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     // reuses stale ring-buffer frames. This applies to all k_8/k_8_8
     // textures, with linear (untiled) surfaces handled by the dedicated
     // linear upload path in D3D12TextureCache.
+    // (Ronda 5, C-R5-04.) Only force it when the guest actually wrote to
+    // the surface since the last upload. The old code called WatchCallback
+    // unconditionally, so EVERY linear k_8/k_8_8 texture -- static fonts,
+    // UI, shadows included -- paid a full guest->host memcpy + staging +
+    // upload on every draw that bound it. That is no longer needed: after
+    // each upload MakeUpToDateAndWatch installs a page watch, and
+    // MakeRangeValid enables the physical-memory access callbacks on the
+    // uploaded pages, so a CPU write to the ring buffer faults into
+    // MemoryInvalidationCallback, fires the watch, and leaves the pages
+    // invalid. IsRangeValid() is false exactly in that case (and also
+    // when a write raced the last upload, between the memcpy and the
+    // watch reinstall -- the one hole the unconditional force used to
+    // paper over). When the pages are still valid, the host texture
+    // already holds the current guest data and there is nothing to
+    // re-upload. The key_changed=true force for these bindings in
+    // RequestTextures is deliberately KEPT: it guards the descriptor
+    // against a texture that was evicted and recreated, which the
+    // upload gate cannot see.
     if (streaming_8bit) {
-      if (texture.GetGuestBaseSize()) {
+      if (texture.GetGuestBaseSize() &&
+          !shared_memory().IsRangeValid(texture_key.base_page << 12,
+                                        texture.GetGuestBaseSize())) {
         texture.WatchCallback(global_lock, false);
       }
-      if (texture.GetGuestMipsSize()) {
+      if (texture.GetGuestMipsSize() &&
+          !shared_memory().IsRangeValid(texture_key.mip_page << 12,
+                                        texture.GetGuestMipsSize())) {
         texture.WatchCallback(global_lock, true);
       }
       base_outdated = base_outdated || texture.base_outdated(global_lock);
@@ -1254,6 +1280,19 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
     while (rex::bit_scan_forward(resolve_l2_block, &resolve_block_relative_index)) {
       resolve_l2_block &= ~(UINT64_C(1) << resolve_block_relative_index);
       uint32_t resolve_block_index = (i << 6) + resolve_block_relative_index;
+      // (Hunt v1.4.6 round 5, T-R5-10.) With pre_mask_resolve_l2_block
+      // false the L2 word above still holds bits for blocks OUTSIDE the
+      // written range, and the keep-bits below are 0 for any block that
+      // is neither first nor last -- so those blocks' scaled-resolve
+      // marks would be cleared for pages the CPU never touched, and the
+      // textures backed by them would reload stale (unresolved) guest
+      // data. Skip out-of-range blocks outright, so the result no longer
+      // depends on the cvar. With the cvar true this is a no-op: those
+      // bits are already masked out of the word above.
+      if (resolve_block_index < resolve_block_first ||
+          resolve_block_index > resolve_block_last) {
+        continue;
+      }
       uint32_t resolve_keep_bits = 0;
       if (resolve_block_index == resolve_block_first) {
         resolve_keep_bits |= (UINT32_C(1) << (resolve_page_first & 31)) - 1;
