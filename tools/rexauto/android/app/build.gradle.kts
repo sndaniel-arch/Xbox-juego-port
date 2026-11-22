@@ -23,7 +23,7 @@ val rexSdkDir: String = (project.findProperty("rexSdkDir") as String?)
 // also check the built APK's versionCode with aapt2 dump badging.
 val rexVersionCode: Int = (project.findProperty("rexVersionCode") as String?)
     ?.toIntOrNull()
-?: throw GradleException("A5-R7-02: missing or non-numeric -PrexVersionCode (CI: -PrexVersionCode=<github.run_number>; FULL v1.4.6: -PrexVersionCode=1010406). Refusing the silent default versionCode 1: an APK built as 1 would not install over any previous FULL.")
+    ?: throw GradleException("A5-R7-02: missing or non-numeric -PrexVersionCode (CI: -PrexVersionCode=<github.run_number>; FULL v1.4.6: -PrexVersionCode=1010406). Refusing the silent default versionCode 1: an APK built as 1 would not install over any previous FULL.")
 val rexVersionName: String = (project.findProperty("rexVersionName") as String?) ?: "1.0"
 // Full variant (private only, never CI): the game ships inside the APK as an
 // asset and the launcher auto-imports it on first launch (-PrexFull=true).
