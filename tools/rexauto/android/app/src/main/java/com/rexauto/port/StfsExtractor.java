@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -78,7 +79,24 @@ public final class StfsExtractor {
         private final int ftBlockCount, ftBlockNumber;
         private final long baseOff;
         private final long[] blockStep = new long[2];
-        private final Map<Long, ByteBuffer> hashCache = new HashMap<>();
+        // (Caza ronda 7, A4-R7-06.) Bounded LRU: the old unbounded HashMap
+        // kept one 4 KiB hash block per distinct hash-block offset visited
+        // until the Stfs was released at the end of the import -- ~43 MB
+        // on a very fragmented 7 GiB package (~10.8 K level-0 hash blocks:
+        // one hash block covers L[0] = 170 data blocks). 512 entries is
+        // 2 MiB worst case and still far above the live working set: a
+        // hash block is hit ~170 times in a row while its data blocks are
+        // walked, then abandoned, so only a handful of entries are hot at
+        // any moment and sequential imports never notice the eviction.
+        // Access-ordered so the eviction drops the least-recently-used
+        // entry, not an arbitrary one.
+        private static final int HASH_CACHE_MAX_ENTRIES = 512;
+        private final Map<Long, ByteBuffer> hashCache = new LinkedHashMap<Long, ByteBuffer>(64, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, ByteBuffer> eldest) {
+                return size() > HASH_CACHE_MAX_ENTRIES;
+            }
+        };
 
         public Stfs(FileChannel ch, ByteBuffer d) {
             this.ch = ch;
@@ -287,7 +305,22 @@ public final class StfsExtractor {
         private static boolean magicAt(FileChannel f, long off) throws IOException {
             if (off + 20 > f.size()) return false;
             ByteBuffer m = ByteBuffer.allocate(20);
-            f.read(m, off);
+            // (Caza ronda 7, A4-R7-05.) Same family as A4-R6-09: the old
+            // code ignored f.read()'s return, so a short read (a SAF
+            // provider handing back fewer bytes than f.size() promises)
+            // degraded to "no magic at this offset" and the Svod
+            // constructor ended up throwing "GDFX magic block not
+            // found" -- the wrong diagnosis for a truncated container.
+            // Loop until the 20 bytes are in, like readAt()/readHeader()
+            // do elsewhere in this file; a short read is a truncated
+            // file, so say so (distinct message from the constructor's
+            // "not found"). The size guard above still returns false
+            // when the offset is out of range by the file's own size.
+            while (m.hasRemaining()) {
+                if (f.read(m, off + m.position()) <= 0)
+                        throw new IOException("GoD: truncated GDFX magic block at offset 0x"
+                                              + Long.toHexString(off) + " (short read, file truncated?)");
+            }
             m.flip();
             return IsoExtractor.isGdfxMagic(m);
         }
