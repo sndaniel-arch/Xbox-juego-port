@@ -44,6 +44,14 @@ retry() { # retry <attempts> <delay-seconds> <command...>
 
 if [ -f "$SDK_DIR/.patches-applied" ]; then
   echo "[android_sdk] SDK already set up at $SDK_DIR"
+  # (A5-R7-07, ronda 7.) Re-validate on re-execution: the marker used to
+  # short-circuit this whole block, so a hand-modified SDK tree, a stale
+  # patch set, or a moved tag was accepted silently. The pin assertion
+  # below mirrors the fresh-clone check below. A missing SDK dir or a
+  # non-git checkout fails here instead of being accepted.
+  _sdk_head="$(git -C "$SDK_DIR" rev-parse HEAD 2>/dev/null)" || { echo "[android_sdk] ERROR: $SDK_DIR is not a git checkout (or is missing) -- remove it and re-run to rebuild from the pinned tag"; exit 1; }
+  [ "$_sdk_head" = "$SDK_COMMIT" ] || { echo "[android_sdk] ERROR: SDK at $SDK_DIR is $_sdk_head, expected pinned commit $SDK_COMMIT (tag moved, or tree modified?) -- remove $SDK_DIR and re-run"; exit 1; }
+  echo "[android_sdk] SDK commit OK (re-validated): $_sdk_head"
 else
   rm -rf "$SDK_DIR"; mkdir -p "$(dirname "$SDK_DIR")"
   echo "[android_sdk] cloning $SDK_REPO@$SDK_TAG ($SDK_COMMIT)"
@@ -91,6 +99,18 @@ if [ ! -f "$AT_DIR/CMakeLists.txt" ]; then
   retry 3 30 git -C "$AT_DIR/lib/linkernsbypass" fetch -q --depth 1 origin "$LNB_REV"
   git -C "$AT_DIR/lib/linkernsbypass" checkout -q FETCH_HEAD
   echo "[android_sdk] libadrenotools -> $AT_DIR"
+else
+  # (A5-R7-07, ronda 7.) Re-validate the pinned revs on re-execution:
+  # an existing checkout at another rev used to be kept forever, with no
+  # rev-parse assertion like the SDK pin above. AT_REV is the
+  # libadrenotools checkout itself; LNB_REV is the nested
+  # lib/linkernsbypass checkout. A missing or non-git checkout fails
+  # clearly instead of being accepted silently.
+  _at_head="$(git -C "$AT_DIR" rev-parse HEAD 2>/dev/null)" || { echo "[android_sdk] ERROR: $AT_DIR is not a git checkout (or is missing) -- remove it and re-run to re-clone the pinned revs"; exit 1; }
+  [ "$_at_head" = "$AT_REV" ] || { echo "[android_sdk] ERROR: libadrenotools at $AT_DIR is $_at_head, expected pinned rev $AT_REV -- remove $AT_DIR and re-run"; exit 1; }
+  _lnb_head="$(git -C "$AT_DIR/lib/linkernsbypass" rev-parse HEAD 2>/dev/null)" || { echo "[android_sdk] ERROR: $AT_DIR/lib/linkernsbypass is not a git checkout (or is missing) -- remove $AT_DIR and re-run"; exit 1; }
+  [ "$_lnb_head" = "$LNB_REV" ] || { echo "[android_sdk] ERROR: linkernsbypass at $AT_DIR/lib/linkernsbypass is $_lnb_head, expected pinned rev $LNB_REV -- remove $AT_DIR and re-run"; exit 1; }
+  echo "[android_sdk] libadrenotools revs OK (re-validated): $AT_REV / $LNB_REV"
 fi
 
 # (Ronda 8, auditor E — R8-E3.) libadrenotools upstream devuelve
