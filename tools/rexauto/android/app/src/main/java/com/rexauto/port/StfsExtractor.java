@@ -318,8 +318,8 @@ public final class StfsExtractor {
             // when the offset is out of range by the file's own size.
             while (m.hasRemaining()) {
                 if (f.read(m, off + m.position()) <= 0)
-                        throw new IOException("GoD: truncated GDFX magic block at offset 0x"
-                                              + Long.toHexString(off) + " (short read, file truncated?)");
+                    throw new IOException("GoD: truncated GDFX magic block at offset 0x"
+                            + Long.toHexString(off) + " (short read, file truncated?)");
             }
             m.flip();
             return IsoExtractor.isGdfxMagic(m);
