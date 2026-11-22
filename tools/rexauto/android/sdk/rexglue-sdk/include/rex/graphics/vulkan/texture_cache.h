@@ -185,7 +185,11 @@ class VulkanTextureCache final : public TextureCache {
   // submission, stamped by submission index.
   struct Etc2TranscodeBudget {
     uint64_t submission = 0;
-    uint32_t blocks_used = 0;
+    // (Hunt v1.4.6 round 6, A2-R6-04.) 64-bit: a single slice's block
+    // count (x_blocks * y_blocks * level_depth) can exceed 2^32 for
+    // absurd extents, and a 32-bit counter would wrap and undercount the
+    // budget, letting one submission transcode far past the cap.
+    uint64_t blocks_used = 0;
   };
   Etc2TranscodeBudget etc2_budget_;
   struct Etc2TranscodeFailure {
@@ -325,13 +329,20 @@ class VulkanTextureCache final : public TextureCache {
     // completes and from the destructor.
     void DisarmEtc2PartialLoadWatch(SharedMemory& shared_memory);
     // Called by Etc2PartialLoadWatchCallback when the guest writes into
-    // the watched range: drops the resume position (the watch itself is
-    // already cancelled by the shared memory, so its handles are just
-    // forgotten here). Only clears state; never watches or unwatches.
-    void NoteEtc2PartialLoadWatchFired() {
+    // the watched range: drops the resume position and forgets ONLY the
+    // handle of the range that fired (argument 0 = base, 1 = mips).
+    // (Hunt v1.4.6 round 6, A2-R6-01.) SharedMemory::FireWatches cancels
+    // only the range that fired, so the other watch stays registered: the
+    // old code nulled BOTH handles, orphaning the surviving watch (it
+    // could later fire into a destroyed texture) and letting Arm re-arm
+    // a duplicate. Only clears state; never watches or unwatches.
+    void NoteEtc2PartialLoadWatchFired(uint64_t argument) {
       ClearEtc2Progress();
-      etc2_partial_load_base_watch_handle_ = nullptr;
-      etc2_partial_load_mips_watch_handle_ = nullptr;
+      if (argument == 0) {
+       etc2_partial_load_base_watch_handle_ = nullptr;
+      } else {
+       etc2_partial_load_mips_watch_handle_ = nullptr;
+      }
     }
 
    private:
