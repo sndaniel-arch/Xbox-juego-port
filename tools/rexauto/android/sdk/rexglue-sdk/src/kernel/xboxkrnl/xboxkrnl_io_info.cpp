@@ -179,6 +179,18 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-04.) The fail helper below writes the
+  // 8-byte IO_STATUS_BLOCK on every failure exit -- before any other
+  // validation runs -- and the normal exit writes it too. A non-NULL
+  // block at the end of the mapping used to SIGSEGV the host even on
+  // calls that were going to fail anyway. Validate the block first; an
+  // invalid block fails without touching it (the NULL case stays
+  // allowed, as before).
+  if (io_status_block_ptr && !GuestInfoBufferIsWritable(io_status_block_ptr.guest_address(),
+                                          sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // (Hunt v1.4.6, A2-R3-08.) The early returns below used to leave the
   // caller's IO_STATUS_BLOCK stale (whatever a previous call left there,
   // possibly SUCCESS for a failed call). Every failure exit goes through
@@ -332,6 +344,18 @@ uint32_t GetSetFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-04.) The fail helper below writes the
+  // 8-byte IO_STATUS_BLOCK on every failure exit -- before any other
+  // validation runs -- and the normal exit writes it too. A non-NULL
+  // block at the end of the mapping used to SIGSEGV the host even on
+  // calls that were going to fail anyway. Validate the block first; an
+  // invalid block fails without touching it (the NULL case stays
+  // allowed, as before).
+  if (io_status_block && !GuestInfoBufferIsWritable(io_status_block.guest_address(),
+                                          sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // (Hunt v1.4.6, A2-R3-08.) Same iosb-on-early-return helper as
   // NtQueryInformationFile above.
   auto fail = [&](X_STATUS status) -> X_STATUS {
@@ -526,6 +550,18 @@ uint32_t GetQueryVolumeInfoMinimumLength(uint32_t info_class) {
 u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
                                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                        mapped_void info_ptr, u32 info_length, u32 info_class) {
+  // (Hunt v1.4.6, ronda 7, A3-R7-04.) The fail helper below writes the
+  // 8-byte IO_STATUS_BLOCK on every failure exit -- before any other
+  // validation runs -- and the normal exit writes it too. A non-NULL
+  // block at the end of the mapping used to SIGSEGV the host even on
+  // calls that were going to fail anyway. Validate the block first; an
+  // invalid block fails without touching it (the NULL case stays
+  // allowed, as before).
+  if (io_status_block_ptr && !GuestInfoBufferIsWritable(io_status_block_ptr.guest_address(),
+                                          sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // (Hunt v1.4.6, A2-R3-08, same-class extension.) This third sibling had
   // the same stale-iosb hole on its early returns; same helper.
   auto fail = [&](X_STATUS status) -> X_STATUS {
