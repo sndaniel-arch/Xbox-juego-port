@@ -2432,6 +2432,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       last_swap_null_log = swap_null_log_now;
       REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     }
+    // (Hunt v1.4.6 round 7, A1-R7-02.) BeginSubmission(true) above opened
+    // a submission and a frame: returning here without EndSubmission(true)
+    // left both open (frame_open_ / submission_open_ stuck true), so the
+    // present was lost and the draws of this frame merged into the next
+    // one. The neighboring skip for the async placeholder (:2403) and the
+    // normal close at the end of IssueSwap both call EndSubmission(true);
+    // this path must too. Safe here: the submission is open and the frame
+    // is open, exactly the state EndSubmission(true) expects, and the
+    // deferred stream is submitted like any other EndSubmission.
+    EndSubmission(true);
     return;
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
