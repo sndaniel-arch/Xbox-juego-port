@@ -16,6 +16,12 @@
     <string name="copied">Copiado al portapapeles</string>
     <string name="reset">Quitar archivos</string>
     <string name="reset_confirm">¿Borrar los archivos del juego y los datos guardados (partidas, DLC instalados, caché)?</string>
+    <!-- (Hunt v1.4.6 ronda 7, A4-R7-02.) Exit confirmation for the Android
+         gesture back in MainActivity: the swipe used to kill the game
+         with no question and no save. -->
+    <string name="exit_confirm_title">¿Salir del juego?</string>
+    <string name="exit_confirm_msg">Se cerrará el juego y se perderá el progreso no guardado.</string>
+    <string name="exit_confirm_yes">Salir</string>
     <string name="err_no_xex_in_iso">La imagen del disco no tiene default.xex: no es un disco de juego de Xbox 360.</string>
     <string name="err_no_xex_in_folder">No se encontró default.xex en esa carpeta.</string>
     <string name="err_not_iso">%1$s no es ni una ISO de Xbox 360 ni un default.xex.</string>
