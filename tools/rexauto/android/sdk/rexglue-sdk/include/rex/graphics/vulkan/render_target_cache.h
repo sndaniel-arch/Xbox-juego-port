@@ -838,16 +838,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool color_rg16_draw_format_fallback_to_float_ = false;
   bool color_rgba16_draw_format_fallback_to_float_ = false;
 
-  // (Caza v1.4.6 ronda 4, A1-R4-01.) GetHostRenderTargetsRenderPass is
-  // called from EnsurePipelineCreated, which runs on the pipeline
-  // creation threads as well as on the command processor thread, so the
-  // lazy render-pass cache must be serialized: concurrent insertion into
-  // std::unordered_map is UB. The same mutex also guards the
-  // render_passes_ loops in ClearCache (V-A1-02, same round, second
-  // sweep: ClearCache runs on the command processor thread during
-  // EndSubmission while the creation threads are still alive) and in
-  // Shutdown. vkCreateRenderPass does not call back into this cache, so
-  // holding the mutex across the creation is deadlock-free.
+  // (Caza v1.4.6 ronda 4, A1-R4-01; corregido en ronda 5, S-R5-01, y
+   // aquí en ronda 6, A1-R6-01.) GetHostRenderTargetsRenderPass is only
+   // called from TryGetPipelineCreationArgumentsForDescription, which runs
+   // on the command processor thread (ConfigurePipeline / IssueDraw, and
+   // InitializeShaderStorage) — never from the pipeline creation threads,
+   // which only consume the pre-looked-up arguments in
+   // EnsurePipelineCreated. The lock stays as defense in depth: it
+   // serializes the lazy render-pass cache if this path ever moves off the
+   // processor thread, and it is never contended today. The same mutex
+   // also guards the render_passes_ loops in ClearCache (V-A1-02, same
+   // round, second sweep: ClearCache runs on the command processor thread
+   // during EndSubmission while the creation threads are still alive) and
+   // in Shutdown. vkCreateRenderPass does not call back into this cache, so
+   // holding the mutex across the creation is deadlock-free.
   std::mutex render_pass_cache_mutex_;
 
   // VK_NULL_HANDLE if failed to create.
