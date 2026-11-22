@@ -333,8 +333,14 @@ class VulkanTextureCache final : public TextureCache {
     // MakeUpToDateAndWatch.
     void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
     // Unregisters the partial-load watch, if armed. Called when the load
-    // completes and from the destructor.
-    void DisarmEtc2PartialLoadWatch(SharedMemory& shared_memory);
+    // completes and from the destructor. The caller must hold the global
+    // critical region (pass it in): the handle read and the unwatch must
+    // be atomic against FireWatches, or a guest write firing the watch
+    // in between would double-unlink the WatchRange (UnwatchMemoryRange
+    // is not idempotent). (Hunt v1.4.6 round 8, A2-R8-01.)
+    void DisarmEtc2PartialLoadWatch(
+        const std::unique_lock<std::recursive_mutex>& global_lock,
+        SharedMemory& shared_memory);
     // Called by Etc2PartialLoadWatchCallback when the guest writes into
     // the watched range: drops the resume position and forgets ONLY the
     // handle of the range that fired (argument 0 = base, 1 = mips).
