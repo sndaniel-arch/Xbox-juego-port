@@ -302,6 +302,16 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
 }
 
 u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr) {
+  // (Hunt v1.4.6, caza ronda 6, A3-R6-02.) data_ptr is written below
+  // (~0x190 bytes: the struct itself is 0x18E, and the Win32 branch
+  // round-trips the vendor pointer at offset 0x190) with only a NULL
+  // check; a non-NULL pointer at the end of the mapping SIGSEGVs the
+  // host. Validate the whole written range first (0x194 covers the
+  // struct plus the 4-byte vendor round-trip). A NULL data_ptr is still
+  // tolerated, as before. WSAEFAULT, like the other entries here.
+  if (data_ptr && !GuestRangeWritable(data_ptr.guest_address(), 0x194)) {
+    return 0x271E;  // WSAEFAULT
+  }
 // TODO(benvanik): abstraction layer needed.
 #if REX_PLATFORM_WIN32
   WSADATA wsaData;
@@ -864,6 +874,39 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  // (Hunt v1.4.6, caza ronda 6, A3-R6-03.) arg_ptr used to go straight
+  // to the host ioctl() with no range check: for FIONBIO/FIONREAD the
+  // kernel touches 4 bytes at arg, so an arg_ptr less than 4 bytes from
+  // the end of the mapping SIGSEGVs the host inside ioctl(). The
+  // commands are Winsock values from the guest (no FIONBIO/FIONREAD
+  // constants exist in this tree); every socket ioctl the guest can
+  // reach here takes a 4-byte u_long. Unknown commands are rejected
+  // rather than passed through with an unvalidated size -- add the
+  // command and its arg size to this table first.
+  constexpr uint32_t kIoctlFionbio = 0x8004667E;    // FIONBIO
+  constexpr uint32_t kIoctlFionread = 0x4004667F;   // FIONREAD
+  constexpr uint32_t kIoctlSiocatmark = 0x40047307;  // SIOCATMARK
+  uint32_t arg_size = 0;
+  switch (cmd) {
+    case kIoctlFionbio:
+    case kIoctlFionread:
+    case kIoctlSiocatmark:
+      arg_size = sizeof(uint32_t);
+      break;
+    default:
+      // WSAEINVAL: unknown ioctl command.
+      XThread::SetLastError(0x2726);
+      return -1;
+  }
+  // Writable covers both directions: FIONREAD writes the result, FIONBIO
+  // reads the flag. A NULL arg is rejected the same way (the kernel
+  // would only EFAULT on it, so no working caller loses anything).
+  if (!GuestRangeWritable(arg_ptr.guest_address(), arg_size)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
     return -1;
   }
 
