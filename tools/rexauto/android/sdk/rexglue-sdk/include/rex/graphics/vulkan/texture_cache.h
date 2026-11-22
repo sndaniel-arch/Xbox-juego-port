@@ -80,6 +80,8 @@ class VulkanTextureCache final : public TextureCache {
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
+  void ClearCache() override;
+  void OnTextureEvicted(const TextureKey& key) override;
 
   // Must be called within a frame - creates and untiles textures needed by
   // shaders, and enqueues transitioning them into the sampled usage. This may
@@ -112,6 +114,11 @@ class VulkanTextureCache final : public TextureCache {
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
+  // (Hunt v1.4.6 round 5, T-R5-03.) If the frontbuffer cannot be loaded, the
+  // 1x1 null image (plain 2D view) is served instead of VK_NULL_HANDLE, so
+  // the present still runs and shows a degraded (black) frame rather than
+  // aborting the present on every frame. The texture stays outdated, so the
+  // next frame retries the load.
   // If swap_source_needs_rb_swap_out is not nullptr, writes whether the final
   // guest-to-host swizzle requires swapping red and blue (R <- B, B <- R) with
   // green preserved, which is needed by the presentation fallback path on
@@ -188,6 +195,16 @@ class VulkanTextureCache final : public TextureCache {
   std::unordered_map<TextureKey, Etc2TranscodeFailure, TextureKey::Hasher>
       etc2_failed_textures_;
   void RecordEtc2TranscodeFailure(const TextureKey& key, uint64_t submission);
+  // (Hunt v1.4.6 round 5, T-R5-02.) Watch callback for a partially loaded
+  // ETC2 texture: a guest write into the texture's guest range while the
+  // load is incomplete invalidates the saved resume position, so the next
+  // load restarts from slice 0 instead of mixing slices from two guest
+  // generations. Only clears progress (and the watch handles, which the
+  // shared memory invalidates after firing); never watches or unwatches
+  // from within the callback.
+  static void Etc2PartialLoadWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context, void* data,
+      uint64_t argument, bool invalidated_by_gpu);
   // (Run #11, F3, point 6.) CPU staging for BC -> ETC2 transcoded uploads.
   // Instance member (audit A1-R6-03), destroyed with the cache: the pool
   // is bound to this cache's device, so a new cache on re-init must not
@@ -279,6 +296,16 @@ class VulkanTextureCache final : public TextureCache {
     // and only cleared when the load completes, so a re-upload after the
     // guest data changes (which requires a prior completed load, and
     // clears this) never skips levels.
+    // (Hunt v1.4.6 round 5, T-R5-02.) Correction to the last sentence
+    // above: the guest CAN rewrite the texture while a load is still
+    // partial, with no completed load in between -- and until this fix
+    // there was no watch on the range during the partial load, so the
+    // resume silently mixed slices from two guest generations. While
+    // progress is active the texture now also carries a shared-memory
+    // watch over its guest base+mips ranges (see
+    // ArmEtc2PartialLoadWatch); a guest write fires
+    // Etc2PartialLoadWatchCallback, which only clears the progress, so
+    // the next load restarts from slice 0.
     bool etc2_progress_active() const { return etc2_progress_active_; }
     uint32_t etc2_next_loop_level() const { return etc2_next_loop_level_; }
     uint32_t etc2_next_slice() const { return etc2_next_slice_; }
@@ -288,7 +315,24 @@ class VulkanTextureCache final : public TextureCache {
       etc2_next_slice_ = slice;
     }
     void ClearEtc2Progress() { etc2_progress_active_ = false; }
-
+    // Registers the partial-load watch (base range, and mips range when
+    // the texture has one) if not already armed. No-op when already
+    // armed: the watch survives across the submissions of one partial
+    // load. Must be called with the global critical region held, like
+    // MakeUpToDateAndWatch.
+    void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
+    // Unregisters the partial-load watch, if armed. Called when the load
+    // completes and from the destructor.
+    void DisarmEtc2PartialLoadWatch(SharedMemory& shared_memory);
+    // Called by Etc2PartialLoadWatchCallback when the guest writes into
+    // the watched range: drops the resume position (the watch itself is
+    // already cancelled by the shared memory, so its handles are just
+    // forgotten here). Only clears state; never watches or unwatches.
+    void NoteEtc2PartialLoadWatchFired() {
+      ClearEtc2Progress();
+      etc2_partial_load_base_watch_handle_= nullptr;
+      etc2_partial_load_mips_watch_handle_= nullptr;
+    }
    private:
     union ViewKey {
       uint32_t key;
@@ -340,15 +384,28 @@ class VulkanTextureCache final : public TextureCache {
     VkImage image_;
     VmaAllocation allocation_;
 
-    Usage usage_ = Usage::kUndefined;
+
+Usage usage_ = Usage::kUndefined;
 
     // (Audit A1-R6-01.) See the accessors above.
     bool etc2_progress_active_ = false;
     uint32_t etc2_next_loop_level_ = 0;
     uint32_t etc2_next_slice_ = 0;
+    // (Hunt v1.4.6 round 5, T-R5-02.) Partial-load watches, armed while
+    // etc2_progress_active_. They are separate from the base Texture
+    // base/mips watches, which only exist once the texture is up to date.
+    SharedMemory::WatchHandle etc2_partial_load_base_watch_handle_= nullptr;
+    SharedMemory::WatchHandle etc2_partial_load_mips_watch_handle_= nullptr;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+    // (Hunt v1.4.6 round 5, T-R5-01.) Whether the 3D-as-2D wrapper image
+    // has actually been loaded. The wrapper is kept across a failed first
+    // load (A1-R3-03), but until this flag is set the load must be
+    // RETRIED on every call: creating the image view over an unloaded
+    // wrapper (layout UNDEFINED, texels uninitialized) and caching it
+    // forever was the R3-03 regression.
+    bool texture_3d_as_2d_loaded_= false;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };
@@ -440,6 +497,12 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView null_image_view_2d_array_ = VK_NULL_HANDLE;
   VkImageView null_image_view_cube_ = VK_NULL_HANDLE;
   VkImageView null_image_view_3d_ = VK_NULL_HANDLE;
+  // (Hunt v1.4.6 round 5, T-R5-03.) Plain 2D view of the 1x1 null image,
+  // for the swap path: the swap gamma shaders declare `texture2D`, and a
+  // 2D_ARRAY view bound there is a view-type mismatch (spec: the view
+  // type must match the OpTypeImage Dim/Arrayed), so the 2D_ARRAY null
+  // view used for shader fetches cannot serve the present path.
+  VkImageView null_image_view_2d_= VK_NULL_HANDLE;
   bool null_images_cleared_ = false;
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
