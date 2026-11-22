@@ -132,6 +132,10 @@ final class PadSettingsDialog {
         // one is up; VirtualPadView checks isShowing() too, but show() is
         // the choke point.
         if (isShowing()) return;
+        // (Caza ronda 6, A4-R6-07.) Sin este guard, un show() sobre una
+        // activity terminada/destruida tira WindowManager$BadTokenException;
+        // mismo guard que GraphicsDialog.showRestartDialog ya usa.
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         final float density = activity.getResources().getDisplayMetrics().density;
         final int pad = (int) (20 * density);
 
