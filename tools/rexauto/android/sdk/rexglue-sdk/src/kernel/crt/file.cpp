@@ -278,14 +278,6 @@ u32 SetFilePointer_entry(u32 hFile, u32 lDistanceToMove, mapped_u32 lpDistanceTo
     return kInvalidHandleValue;
   }
 
-  // (Hunt v1.4.6, ronda 7, A3-R7-07.) As GetFileSizeEx above: the
-  // 8-byte out-param is written with only a NULL-check. Validate it
-  // before the seek takes effect, so a bad pointer fails without
-  // moving the file position.
-  if (lpNewFilePointer && !GuestRangeWritable(lpNewFilePointer.guest_address(), 8)) {
-    return 0;
-  }
-
   file->set_position(new_pos);
   if (lpDistanceToMoveHigh)
     *lpDistanceToMoveHigh = static_cast<uint32_t>(new_pos >> 32);
@@ -566,6 +558,14 @@ u32 SetFilePointerEx_entry(u32 hFile, u32 distHigh, u32 distLow, mapped_void lpN
   // (Hunt v1.4.6, A2-R4-14.) Same wrapping negative seek as
   // SetFilePointer above: fail it instead of storing ~2^64.
   if (!ComputeSeekPosition(file.get(), distance, static_cast<uint32_t>(dwMoveMethod), &new_pos)) {
+    return 0;
+  }
+
+  // (Hunt v1.4.6, ronda 7, A3-R7-07.) As GetFileSizeEx above: the
+  // 8-byte out-param is written with only a NULL-check. Validate it
+  // before the seek takes effect, so a bad pointer fails without
+  // moving the file position.
+  if (lpNewFilePointer && !GuestRangeWritable(lpNewFilePointer.guest_address(), 8)) {
     return 0;
   }
 
