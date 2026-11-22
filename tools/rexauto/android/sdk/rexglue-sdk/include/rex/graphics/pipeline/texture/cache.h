@@ -243,6 +243,16 @@ class TextureCache {
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
+    // (Hunt v1.4.6 round 7, A2-R7-01.) Unregisters the live page watch for
+    // one range, if any, and forgets its handle. Only for the manual
+    // invalidation in PrepareTextureLoad: the normal watch path
+    // (SharedMemory::FireWatches) already unlinks the range before calling
+    // WatchCallback, and UnwatchMemoryRange is not idempotent (it pushes
+    // the range back onto the free list), so WatchCallback itself must NOT
+    // disarm -- the manual call site is the one place where the handle is
+    // known to be still registered.
+    void DisarmWatch(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
