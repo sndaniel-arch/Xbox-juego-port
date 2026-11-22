@@ -377,7 +377,7 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   // after the handle lookup like the Query sibling does, so an invalid
   // handle still reports INVALID_HANDLE first. (The rename case reads
   // a second, nested guest string through info->ansi_string; that
-  // nested pointer is a separate, systemic class, not covered here.)
+  // nested pointer is validated in the rename case itself, A3-R6-04.)
   if (!GuestInfoBufferIsReadable(info_ptr.guest_address(), minimum_length)) {
     return fail(X_STATUS_INVALID_PARAMETER);
   }
@@ -427,6 +427,18 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     }
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
+      // (Hunt v1.4.6, caza ronda 6, A3-R6-04.) The outer struct range
+      // is validated above, but the nested ansi_string is not:
+      // TranslateAnsiString bounds the read by length (u16) yet never
+      // validates pointer + length against the mapping, so a pointer at
+      // the end of the mapping with length > 0 SIGSEGVs the host in the
+      // string copy. Validate the nested range first; length 0 reads
+      // nothing (TranslateAnsiString returns "" early).
+      if (info->ansi_string.length &&
+          !GuestInfoBufferIsReadable(static_cast<uint32_t>(info->ansi_string.pointer),
+                                     info->ansi_string.length)) {
+        return fail(X_STATUS_INVALID_PARAMETER);
+      }
       auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), &info->ansi_string);
       if (!IsValidPath(target_path, false)) {
         return fail(X_STATUS_OBJECT_NAME_INVALID);
