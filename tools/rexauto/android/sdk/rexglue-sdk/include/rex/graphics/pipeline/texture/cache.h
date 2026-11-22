@@ -257,7 +257,7 @@ class TextureCache {
     // is still registered, and FireWatches unlinks it as soon as the
     // callback returns, which would double-unlink it. UnwatchMemoryRange
     // is not idempotent (it pushes the range back onto the free list).
-void DisarmWatch(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    void DisarmWatch(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
