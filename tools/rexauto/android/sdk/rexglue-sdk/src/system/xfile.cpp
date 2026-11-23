@@ -60,7 +60,7 @@ static bool GuestBufferRangeAccessible(rex::memory::Memory* memory,
   return range_ok(start_heap->QueryRangeAccess(low_address, start_heap_end)) &&
          range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
-              
+
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
@@ -239,7 +239,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
             buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
                 ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
                 : nullptr;
-                // (Hunt v1.4.6, ronda 9, A3-R9-11.) ReadInternal WRITES the
+        // (Hunt v1.4.6, ronda 9, A3-R9-11.) ReadInternal WRITES the
         // guest buffer, so the range must be writable -- in virtual
         // heaps as well as physical ones (see the helper above).
         if (!GuestBufferRangeAccessible(memory(), buffer_start_heap, buffer_end_heap,
