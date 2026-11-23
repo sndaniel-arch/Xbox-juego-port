@@ -43,13 +43,28 @@ public final class StfsExtractor {
     public static final int VOLUME_STFS = 0;
     public static final int VOLUME_SVOD = 1;
 
-    /** Reads the first 0x400 bytes and tells whether this is a CON/LIVE/PIRS package. */
+    /** Reads the first 0x400 bytes and tells whether this is a CON/LIVE/PIRS package. Returns null when it is not a package. */
     public static ByteBuffer readHeader(FileChannel ch) throws IOException {
         if (ch.size() < 0x400) return null;
         ByteBuffer h = ByteBuffer.allocate(0x400).order(ByteOrder.BIG_ENDIAN);
-        while (h.hasRemaining()) { if (ch.read(h, h.position()) <= 0) break; }
+        // (Hunt v1.4.6 ronda 8, A4-R8-03.) Misma familia que A4-R7-05
+        // (magicAt): el break en lectura corta y el return null
+        // posterior no distinguian "no es un paquete" de "paquete
+        // truncado" -- un STFS/GoD truncado (o un provider SAF que
+        // entrega menos bytes de los que size() promete) caia en
+        // importPackage como null y terminaba en err_not_iso, el
+        // mensaje equivocado. Una lectura corta aqui es un paquete
+        // truncado: tirar con el motivo real, que importPackage
+        // propaga hasta fail() (SetupActivity). El guard de tamano de
+        // arriba se queda como null, igual que el de magicAt: un
+        // fichero que por su propio tamano no llega a 0x400 no puede
+        // ser un paquete. El chequeo de limit() posterior ya no hace
+        // falta: el bucle solo sale con el buffer lleno, o tirando.
+        while (h.hasRemaining()) {
+            if (ch.read(h, h.position()) <= 0)
+                throw new IOException("STFS: truncated package header (short read, file truncated?)");
+        }
         h.flip();
-        if (h.limit() < 0x400) return null;
         String magic = new String(h.array(), 0, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
         if (!magic.equals("CON ") && !magic.equals("LIVE") && !magic.equals("PIRS")) return null;
         return h;
@@ -424,6 +439,19 @@ public final class StfsExtractor {
             try (ParcelFileDescriptor pfd = cr.openFileDescriptor(doc, "r")) {
                 if (pfd == null) continue;
                 try (FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel()) {
+                    // (Hunt v1.4.6 ronda 8, A4-R8-03.) readHeader tira
+                    // IOException en lectura corta (paquete truncado);
+                    // aqui se traga a proposito y el archivo se salta,
+                    // igual que un no-paquete: esto es un escaneo de
+                    // carpeta buscando CUALQUIER paquete valido, y un
+                    // candidato truncado no debe abortar la busqueda de
+                    // los demas. Si la carpeta solo contiene el
+                    // truncado, el import termina en "no se encontro el
+                    // juego en la carpeta" -- diagnostico menos preciso
+                    // que en importPackage (fichero unico, donde el
+                    // throw si llega al usuario), pero abortar el
+                    // escaneo seria peor: una carpeta puede tener el
+                    // truncado Y el valido. Decision documentada.
                     hdr = readHeader(ch);
                 }
             } catch (Exception e) {
