@@ -38,7 +38,7 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = memory->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -56,7 +56,25 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(rex::memory::Memory* memory, uint32_t guest_address,
@@ -67,6 +85,62 @@ static bool GuestRangeReadable(rex::memory::Memory* memory, uint32_t guest_addre
 static bool GuestRangeWritable(rex::memory::Memory* memory, uint32_t guest_address,
                                size_t length) {
   return GuestRangeAccessible(memory, guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 8, A3-R8-04.) Length caps for the guest
+// u16strings below, in u16 code units INCLUDING the NUL:
+//  - the five song fields written back into the 40-byte 0x7000E
+//    slots (name/artist/album/album_artist/genre): 20. A longer
+//    value used to overwrite the next field, and past genre the
+//    788 bytes validated by A3-R7-02.
+//  - the file path: host-side only (never written back to the
+//    guest), but real title paths are long, so a generous 1024.
+//  - the playlist name: host-side only (Playlist::name), 64 is far
+//    above any title playlist name.
+constexpr size_t kMaxSongFieldChars = 20;
+constexpr size_t kMaxSongPathChars = 1024;
+constexpr size_t kMaxPlaylistNameChars = 64;
+
+// (Hunt v1.4.6, ronda 8, A3-R8-04.) Bounded guest u16string load.
+// load_and_swap<std::u16string> scans for NUL with no cap at all
+// (utils.h), so an unterminated pointer reads past the mapping
+// (SIGSEGV) or grows host memory without bound. Validate each 4 KiB
+// chunk before reading it, require the NUL inside max_chars u16,
+// and require each chunk to stay in one heap: TranslateVirtual maps
+// from the chunk-start heap only, so a string straddling a boundary
+// would read its tail from the wrong host pages. A NULL pointer
+// means "no string" (empty), as the callers treat it; anything else
+// invalid fails the whole call.
+static bool LoadGuestU16StringBounded(rex::memory::Memory* memory, uint32_t guest_ptr,
+                                      size_t max_chars, std::u16string* out) {
+  out->clear();
+  if (!guest_ptr) {
+    return true;
+  }
+  constexpr size_t kChunkU16 = 2048;  // 4 KiB, the smallest page.
+  for (size_t i = 0; i < max_chars; ++i) {
+    if (i % kChunkU16 == 0) {
+      size_t chunk = kChunkU16 < (max_chars - i) ? kChunkU16 : (max_chars - i);
+      uint32_t chunk_ptr = guest_ptr + static_cast<uint32_t>(i * sizeof(uint16_t));
+      if (!GuestRangeReadable(memory, chunk_ptr, chunk * sizeof(uint16_t))) {
+        return false;
+      }
+      if (memory->LookupHeap(chunk_ptr) !=
+          memory->LookupHeap(chunk_ptr +
+                             static_cast<uint32_t>(chunk * sizeof(uint16_t)) - 1)) {
+        return false;
+      }
+    }
+    const uint16_t* host =
+        memory->TranslateVirtual<const uint16_t*>(guest_ptr + static_cast<uint32_t>(
+                                                                                    i * sizeof(uint16_t)));
+    uint16_t c = memory::load_and_swap<uint16_t>(host);
+    if (!c) {
+      return true;
+    }
+    out->push_back(static_cast<char16_t>(c));
+  }
+  return false;  // No NUL within max_chars.
 }
 
 XmpApp::XmpApp(KernelState* kernel_state)
@@ -122,8 +196,9 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
     // Cap the playlist at 1024 songs (36 KiB of structs, 4 KiB of
     // handles -- far above anything a title builds) and validate both
     // arrays up front with 64-bit math, so a wrapped count cannot slip
-    // through. (The per-song u16string scans inside the loop are the
-    // documented V-R6-02 residue and are intentionally left untouched.)
+    // through. (The per-song u16string scans inside the loop were
+    // the documented V-R6-02 residue; ronda 8, A3-R8-04, bounds
+    // them below -- see LoadGuestU16StringBounded above.
     constexpr uint32_t kMaxPlaylistSongs = 1024;
     if (song_count > kMaxPlaylistSongs) {
       return X_E_INVALIDARG;
@@ -141,26 +216,43 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
       auto song = std::make_unique<Song>();
       song->handle = ++next_song_handle_;
       uint8_t* song_base = memory_->TranslateVirtual(songs_ptr + (i * 36));
-      song->file_path = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 0)));
-      song->name = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 4)));
-      song->artist = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 8)));
-      song->album = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 12)));
-      song->album_artist = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 16)));
-      song->genre = memory::load_and_swap<std::u16string>(
-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 20)));
+      // (Hunt v1.4.6, ronda 8, A3-R8-04.) Each string pointer is
+      // guest memory: the old code scanned it for NUL with no cap
+      // and no check at all (not even NULL -- pointer 0 read the
+      // protected zero page). A NULL pointer means "empty"; an
+      // invalid, unterminated or over-long string fails the whole
+      // playlist instead of corrupting the host or the next field.
+      if (!LoadGuestU16StringBounded(
+              memory_, memory::load_and_swap<uint32_t>(song_base + 0), kMaxSongPathChars,
+              &song->file_path) ||
+          !LoadGuestU16StringBounded(memory_, memory::load_and_swap<uint32_t>(song_base + 4),
+                                     kMaxSongFieldChars, &song->name) ||
+          !LoadGuestU16StringBounded(memory_, memory::load_and_swap<uint32_t>(song_base + 8),
+                                     kMaxSongFieldChars, &song->artist) ||
+          !LoadGuestU16StringBounded(memory_, memory::load_and_swap<uint32_t>(song_base + 12),
+                                     kMaxSongFieldChars, &song->album) ||
+          !LoadGuestU16StringBounded(memory_, memory::load_and_swap<uint32_t>(song_base + 16),
+                                     kMaxSongFieldChars, &song->album_artist) ||
+          !LoadGuestU16StringBounded(memory_, memory::load_and_swap<uint32_t>(song_base + 20),
+                                     kMaxSongFieldChars, &song->genre)) {
+        return X_E_INVALIDARG;
+      }
       song->track_number = memory::load_and_swap<uint32_t>(song_base + 24);
       song->duration_ms = memory::load_and_swap<uint32_t>(song_base + 28);
       song->format = static_cast<Song::Format>(memory::load_and_swap<uint32_t>(song_base + 32));
-      if (out_song_handles) {
-        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(out_song_handles + (i * 4)),
-                                         song->handle);
-      }
       playlist->songs.emplace_back(std::move(song));
+    }
+    // (Hunt v1.4.6, ronda 8, A3-R8-04, segundo barrido.) The handles
+    // used to be written song by song inside the loop above, so a
+    // string rejected halfway left live-looking handles to songs of
+    // a discarded playlist in the guest array. Write them only
+    // after every song loaded cleanly.
+    if (out_song_handles) {
+      for (uint32_t i = 0; i < song_count; ++i) {
+        memory::store_and_swap<uint32_t>(
+            memory_->TranslateVirtual(out_song_handles + (i * 4)),
+            playlist->songs[i]->handle);
+      }
     }
   }
   // (Hunt v1.4.6, ronda 7, A3-R7-02.) out_playlist_handle is a 4-byte
@@ -477,12 +569,13 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                          args->storage_ptr);
       }
       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+      // (Hunt v1.4.6, ronda 8, A3-R8-04.) The playlist name is
+      // host-side only (Playlist::name); bound the scan the same
+      // way as the song strings. NULL stays "empty".
       std::u16string playlist_name;
-      if (!args->playlist_name_ptr) {
-        playlist_name = u"";
-      } else {
-        playlist_name = memory::load_and_swap<std::u16string>(
-            memory_->TranslateVirtual(args->playlist_name_ptr));
+      if (!LoadGuestU16StringBounded(memory_, uint32_t(args->playlist_name_ptr),
+                                     kMaxPlaylistNameChars, &playlist_name)) {
+        return X_E_INVALIDARG;
       }
       // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
       assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
@@ -506,9 +599,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       // (Hunt v1.4.6, ronda 7, A3-R7-02.) info_ptr is written at
       // offsets 0..784 (fixed fields end at 788 bytes) with no
-      // NULL-check at all; validate that range. (Over-long song
-      // strings can store past it -- their reads are the V-R6-02
-      // residue, left untouched here.)
+      // NULL-check at all; validate that range. (Ronda 8, A3-R8-04:
+      // the song strings are capped at creation now, and each
+      // 40-byte field below is NUL-terminated explicitly, so no
+      // string can store past the validated range.)
       if (!args->info_ptr ||
           !GuestRangeWritable(memory_, uint32_t(args->info_ptr), 788)) {
         return X_E_INVALIDARG;
@@ -528,6 +622,17 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       memory::store_and_swap<std::u16string>(info + 4 + 572 + 80, song->album);
       memory::store_and_swap<std::u16string>(info + 4 + 572 + 120, song->album_artist);
       memory::store_and_swap<std::u16string>(info + 4 + 572 + 160, song->genre);
+      // (Hunt v1.4.6, ronda 8, A3-R8-04.) store_and_swap writes
+      // exactly value.size() u16 with no NUL, and the values are
+      // now capped at 19 chars, so terminate each 40-byte field
+      // explicitly: without this a short name left the stale guest
+      // bytes after it as the "string", and a 19-char name filled
+      // its field with no terminator at all.
+      memory::store_and_swap<uint16_t>(info + 4 + 572 + 0 + song->name.size() * 2, 0);
+      memory::store_and_swap<uint16_t>(info + 4 + 572 + 40 + song->artist.size() * 2, 0);
+      memory::store_and_swap<uint16_t>(info + 4 + 572 + 80 + song->album.size() * 2, 0);
+      memory::store_and_swap<uint16_t>(info + 4 + 572 + 120 + song->album_artist.size() * 2, 0);
+      memory::store_and_swap<uint16_t>(info + 4 + 572 + 160 + song->genre.size() * 2, 0);
       memory::store_and_swap<uint32_t>(info + 4 + 572 + 200, song->track_number);
       memory::store_and_swap<uint32_t>(info + 4 + 572 + 204, song->duration_ms);
       memory::store_and_swap<uint32_t>(info + 4 + 572 + 208, static_cast<uint32_t>(song->format));
