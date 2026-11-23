@@ -66,6 +66,8 @@ constexpr uint32_t kOpCapability = 17;
 constexpr uint32_t kOpTypeRuntimeArray = 29;
 constexpr uint32_t kOpDecorate = 71;
 constexpr uint32_t kOpMemberDecorate = 72;
+constexpr uint32_t kOpDecorateId = 332;
+constexpr uint32_t kOpMemberDecorateIdEXT = 5127;
 
 // Decorations.
 constexpr uint32_t kDecorationBinding = 33;
@@ -189,6 +191,23 @@ inline AuditResult Audit(const uint32_t* words, size_t word_count) {
         }
         break;
       }
+      case kOpDecorateId: {
+        // Operands: target id, decoration, [ids...] — the decoration is
+        // the THIRD word (words[i + 2]), exactly like OpDecorate
+        // (spirv.core.grammar.json: OpDecorateId = Target IdRef,
+        // Decoration). (Caza v1.4.6 ronda 9, A1-R9-01.) Only NonUniform
+        // is scanned here: a DescriptorSet/Binding in the Id form names
+        // its value by constant id, not by literal, so it cannot be read
+        // off words[i + 3] the way OpDecorate does — resolving it would
+        // need the constant table, out of scope for this audit. The
+        // translator never emits OpDecorateId today, so this changes no
+        // current audit result — defense in depth only.
+        if (word_count_instruction >= 3 &&
+              words[i + 2] == kDecorationNonUniform) {
+          result.uses_non_uniform = true;
+        }
+        break;
+      }
       case kOpMemberDecorate: {
         // Operands: struct type id, member index literal, decoration,
         // [literals...]. NOTE: unlike OpDecorate, the decoration is the
@@ -207,6 +226,23 @@ inline AuditResult Audit(const uint32_t* words, size_t word_count) {
         // OpMemberDecorate.
         if (word_count_instruction >= 4 &&
             words[i + 3] == kDecorationNonUniform) {
+          result.uses_non_uniform = true;
+        }
+        break;
+      }
+      case kOpMemberDecorateIdEXT: {
+        // Operands: struct type id, member index literal, decoration,
+        // [ids...] — the decoration is the FOURTH word (words[i + 3]),
+        // exactly like OpMemberDecorate (spirv.core.grammar.json):
+        // words[i + 2] is the member index, not the decoration.
+        // (Caza v1.4.6 ronda 9, A1-R9-01.) Only NonUniform is scanned
+        // here, same as OpMemberDecorate: DescriptorSet/Binding apply to
+        // variables, not struct members, so they cannot appear in this
+        // instruction. The translator never emits OpMemberDecorateIdEXT
+        // today, so this changes no current audit result — defense in
+        // depth only.
+        if (word_count_instruction >= 4 &&
+              words[i + 3] == kDecorationNonUniform) {
           result.uses_non_uniform = true;
         }
         break;
