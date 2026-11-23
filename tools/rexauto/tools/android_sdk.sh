@@ -52,6 +52,28 @@ if [ -f "$SDK_DIR/.patches-applied" ]; then
   _sdk_head="$(git -C "$SDK_DIR" rev-parse HEAD 2>/dev/null)" || { echo "[android_sdk] ERROR: $SDK_DIR is not a git checkout (or is missing) -- remove it and re-run to rebuild from the pinned tag"; exit 1; }
   [ "$_sdk_head" = "$SDK_COMMIT" ] || { echo "[android_sdk] ERROR: SDK at $SDK_DIR is $_sdk_head, expected pinned commit $SDK_COMMIT (tag moved, or tree modified?) -- remove $SDK_DIR and re-run"; exit 1; }
   echo "[android_sdk] SDK commit OK (re-validated): $_sdk_head"
+  # (A5-R8-07, ronda 8.) Re-validate the TREE, not just HEAD: a deleted
+  # file or a deleted submodule still has HEAD == SDK_COMMIT and used to
+  # pass. Deleted tracked files fail loudly (neither the patches nor the
+  # repo overlay ever delete SDK files). Submodules must be initialized
+  # AND at the indexed rev (`git submodule status` prefixes `-` for a
+  # missing/uninitialized one and `+` for a wrong rev); if
+  # thirdparty/sdl3 is gone the SDL glue copy below dies, but other
+  # submodules would only fail later in CMake.
+  # DELIBERATELY NOT checked here: a plain `git diff --quiet` / full
+  # reverse-check of the patch set. The tree legitimately differs from
+  # HEAD far beyond the patches (the repo overlay edits 183 files; the
+  # 11 patches touch 22, and 5 of the 11 fail `--check --reverse` on the
+  # legitimate overlaid tree), so a hand edit to a patch-touched file
+  # cannot be told apart from an overlay edit in this script -- that
+  # case stays covered by the CI cache key (which hashes this file +
+  # the patches) and the M-5 guard in the workflow.
+  _sdk_deleted="$(git -C "$SDK_DIR" diff --name-only --diff-filter=D 2>/dev/null)"
+  [ -z "$_sdk_deleted" ] || { echo "[android_sdk] ERROR: SDK tree at $SDK_DIR has deleted files (e.g. $(echo "$_sdk_deleted" | head -3 | tr '\n' ' ')) -- remove $SDK_DIR and re-run to rebuild from the pinned tag"; exit 1; }
+  _sdk_sub_status="$(git -C "$SDK_DIR" submodule status 2>/dev/null)" || { echo "[android_sdk] ERROR: cannot list SDK submodules at $SDK_DIR (git submodule status failed) -- remove $SDK_DIR and re-run to re-clone and re-init submodules"; exit 1; }
+  _sdk_sub_bad="$(echo "$_sdk_sub_status" | grep -E '^[-+]' || true)"
+  [ -z "$_sdk_sub_bad" ] || { echo "[android_sdk] ERROR: SDK submodules missing or at the wrong rev at $SDK_DIR (e.g. $(echo "$_sdk_sub_bad" | head -3 | tr '\n' ' ')) -- remove $SDK_DIR and re-run to re-clone and re-init submodules"; exit 1; }
+  echo "[android_sdk] SDK tree OK (re-validated): no deleted files, submodules initialized at the indexed revs"
 else
   rm -rf "$SDK_DIR"; mkdir -p "$(dirname "$SDK_DIR")"
   echo "[android_sdk] cloning $SDK_REPO@$SDK_TAG ($SDK_COMMIT)"
@@ -125,9 +147,22 @@ fi
 # de hook_android_dlopen_ext; el tercer nullptr (hook_android_load_
 # sphal_library, sin extinfo para un fallback equivalente) se deja
 # como esta, igual que en R6-E7.
-if [ ! -f "$AT_DIR/.hook-fallback-applied" ]; then
+# (A5-R8-07, ronda 8.) Re-validate the hook-fallback patch on every run,
+# not just its marker: a reverted patch with the marker still present used
+# to be accepted silently, and a deleted marker with the patch applied used
+# to die in `git apply` with a confusing error. Three states, all handled:
+# patch present -> touch the marker and continue; patch absent but
+# applicable -> apply it now; neither -> loud error telling the user to
+# remove $AT_DIR and re-run.
+if git -C "$AT_DIR" apply --check --reverse "$PATCHES/libadrenotools-8fae8ce-hook-fallback.patch" 2>/dev/null; then
+  touch "$AT_DIR/.hook-fallback-applied"
+elif git -C "$AT_DIR" apply --check "$PATCHES/libadrenotools-8fae8ce-hook-fallback.patch" 2>/dev/null; then
+  echo "[android_sdk] hook-fallback patch not applied, applying it now"
   git -C "$AT_DIR" apply "$PATCHES/libadrenotools-8fae8ce-hook-fallback.patch"
   touch "$AT_DIR/.hook-fallback-applied"
+else
+  echo "[android_sdk] ERROR: libadrenotools hook-fallback patch is neither applied nor applicable at $AT_DIR (tree modified?) -- remove $AT_DIR and re-run" >&2
+  exit 1
 fi
 
 SDL_JAVA_SRC="$SDK_DIR/thirdparty/sdl3/android-project/app/src/main/java/org/libsdl/app"
