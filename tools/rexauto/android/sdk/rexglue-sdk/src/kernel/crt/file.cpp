@@ -79,13 +79,13 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   auto range_ok = [&](rex::memory::PageAccess access) {
     if (start_physical) {
       return access == rex::memory::PageAccess::kReadWrite;
-}
-      return writable ? access == rex::memory::PageAccess::kReadWrite
-                        : access != rex::memory::PageAccess::kNoAccess;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
   };
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
-           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
@@ -201,10 +201,10 @@ u32 ReadFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToRead,
   // validate it up front instead of writing through a wild pointer.
   // (NULL stays allowed: no count out.)
   if (lpNumberOfBytesRead &&
-        !GuestRangeWritable(lpNumberOfBytesRead.guest_address(), sizeof(uint32_t)) {
+      !GuestRangeWritable(lpNumberOfBytesRead.guest_address(), sizeof(uint32_t))) {
     return 0;
   }
-      auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file) {
     REXKRNL_WARN("rexcrt_ReadFile: invalid handle {:#x}", static_cast<uint32_t>(hFile));
     if (lpNumberOfBytesRead)
@@ -247,8 +247,8 @@ u32 WriteFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToWrite,
                     mapped_u32 lpNumberOfBytesWritten, mapped_void lpOverlapped) {
   // (Hunt v1.4.6, ronda 8, A3-R8-08.) See ReadFile above.
   if (lpNumberOfBytesWritten &&
-        !GuestRangeWritable(lpNumberOfBytesWritten.guest_address(), sizeof(uint32_t))) {
-        return 0;
+      !GuestRangeWritable(lpNumberOfBytesWritten.guest_address(), sizeof(uint32_t))) {
+    return 0;
   }
   auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file) {
