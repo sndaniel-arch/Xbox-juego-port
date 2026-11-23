@@ -603,11 +603,32 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
       // Walk the guest stack to find calling functions
       uint32_t sp = ctx->r1.u32;
       REXSYS_ERROR("  Stack walk from sp=0x{:08X}:", sp);
+      // (Hunt v1.4.6 round 9, A2-R9-05.) The guest controls SP (PPC r1),
+      // so a stack slot must be proven committed and readable in the heap
+      // page table before it is dereferenced: reading an uncommitted or
+      // no-access page faults inside the signal handler and the original
+      // crash loses its diagnosis. Both dwords of the frame (sp+0 and
+      // sp+4) are checked -- the second can sit on the next page. A slot
+      // that fails the check leaves saved_sp at 0, which ends the walk
+      // below; only the diagnostic is lost. QueryRegionInfo takes only
+      // heap_mutex_, and this callback already calls it below with the
+      // same global lock held, so the lock order is unchanged.
+      auto stack_slot_readable = [this](uint32_t address) {
+        BaseHeap* stack_heap = LookupHeap(address);
+        if (!stack_heap) {
+          return false;
+        }
+        HeapAllocationInfo info{};
+        return stack_heap->QueryRegionInfo(address, &info) &&
+                 (info.state & kMemoryAllocationCommit) &&
+                 (info.protect & kMemoryProtectRead);
+      };
       for (int i = 0; i < 16; i++) {
         uint32_t prev_sp = sp;
         // Read saved SP (at sp+0) and saved LR (at sp+4)
         uint32_t saved_sp = 0, saved_lr = 0;
-        if (prev_sp >= 0x10000000 && prev_sp < 0x20000000) {
+        if (prev_sp >= 0x10000000 && prev_sp < 0x20000000) &&
+            stack_slot_readable(prev_sp) && stack_slot_readable(prev_sp + 4)) {
           auto* sp_host = reinterpret_cast<uint8_t*>(virtual_membase_) + prev_sp;
           saved_sp = *reinterpret_cast<uint32_t*>(sp_host);
           saved_lr = *reinterpret_cast<uint32_t*>(sp_host + 4);
@@ -790,6 +811,12 @@ void Memory::SystemHeapFree(uint32_t address, uint32_t* out_region_size) {
   }
   // TODO(benvanik): lightweight pool.
   auto heap = LookupHeap(address);
+  if (!heap) {
+    // Address falls in a gap of the heap map (e.g. 0x7F000000-0x80000000
+    // or >= 0xFFD00000): nothing owns it, so there is nothing to free.
+    // (Hunt v1.4.6 round 9, A2-R9-02.)
+    return;
+  }
   heap->Release(address, out_region_size);
 }
 
@@ -1394,7 +1421,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
   uint32_t start_page_number = (base_address - heap_base_) >> page_size_shift_;
   uint32_t end_page_number = start_page_number + page_count - 1;
-  if (start_page_number >= page_table_.size() || end_page_number > page_table_.size()) {
+  if (start_page_number >= page_table_.size() || end_page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::AllocFixed passed out of range address range");
     return false;
   }
@@ -1723,6 +1750,14 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) >> page_size_shift_;
+  if (base_page_number >= page_table_.size() {
+    // Below heap_base_ the subtraction wraps to a huge index; past the
+    // end of the heap it is simply out of range. Either way there is no
+    // page entry to read. (Hunt v1.4.6 round 9, A2-R9-03.)
+    REXSYS_ERROR("BaseHeap::Release failed because address is out of range");
+    return false;
+  }
+    
   auto base_page_entry = page_table_[base_page_number];
   if (base_page_entry.base_address != base_page_number) {
     REXSYS_ERROR("BaseHeap::Release failed because address is not a region start");
@@ -1874,7 +1909,7 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
 
 bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info) {
   uint32_t start_page_number = (base_address - heap_base_) >> page_size_shift_;
-  if (start_page_number > page_table_.size()) {
+  if (start_page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QueryRegionInfo base page out of range");
     return false;
   }
@@ -1927,7 +1962,7 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_in
 
 bool BaseHeap::QuerySize(uint32_t address, uint32_t* out_size) {
   uint32_t page_number = (address - heap_base_) >> page_size_shift_;
-  if (page_number > page_table_.size()) {
+  if (page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QuerySize base page out of range");
     *out_size = 0;
     return false;
@@ -1940,7 +1975,7 @@ bool BaseHeap::QuerySize(uint32_t address, uint32_t* out_size) {
 
 bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) {
   uint32_t page_number = (*in_out_address - heap_base_) >> page_size_shift_;
-  if (page_number > page_table_.size()) {
+  if (page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QuerySize base page out of range");
     *out_size = 0;
     return false;
@@ -1954,7 +1989,7 @@ bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) {
 
 bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
   uint32_t page_number = (address - heap_base_) >> page_size_shift_;
-  if (page_number > page_table_.size()) {
+  if (page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QueryProtect base page out of range");
     *out_protect = 0;
     return false;
