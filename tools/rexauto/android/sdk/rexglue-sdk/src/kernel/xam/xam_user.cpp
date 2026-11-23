@@ -86,13 +86,13 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   auto range_ok = [&](rex::memory::PageAccess access) {
     if (start_physical) {
       return access == rex::memory::PageAccess::kReadWrite;
-}
-      return writable ? access == rex::memory::PageAccess::kReadWrite
-                        : access != rex::memory::PageAccess::kNoAccess;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
   };
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
-           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
