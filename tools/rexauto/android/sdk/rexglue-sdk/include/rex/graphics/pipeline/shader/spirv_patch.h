@@ -203,7 +203,7 @@ inline AuditResult Audit(const uint32_t* words, size_t word_count) {
         // translator never emits OpDecorateId today, so this changes no
         // current audit result — defense in depth only.
         if (word_count_instruction >= 3 &&
-              words[i + 2] == kDecorationNonUniform) {
+            words[i + 2] == kDecorationNonUniform) {
           result.uses_non_uniform = true;
         }
         break;
@@ -242,7 +242,7 @@ inline AuditResult Audit(const uint32_t* words, size_t word_count) {
         // today, so this changes no current audit result — defense in
         // depth only.
         if (word_count_instruction >= 4 &&
-              words[i + 3] == kDecorationNonUniform) {
+            words[i + 3] == kDecorationNonUniform) {
           result.uses_non_uniform = true;
         }
         break;
