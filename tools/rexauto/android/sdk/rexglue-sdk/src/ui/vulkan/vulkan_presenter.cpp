@@ -339,6 +339,27 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
       !output_height) {
     return false;
   }
+  // (Hunt v1.4.6 round 9, A2-R9-09.) Refuse to dispatch: this path has no
+  // real depth, motion vectors, jitter or camera state to feed FSR2 -- it
+  // would run with reset=true every frame and the color image as depth
+  // and motion vectors, i.e. an expensive spatial upscale that
+  // hallucinates detail from fake motion. The caller falls back to the
+  // EASU render-pass path when this returns false, exactly as on an
+  // ffxDispatch failure (the intermediate render pass declares
+  // initialLayout UNDEFINED, so the UAV barrier recorded by the caller
+  // before this call is harmless on that path). Re-enable only when real
+  // guest depth, real motion vectors, per-frame jitter, real frame
+  // timing and reset-only-on-resolution/scene-change are wired in. This
+  // code is not compiled in this build (REX_HAS_FIDELITYFX_RUNTIME is
+  // off); the guard only matters if someone enables FidelityFX.
+  static std::atomic<bool> logged_fsr2_fabricated_inputs = false;
+  if (!logged_fsr2_fabricated_inputs.exchange(true)) {
+    REXLOG_ERROR(
+    "VulkanPresenter: FSR2 temporal upscaling is disabled: no real "
+    "depth, motion vectors, jitter or camera state is available; "
+    "falling back to EASU");
+  }
+  return false;
   if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
