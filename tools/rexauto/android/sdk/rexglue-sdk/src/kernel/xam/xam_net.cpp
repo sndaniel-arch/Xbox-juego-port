@@ -89,7 +89,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   // uncommitted or NoAccess sailed through every GuestRange* check.
   // Validate both ends instead: the tail of the start heap and the
   // head of the end heap, with the same read/write rule as above.
-    // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
   // two heaps is rejected outright below: the middle heap would
   // otherwise go unchecked, and no legitimate range spans even
   // one boundary (see the R8-13 comment above).
