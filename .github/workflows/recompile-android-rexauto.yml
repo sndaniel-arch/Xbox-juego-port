@@ -169,12 +169,17 @@ jobs:
     # were 360 > 350), so the 240-min phase-2 budget could never be
     # honoured in full. (V-A5-01 added the Python-deps timeout to the
     # count: it was untimed before, so the old sum missed it.)
-    # (A5-R7-11, ronda 7.) The old comment also assumed the steps WITHOUT
-    # a timeout (checkouts, injections, localize, pack, uploads, ...) fit
-    # in the 10 min left over -- an untested hypothesis. Every step in
-    # this job now carries its own timeout-minutes (5-15 min each, 175 in
-    # total across 19 steps). Step timeouts are per-step ATTRIBUTION caps,
-    # NOT an additive budget: their sum (350 + 175 = 525) exceeds the job
+    # (A5-R7-11, ronda 7; aritmetica corregida A5-R8-05, ronda 8.) The
+    # old comment also assumed the steps WITHOUT a timeout (checkouts,
+    # injections, localize, pack, uploads, ...) fit in the 10 min left
+    # over -- an untested hypothesis. 26 of the 28 steps in this job now
+    # carry their own timeout-minutes, and their sum is 530, not the 525
+    # the R7-11 comment claimed: the six long steps sum to 350 (10 + 10 +
+    # 30 + 60 + 60 + 180), the 19 R7-11 steps sum to 175, and the 5-min
+    # "Overlay tracked ci_sdk.py" step (R7-03) was in neither list
+    # (350 + 175 + 5 = 530). Only "Validate inputs" and the actions/cache
+    # restore step have no timeout. Step timeouts are per-step ATTRIBUTION
+    # caps, NOT an additive budget: their sum (530) exceeds the job
     # ceiling by design -- steps run sequentially and the job timeout
     # (360) is still the hard ceiling that fires first if the run as a
     # whole overruns. A step cap only fires when that single step hangs
@@ -445,7 +450,23 @@ jobs:
           if (-not (Test-Path "rexauto/rexglue" -PathType Container)) { Write-Host "::error::cached SDK integrity: rexauto/rexglue is missing after cache restore"; exit 1 }
           $count = (Get-ChildItem "rexauto/rexglue" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
           if ($count -lt 1) { Write-Host "::error::cached SDK integrity: rexauto/rexglue is empty after cache restore"; exit 1 }
-          Write-Host "cached SDK integrity OK: marker $marked matches the audited bundle SHA-256 ($count files under rexauto/rexglue)"
+          # (A5-R8-03, ronda 8.) The marker above proves PROVENANCE (the
+          # tree came from the audited bundle), not CONTENT: a truncated
+          # restore with an intact marker used to pass. Also require the
+          # key binaries of the restored tree, non-empty. Paths are where
+          # detect_env()/sdk_pin_mismatch() look for them: rexglue.exe and
+          # rexruntime.dll are mirrored into rexglue/tool/ by
+          # setup.py:_lay_out_sdk, and rexgpu-xenos.dll lives in
+          # rexglue/sdk/bin/ (it is NOT mirrored into tool/ -- the pin
+          # check in rexauto.py only inspects it when it sits next to
+          # rexglue.exe, so accept any of its possible locations: tool/
+          # (if a bundle ever mirrors it), sdk/bin/ (raw layout, the
+          # 0.10.1 repack), or rexglue/bin/ (wrapped layout, where
+          # _lay_out_sdk falls back to sdk = rexglue/).
+          foreach ($f in @("rexauto/rexglue/tool/rexglue.exe", "rexauto/rexglue/tool/rexruntime.dll")) { if (-not (Test-Path $f -PathType Leaf) -or (Get-Item $f).Length -eq 0) { Write-Host "::error::cached SDK integrity: key file $f is missing or empty in the restored rexauto/rexglue tree -- the cache entry is truncated. Delete the rexglue-sdk cache entry (gh cache delete) and re-run."; exit 1 } }
+          $xenos = @("rexauto/rexglue/tool/rexgpu-xenos.dll", "rexauto/rexglue/sdk/bin/rexgpu-xenos.dll", "rexauto/rexglue/bin/rexgpu-xenos.dll") | Where-Object { (Test-Path $_ -PathType Leaf) -and (Get-Item $_).Length -gt 0 }
+          if (-not $xenos) { Write-Host "::error::cached SDK integrity: rexgpu-xenos.dll is missing or empty in the restored rexauto/rexglue tree (looked in tool/, sdk/bin/ and bin/) -- the cache entry is truncated. Delete the rexglue-sdk cache entry (gh cache delete) and re-run."; exit 1 }
+          Write-Host "cached SDK integrity OK: marker $marked matches the audited bundle SHA-256 ($count files under rexauto/rexglue; key binaries present)" 
 
       - name: Verify SDK pin
         shell: pwsh
@@ -867,18 +888,32 @@ jobs:
     name: "APK (arm64-v8a)"
     needs: recompile
     runs-on: ubuntu-24.04
+    # (A5-R8-06, ronda 8.) Same treatment R7-11 gave job 1: every step
+    # in this job now carries its own timeout-minutes (the 6 steps that
+    # already had one sum to 240; the 19 new ones sum to 350, for 590 in
+    # total). The two steps with real variance -- the Gradle cache restore
+    # (potentially GBs) and the ~1.6 GB APK upload -- get generous caps
+    # (60 each); the rest get attribution caps of 5-30 min. Step timeouts
+    # are per-step ATTRIBUTION caps, NOT an additive budget: their sum
+    # (590) exceeds the job ceiling (300) by design -- the job timeout is
+    # still the hard ceiling, and a step cap only fires when that single
+    # step hangs past its own cap, so the failure names the hanging step
+    # instead of dying anonymously at the job timeout.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 10
 
       - name: Checkout rexauto (pinned commit)
         uses: actions/checkout@v7
+        timeout-minutes: 10
         with:
           repository: Player124413/rexauto
           ref: ${{ env.REXAUTO_REF }}
           path: rexauto
 
       - name: Overlay our port tree onto rexauto
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           # This repo is a DELTA on rexauto@dac49b33: only the files we
@@ -939,11 +974,13 @@ jobs:
           free -h
 
       - uses: actions/download-artifact@v8
+        timeout-minutes: 30
         with:
           name: port-src-${{ env.REX_PROJECT }}
           path: ${{ runner.temp }}/in
 
       - name: Unpack port
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           mkdir -p autoports/${{ env.REX_PROJECT }}/port
@@ -970,12 +1007,14 @@ jobs:
           done
 
       - uses: actions/setup-java@v6
+        timeout-minutes: 10
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Cache patched ReXGlue SDK
         uses: actions/cache@v6
+        timeout-minutes: 30
         id: sdk-cache
         with:
           path: rexauto/android/sdk
@@ -993,6 +1032,7 @@ jobs:
         run: tools/android_sdk.sh
 
       - name: Re-overlay tracked SDK files (after SDK setup)
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           # android_sdk.sh rm -rf's the SDK dir and rebuilds it from patches
@@ -1020,6 +1060,7 @@ jobs:
           test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java
 
       - name: Guard tracked SDK files carry their patch hunks (M-5)
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           # (M-5.) Patches and tracked SDK files are two sources of truth:
@@ -1051,6 +1092,7 @@ jobs:
           echo "M-5 guard OK: 6 patched files + xbmovie_device.cpp carry their hunks"
 
       - name: Enable xbmovie_probe for this run (if requested)
+        timeout-minutes: 5
         if: inputs.xbmovie_probe
         run: |
           set -euo pipefail
@@ -1073,6 +1115,7 @@ jobs:
 
       - name: Cache Android CMake + NDK
         uses: actions/cache@v6
+        timeout-minutes: 30
         with:
           # (M-4.) cmake 3.31.1 + NDK 27.2.12479018 were re-downloaded from
           # dl.google.com on every run. Fixed key: these versions are pinned
@@ -1120,6 +1163,7 @@ jobs:
           fi
 
       - name: CI signing key (stable, from secret if present)
+        timeout-minutes: 10
         env:
           CI_KEYSTORE_BASE64: ${{ secrets.CI_KEYSTORE_BASE64 }}
           CI_KEYSTORE_STORE_PASSWORD: ${{ secrets.CI_KEYSTORE_STORE_PASSWORD }}
@@ -1172,6 +1216,7 @@ jobs:
 
       - name: Cache Gradle dependencies
         uses: actions/cache@v6
+        timeout-minutes: 60
         with:
           # (M-4.) Gradle 8.14 + AGP 8.7.3 + Kotlin + all Maven deps were
           # re-downloaded on every run. Keyed on the wrapper + build scripts,
@@ -1185,6 +1230,7 @@ jobs:
             gradle-${{ runner.os }}-
 
       - name: Guard CI versionCode stays below the FULL range (A5-R4-01)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           # (A5-R4-01, ronda 4.) CI versionCode is github.run_number and
@@ -1228,6 +1274,7 @@ jobs:
             -PrexVersionName="1.${{ github.run_number }}"
 
       - name: Verify APK
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           APK=rexauto/android/app/build/outputs/apk/release/app-release.apk
@@ -1301,7 +1348,12 @@ jobs:
           # lives next to the apksigner pinned above (build-tools 35.0.0).
           AAPT2="$ANDROID_HOME/build-tools/35.0.0/aapt2"
           if [ ! -x "$AAPT2" ]; then echo "::error::aapt2 not found at $AAPT2 (AGP 8.7.3 build-tools 35.0.0) -- check the Android SDK on the runner"; exit 1; fi
-          _BADGING="$("$AAPT2" dump badging "$APK" | grep -a -m1 '^package:')"
+          # (A5-R8-04, ronda 8.) Dump to a file first, then grep the file:
+          # `aapt2 ... | grep -m1` moved the SIGPIPE onto the producer
+          # (aapt2 dies with 141 once grep exits, and pipefail fails the
+          # step) -- same lesson as M-13b above (/tmp/apk.txt).
+          "$AAPT2" dump badging "$APK" > /tmp/badging.txt || { echo "::error::aapt2 dump badging failed on $APK"; exit 1; }
+          _BADGING="$(grep -a -m1 '^package:' /tmp/badging.txt)" 
           ACTUAL_VERSION_CODE="$(echo "$_BADGING" | sed "s/.*versionCode='\([0-9]*\)'.*/\1/")"
           ACTUAL_VERSION_NAME="$(echo "$_BADGING" | sed "s/.*versionName='\([^']*\)'.*/\1/")"
           if [ "$ACTUAL_VERSION_CODE" != "${{ github.run_number }}" ]; then
@@ -1322,6 +1374,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
+        timeout-minutes: 60
         with:
           name: ${{ env.REX_PROJECT }}-android-apk
           path: ${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk
@@ -1331,6 +1384,7 @@ jobs:
       # complete Android project: launcher app + recompiled port sources, ready
       # to open in Android Studio (SDK + build outputs excluded)
       - name: Collect project sources
+        timeout-minutes: 10
         if: always()
         run: |
           # (Ronda 4, G-F3.) set -e: a failed rsync used to leave a partial
@@ -1358,6 +1412,7 @@ jobs:
           du -sh "$OUT"
 
       - name: Upload project sources
+        timeout-minutes: 15
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -1367,6 +1422,7 @@ jobs:
           retention-days: 7
 
       - name: Upload native build logs on failure
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@v7
         with:
