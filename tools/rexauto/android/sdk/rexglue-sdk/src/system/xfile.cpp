@@ -24,6 +24,43 @@
 
 namespace rex::system {
 
+// (Hunt v1.4.6, ronda 9, A3-R9-11.) Page-access check for a file
+// buffer, shared by ReadInternal (which WRITES the buffer) and Write
+// (which READS it). The old code only called QueryRangeAccess for
+// physical heaps: a virtual range was accepted on heap membership
+// alone, so a buffer in the protected zero page (or any uncommitted
+// virtual page) passed validation and the memcpy behind it SIGSEGVd
+// the host. QueryRangeAccess works for virtual heaps too -- it
+// reports uncommitted pages as kNoAccess -- so call it for every
+// heap. The physical rule is unchanged (kReadWrite, as today, for
+// both directions); for virtual ranges the R8-13 rule applies
+// (writable ? kReadWrite : != kNoAccess). A range spanning exactly
+// two heaps validates both ends, as R8-13 does; a range spanning
+// more than two heaps is rejected outright (A3-R9-10: no legitimate
+// range spans even one boundary).
+static bool GuestBufferRangeAccessible(rex::memory::Memory* memory,
+                                       rex::memory::BaseHeap* start_heap,
+                                       rex::memory::BaseHeap* end_heap, uint32_t low_address,
+                                       uint32_t high_address, bool writable) {
+  bool physical = start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  if (start_heap == end_heap) {
+    return range_ok(start_heap->QueryRangeAccess(low_address, high_address));
+  }
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (memory->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(low_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+              
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
@@ -189,7 +226,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
       // on the GPU - and that must not trigger a race condition).
       uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
       rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
-      const rex::memory::BaseHeap* buffer_end_heap =
+      rex::memory::BaseHeap* buffer_end_heap =
           memory()->LookupHeap(buffer_guest_high_address);
       if (!buffer_start_heap || !buffer_end_heap ||
           (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
@@ -202,9 +239,12 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
             buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
                 ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
                 : nullptr;
-        if (buffer_physical_heap && buffer_physical_heap->QueryRangeAccess(
-                                        buffer_guest_address, buffer_guest_high_address) !=
-                                        memory::PageAccess::kReadWrite) {
+                // (Hunt v1.4.6, ronda 9, A3-R9-11.) ReadInternal WRITES the
+        // guest buffer, so the range must be writable -- in virtual
+        // heaps as well as physical ones (see the helper above).
+        if (!GuestBufferRangeAccessible(memory(), buffer_start_heap, buffer_end_heap,
+                                        buffer_guest_address, buffer_guest_high_address,
+                                        true)) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
           result = file_->ReadSync(
@@ -401,7 +441,7 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   } else {
     uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
     rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
-    const rex::memory::BaseHeap* buffer_end_heap =
+    rex::memory::BaseHeap* buffer_end_heap =
         memory()->LookupHeap(buffer_guest_high_address);
     if (!buffer_start_heap || !buffer_end_heap ||
         (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
@@ -414,9 +454,13 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
           buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
               ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
               : nullptr;
-      if (buffer_physical_heap && buffer_physical_heap->QueryRangeAccess(
-                                      buffer_guest_address, buffer_guest_high_address) !=
-                                      memory::PageAccess::kReadWrite) {
+      // (Hunt v1.4.6, ronda 9, A3-R9-11.) Write READS the guest
+      // buffer, so the range must be readable -- in virtual heaps as
+      // well as physical ones (see the helper above). The physical
+      // rule stays kReadWrite, as today.
+      if (!GuestBufferRangeAccessible(memory(), buffer_start_heap, buffer_end_heap,
+                                      buffer_guest_address, buffer_guest_high_address,
+                                      false)) {
         result = X_STATUS_ACCESS_VIOLATION;
       } else {
         result = file_->WriteSync(
