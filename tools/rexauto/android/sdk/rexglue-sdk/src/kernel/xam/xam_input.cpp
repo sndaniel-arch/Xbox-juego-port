@@ -38,6 +38,73 @@ rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
 }
 
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) This file had no range helper:
+// every entry below only NULL-checked its guest pointers, and
+// TranslateVirtual never validates or returns null, so a wild
+// pointer SIGSEGVd the host. Same heap validation as A3-R4-07
+// (xam_app.cpp): reject a range that wraps past 4 GiB, starts or
+// ends outside any heap, or spans heaps of different kinds (or
+// two physical heaps); inside a single heap require the pages to
+// be accessible; across a heap boundary validate both ends
+// (A3-R8-13).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+
 void XamResetInactivity_entry() {
   // Do we need to do anything?
 }
@@ -59,6 +126,12 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) The driver memsets the whole
+  // 20-byte capabilities struct through this pointer.
+  if (!GuestRangeWritable(caps.guest_address(), sizeof(X_INPUT_CAPABILITIES))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  
   uint32_t actual_user_index = user_index;
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
@@ -87,6 +160,10 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
   }
 
   (void)unk;  // Unused in this implementation
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) See GetCapabilities above.
+  if (!GuestRangeWritable(caps.guest_address(), sizeof(X_INPUT_CAPABILITIES))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
   auto* is = input_system();
   return is->GetCapabilities(actual_user_index, flags, caps);
 }
@@ -111,6 +188,13 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     actual_user_index = 0;
   }
 
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) GetState writes the 16-byte
+  // state when the pointer is non-NULL (NULL is a deliberate query
+  // and stays allowed, R-01); validate only a non-NULL pointer.
+  if (input_state &&
+      !GuestRangeWritable(input_state.guest_address(), sizeof(X_INPUT_STATE))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
   auto* is = input_system();
   return is->GetState(actual_user_index, input_state);
 }
@@ -121,6 +205,11 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
     return X_ERROR_BAD_ARGUMENTS;
   }
 
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) The 4-byte vibration struct
+  // is read by the driver below.
+  if (!GuestRangeReadable(vibration.guest_address(), sizeof(X_INPUT_VIBRATION))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
   uint32_t actual_user_index = user_index;
   if ((user_index & 0xFF) == 0xFF) {
     // Always pin user to 0.
@@ -153,6 +242,11 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
     actual_user_index = 0;
   }
 
+// (Hunt v1.4.6, ronda 8, A3-R8-05.) The 8-byte keystroke is
+  // written by the driver below.
+  if (!GuestRangeWritable(keystroke.guest_address(), sizeof(X_INPUT_KEYSTROKE))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
   auto* is = input_system();
   return is->GetKeystroke(actual_user_index, flags, keystroke);
 }
@@ -175,7 +269,15 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  uint32_t user_index = *user_index_ptr;
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) Same function as above for
+  // the keystroke; user_index_ptr is additionally read here and
+  // written back on success (4 bytes both ways).
+  if (!GuestRangeWritable(keystroke.guest_address(), sizeof(X_INPUT_KEYSTROKE)) ||
+      !GuestRangeWritable(user_index_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+    uint32_t user_index = *user_index_ptr;
   if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     user_index = 0;
