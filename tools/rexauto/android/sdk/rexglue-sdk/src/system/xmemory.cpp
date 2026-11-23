@@ -1757,7 +1757,7 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     REXSYS_ERROR("BaseHeap::Release failed because address is out of range");
     return false;
   }
-      auto base_page_entry = page_table_[base_page_number];
+  auto base_page_entry = page_table_[base_page_number];
   if (base_page_entry.base_address != base_page_number) {
     REXSYS_ERROR("BaseHeap::Release failed because address is not a region start");
     return false;
