@@ -82,8 +82,10 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   // uncommitted or NoAccess sailed through every GuestRange* check.
   // Validate both ends instead: the tail of the start heap and the
   // head of the end heap, with the same read/write rule as above.
-  // (A range spanning more than two heaps still has only its two
-  // ends checked; no legitimate range spans even one boundary.)
+    // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // two heaps is rejected outright below: the middle heap would
+  // otherwise go unchecked, and no legitimate range spans even
+  // one boundary (see the R8-13 comment above).
   auto range_ok = [&](rex::memory::PageAccess access) {
     if (start_physical) {
       return access == rex::memory::PageAccess::kReadWrite;
@@ -92,6 +94,14 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
                     : access != rex::memory::PageAccess::kNoAccess;
   };
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) The heap right after the start
+  // heap must be the end heap: anything else means the range spans
+  // three or more heaps (or a gap in the heap map) and the middle heap
+  // would go unchecked. Reject outright instead of validating only
+  // the two ends.
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
          range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
@@ -295,6 +305,13 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL out_ptr used to write 0 to
   // guest address 0.
   if (!out_ptr) {
+    return X_E_INVALIDARG;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-13.) *out_ptr is written
+  // unconditionally below with only the NULL check above; a wild
+  // pointer SIGSEGVs the host on the 4-byte write. Same pattern as
+  // GetCapabilities/GetState in this file (R8-05).
+  if (!GuestRangeWritable(out_ptr.guest_address(), sizeof(uint32_t))) {
     return X_E_INVALIDARG;
   }
 
