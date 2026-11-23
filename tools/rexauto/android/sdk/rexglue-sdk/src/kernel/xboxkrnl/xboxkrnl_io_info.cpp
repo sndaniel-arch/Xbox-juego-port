@@ -52,7 +52,7 @@ static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
   }
   uint32_t guest_high_address = guest_address + length - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
   if (!start_heap || !end_heap ||
       (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) !=
           (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
@@ -60,25 +60,38 @@ static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
        start_heap != end_heap)) {
     return false;
   }
-  if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
-    auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
-    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address) !=
-        rex::memory::PageAccess::kReadWrite) {
-      return false;
-    }
+  // (Hunt v1.4.6, ronda 9, A3-R9-11.) The old code only called
+  // QueryRangeAccess for physical heaps; a virtual range passed on
+  // heap membership alone, so e.g. info_ptr = 0x00008000 (inside the
+  // protected zero page, not NULL) sailed through and the memset
+  // behind it SIGSEGVd the host. QueryRangeAccess works for virtual
+  // heaps too, so call it for every heap; the rule here is kReadWrite
+  // in both cases (this helper guards a write). A range spanning
+  // exactly two heaps validates both ends, as R8-13 does; a range
+  // spanning more than two heaps is rejected outright (A3-R9-10: no
+  // legitimate range spans even one boundary).
+  if (start_heap == end_heap) {
+    return start_heap->QueryRangeAccess(guest_address, guest_high_address) ==
+             rex::memory::PageAccess::kReadWrite;
   }
-  return true;
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return start_heap->QueryRangeAccess(guest_address, start_heap_end) ==
+               rex::memory::PageAccess::kReadWrite &&
+           end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address) ==
+               rex::memory::PageAccess::kReadWrite;
 }
 
 // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-16.)
 // Readable twin of GuestInfoBufferIsWritable above, same contract:
 // the Query sibling validates the range it WRITES with the writable
 // helper, but NtSetInformationFile below READS the info struct from
-// the guest and had no range check at all. Mirror the helper exactly
-// (heap membership for virtual heaps, kReadWrite for a physical
-// range); a readable range only needs the pages to be accessible, and
-// the physical heap is read/write in practice, so the same test
-// applies.
+// the guest and had no range check at all. Mirror the helper, with
+// the readable rule for virtual ranges (pages must be accessible;
+// the physical rule stays kReadWrite, as in the writable helper,
+// because the physical heap is read/write in practice).
 static bool GuestInfoBufferIsReadable(uint32_t guest_address, uint32_t length) {
   if (length == 0) {
     return true;
@@ -88,7 +101,7 @@ static bool GuestInfoBufferIsReadable(uint32_t guest_address, uint32_t length) {
   }
   uint32_t guest_high_address = guest_address + length - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_high_address);
   if (!start_heap || !end_heap ||
       (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) !=
           (end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) ||
@@ -96,14 +109,26 @@ static bool GuestInfoBufferIsReadable(uint32_t guest_address, uint32_t length) {
        start_heap != end_heap)) {
     return false;
   }
-  if (start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical) {
-    auto* physical_heap = static_cast<rex::memory::PhysicalHeap*>(start_heap);
-    if (physical_heap->QueryRangeAccess(guest_address, guest_high_address) !=
-        rex::memory::PageAccess::kReadWrite) {
-      return false;
+  // (Hunt v1.4.6, ronda 9, A3-R9-11.) As in the writable helper
+  // above: virtual ranges now get a QueryRangeAccess check too
+  // (readable rule: any access but kNoAccess), with both ends
+  // validated on a two-heap span and more than two heaps rejected.
+  bool physical = start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
     }
+    return access != rex::memory::PageAccess::kNoAccess;
+  };
+  if (start_heap == end_heap) {
+    return range_ok(start_heap->QueryRangeAccess(guest_address, guest_high_address));
   }
-  return true;
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address));
 }
 
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
