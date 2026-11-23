@@ -250,9 +250,16 @@ public class MainActivity extends SDLActivity {
      * in pauseEmulation()/resumeEmulation() absorbs the overlap with
      * onPause/onResume/onStop (Home, incoming call, screen-off fire
      * several of them for one event). An AlertDialog opened by the game
-     * itself does NOT take window focus from the activity, so the
-     * in-game menus (gear, graphics, logs, driver) still do not pause --
-     * same as before. SDL's own focus handling
+     * itself DOES take window focus from the activity (Android calls
+     * onWindowFocusChanged even when the activity itself shows a dialog),
+     * so opening an in-game menu (gear, graphics, logs, driver, exit
+     * confirm) pauses the guest -- that is the wanted auto-pause, and
+     * dismissing the menu resumes it via onWindowFocusChanged(true).
+     * (Hunt v1.4.6 ronda 8, A4-R8-01.) The R7-01 text this paragraph
+     * replaces claimed the opposite ("does NOT take window focus");
+     * that was false and it hid the resume hole fixed in
+     * onResume()/onStart(): they must not resume without focus.
+     * SDL's own focus handling
      * (SDLActivity.onWindowFocusChanged) is untouched: the SDL thread
      * keeps pumping events while the guest (graphics + audio) is
      * parked, which is what the player experiences as paused.
@@ -274,7 +281,18 @@ public class MainActivity extends SDLActivity {
         // emulation first, mirroring onPause.
         // (Hunt v1.4.6 ronda 7, A4-R7-01.) Same dead gate as onPause:
         // resume on every onResume.
-        resumeEmulation();
+        // (Hunt v1.4.6 ronda 8, A4-R8-01.) ... except without focus:
+        // onResume fires BEFORE onWindowFocusChanged(true), so resuming
+        // here unconditionally also resumed behind a dialog that was
+        // still open (and still holding focus) when the activity came
+        // back from Home / a call / the file picker -- the pause that
+        // focus loss had applied was undone with no focus callback to
+        // re-apply it. Only resume when the window already has focus
+        // (or the activity is genuinely in multi-window, where the
+        // unfocused pane is still visible and SDL keeps running); the
+        // onWindowFocusChanged(true) callback resumes in the normal
+        // case, so skipping here loses nothing.
+        if (shouldResumeEmulation()) resumeEmulation();
         super.onResume();
     }
 
@@ -288,8 +306,35 @@ public class MainActivity extends SDLActivity {
     protected void onStart() {
         // (A4-R3-09, multi-window half.) Same reversal as onResume: the
         // emulation resumes before the SDL thread, mirroring onStop.
-        if (mHasMultiWindow) resumeEmulation();
+        // (Hunt v1.4.6 ronda 8, A4-R8-01.) Same focus gate as onResume:
+        // onStart fires before any focus callback, so an unconditional
+        // resume here also restarted the guest behind a still-open
+        // dialog after an interruption.
+        if (shouldResumeEmulation()) resumeEmulation();
         super.onStart();
+    }
+
+    /**
+     * (Hunt v1.4.6 ronda 8, A4-R8-01.) Whether onStart/onResume may
+     * resume the guest. The window has focus in the normal return path
+     * (and onWindowFocusChanged(true) resumes anyway right after, so
+     * the gate costs nothing there); it does NOT have focus while a
+     * dialog -- an in-game menu, the driver picker, the share chooser --
+     * is still open over the activity, and resuming then would run the
+     * game with audio behind a modal the player cannot dismiss by
+     * playing. The multi-window half mirrors SDL's own resume
+     * condition in handleNativeState() (SDLActivity.java:869,
+     * {@code mHasFocus || mHasMultiWindow}): in split-screen the
+     * unfocused pane is still visible, so the game keeps running.
+     * Note the condition here is the real one -- isInMultiWindowMode()
+     * -- not SDL's static mHasMultiWindow, which is just
+     * (SDK_INT >= 24) and therefore true on every device this APK can
+     * install on (minSdk 28): gating on it would make this whole check
+     * a no-op. isInMultiWindowMode() needs API 24; minSdk is 28, so no
+     * SDK guard is needed. hasWindowFocus() exists since API 1.
+     */
+    private boolean shouldResumeEmulation() {
+        return hasWindowFocus() || isInMultiWindowMode();
     }
 
     /**
@@ -303,10 +348,16 @@ public class MainActivity extends SDLActivity {
      * (Hunt v1.4.6 ronda 7, A4-R7-01.) The !mHasMultiWindow split the old
      * comment described is gone: the flag is (SDK_INT >= 24) and minSdk
      * is 28, so onPause/onResume used to never pause/resume and onStop
-     * was the only real pause. Now onPause, onResume and focus loss all
-     * pause/resume unconditionally; onStop/onStart keep their branches
-     * as a safety net and the overlap collapses to one native call via
-     * mEmulationPaused. Idempotence, verified in the SDK sources rather
+     * was the only real pause. Now onPause and focus loss pause
+     * unconditionally, onStop/onStart keep their branches as a safety
+     * net, and the overlap collapses to one native call via
+     * mEmulationPaused. (Hunt v1.4.6 ronda 8, A4-R8-01.) The resumes
+     * are NOT unconditional anymore: onResume/onStart only resume when
+     * shouldResumeEmulation() says the window has focus or the activity
+     * is genuinely in multi-window mode -- resuming without focus
+     * restarted the guest behind a dialog that was still open. The
+     * onWindowFocusChanged(true) callback is the resumer in the normal
+     * path. Idempotence, verified in the SDK sources rather
      * than assumed: AudioSystem::Pause/Resume, CommandProcessor::
      * Pause/Resume and XmaDecoder::Pause/Resume all early-return on
      * their paused_ flag, and GraphicsSystem::Pause only delegates to
@@ -363,10 +414,13 @@ public class MainActivity extends SDLActivity {
      * and bypasses this override, so a game-requested exit is still
      * immediate and never shows the dialog. A showing AlertDialog
      * (crash guard, graphics, ...) consumes the gesture itself to
-     * dismiss, so this only fires while actually playing. The game
-     * keeps running behind the dialog, like behind every other in-game
-     * dialog (an AlertDialog does not take window focus, so the A4-R7-01
-     * focus pause does not fire either).
+     * dismiss, so this only fires while actually playing. (Hunt v1.4.6
+     * ronda 8, A4-R8-01.) The R7-02 comment used to claim the game
+     * "keeps running behind the dialog" because "an AlertDialog does
+     * not take window focus" -- false on both counts: opening this
+     * dialog takes focus, so the A4-R7-01 focus pause parks the guest
+     * behind it, exactly like behind every other in-game dialog; the
+     * game resumes when the dialog is dismissed and focus returns.
      */
     @Override
     public void onBackPressed() {
