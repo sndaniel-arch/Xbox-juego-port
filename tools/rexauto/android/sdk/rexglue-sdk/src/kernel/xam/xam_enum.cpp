@@ -61,6 +61,14 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   // returned true without checking anything (same hole as the
   // GuestRangeAccessible copies). Validate both ends for ReadWrite.
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) The heap right after the start
+  // heap must be the end heap: anything else means the range spans
+  // three or more heaps (or a gap in the heap map) and the middle heap
+  // would go unchecked. Reject outright instead of validating only
+  // the two ends.
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
   return start_heap->QueryRangeAccess(guest_address, start_heap_end) ==
              rex::memory::PageAccess::kReadWrite &&
          end_heap->QueryRangeAccess(end_heap->heap_base(), high_address) ==
