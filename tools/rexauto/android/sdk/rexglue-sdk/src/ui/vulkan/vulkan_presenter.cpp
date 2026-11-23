@@ -355,9 +355,9 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
   static std::atomic<bool> logged_fsr2_fabricated_inputs = false;
   if (!logged_fsr2_fabricated_inputs.exchange(true)) {
     REXLOG_ERROR(
-    "VulkanPresenter: FSR2 temporal upscaling is disabled: no real "
-    "depth, motion vectors, jitter or camera state is available; "
-    "falling back to EASU");
+        "VulkanPresenter: FSR2 temporal upscaling is disabled: no real "
+        "depth, motion vectors, jitter or camera state is available; "
+        "falling back to EASU");
   }
   return false;
   if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
