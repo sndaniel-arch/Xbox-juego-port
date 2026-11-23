@@ -28,11 +28,104 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// (Hunt v1.4.6, ronda 8, A3-R8-02.) This file had no range helper:
+// every entry below only NULL-checked its guest pointers, and
+// TranslateVirtual never validates or returns null, so a wild
+// pointer SIGSEGVd the host. Same heap validation as A3-R4-07
+// (xam_app.cpp): reject a range that wraps past 4 GiB, starts or
+// ends outside any heap, or spans heaps of different kinds (or
+// two physical heaps); inside a single heap require the pages to
+// be accessible; across a heap boundary validate both ends
+// (A3-R8-13).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 8, A3-R8-02.) An X_ANSI_STRING guest struct
+// plus the bytes it points at: the 8-byte header first, then
+// length bytes at pointer. A NULL pointer or zero length means
+// "empty", which TranslateAnsiString* already tolerates.
+static bool GuestAnsiStringReadable(uint32_t guest_address) {
+  if (!guest_address) {
+    return true;
+  }
+  if (!GuestRangeReadable(guest_address, sizeof(X_ANSI_STRING))) {
+    return false;
+  }
+  auto* ansi = REX_KERNEL_MEMORY()->TranslateVirtual<const X_ANSI_STRING*>(guest_address);
+  uint32_t length = ansi->length;
+  if (!length) {
+    return true;
+  }
+  uint32_t pointer = ansi->pointer;
+  if (!pointer) {
+    return false;
+  }
+  return GuestRangeReadable(pointer, length);
+}
+
+
 u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_type_ptr, u32 unk,
                              mapped_u32 handle_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL handle_ptr used to write the
   // handle to guest address 0 on the success path.
   if (!handle_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -47,10 +140,20 @@ u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_
   if (!obj_attributes_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) The attributes struct (16 B)
+  // and the name string it points at are guest memory: validate
+  // both before the first read below.
+  if (!GuestRangeReadable(obj_attributes_ptr.guest_address(),
+                          sizeof(X_OBJECT_ATTRIBUTES))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   auto obj_attributes = REX_KERNEL_MEMORY()->TranslateVirtual<X_OBJECT_ATTRIBUTES*>(
       obj_attributes_ptr.guest_address());
   assert_true(obj_attributes->name_ptr != 0);
+  if (!GuestAnsiStringReadable(obj_attributes->name_ptr)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto name = util::TranslateAnsiStringAddress(REX_KERNEL_MEMORY(), obj_attributes->name_ptr);
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
@@ -63,6 +166,11 @@ u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_
 }
 
 u32 ObOpenObjectByPointer_entry(mapped_void object_ptr, mapped_u32 out_handle_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) GetNativeObject reads the
+  // 16-byte dispatch header before any type check.
+  if (!GuestRangeReadable(object_ptr.guest_address(), sizeof(X_DISPATCH_HEADER))) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
   auto object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
   if (!object) {
     return X_STATUS_UNSUCCESSFUL;
@@ -91,6 +199,9 @@ u32 ObLookupThreadByThreadId_entry(u32 thread_id, mapped_u32 out_object_ptr) {
   // out_object_ptr used to write the object pointer to guest address 0,
   // and retaining first would have leaked the reference on that path.
   if (!out_object_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestRangeWritable(out_object_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -162,6 +273,11 @@ u32 ObReferenceObjectByHandle_entry(u32 handle, u32 object_type_ptr, mapped_u32 
   if (!out_object_ptr.guest_address()) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) Validated before RetainHandle,
+  // so an invalid out-pointer cannot leak the reference.
+  if (!GuestRangeWritable(out_object_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   object->RetainHandle();
   *out_object_ptr = native_ptr;
   REXKRNL_IMPORT_RESULT("ObReferenceObjectByHandle", "0x0 obj={:#x}", native_ptr);
@@ -186,6 +302,12 @@ u32 ObDereferenceObject_entry(u32 native_ptr) {
     return 0;
   }
 
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) The u32 is an arbitrary guest
+  // address: GetNativeObject reads its 16-byte dispatch header.
+  if (!GuestRangeReadable(native_ptr, sizeof(X_DISPATCH_HEADER))) {
+    return 0;
+  }
+
   auto object = XObject::GetNativeObject<XObject>(
       REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(native_ptr));
   if (object) {
@@ -197,6 +319,12 @@ u32 ObDereferenceObject_entry(u32 native_ptr) {
 
 u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
                                ppc_ptr_t<X_ANSI_STRING> target_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) Both ANSI strings (8-byte
+  // header + bytes) are read by TranslateAnsiPath below.
+  if (!GuestAnsiStringReadable(path_ptr.guest_address()) ||
+      !GuestAnsiStringReadable(target_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto path = rex::string::utf8_canonicalize_guest_path(
       util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr));
   auto target = rex::string::utf8_canonicalize_guest_path(
@@ -214,6 +342,10 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
 }
 
 u32 ObDeleteSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) See ObCreateSymbolicLink.
+  if (!GuestAnsiStringReadable(path_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr);
   if (!REX_KERNEL_FS()->UnregisterSymbolicLink(path)) {
     return X_STATUS_UNSUCCESSFUL;
@@ -223,6 +355,14 @@ u32 ObDeleteSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr) {
 }
 
 u32 NtDuplicateObject_entry(u32 handle, mapped_u32 new_handle_ptr, u32 options) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) new_handle_ptr is written
+  // below; fail fast on an invalid pointer (NULL means "just
+  // close", and stays allowed -- no handle is duplicated or
+  // closed on this path).
+  if (new_handle_ptr &&
+      !GuestRangeWritable(new_handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // NOTE: new_handle_ptr can be zero to just close a handle.
   // NOTE: this function seems to be used to get the current thread handle
   //       (passed handle=-2).
@@ -256,6 +396,10 @@ u32 NtQueryEvent_entry(u32 handle, mapped_u32 out_struc) {
   // guarded but out_struc was not: a NULL out-pointer wrote the event
   // type/state through a null host pointer.
   if (!out_struc) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 8, A3-R8-02.) 8 bytes are written below.
+  if (!GuestRangeWritable(out_struc.guest_address(), 2 * sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
