@@ -329,9 +329,22 @@ class VulkanTextureCache final : public TextureCache {
     // Registers the partial-load watch (base range, and mips range when
     // the texture has one) if not already armed. No-op when already
     // armed: the watch survives across the submissions of one partial
-    // load. Must be called with the global critical region held, like
-    // MakeUpToDateAndWatch.
-    void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
+    // load. No lock is required from the caller, unlike
+    // DisarmEtc2PartialLoadWatch below: all six callers run on the
+    // command-processor thread without the global critical region, and
+    // SharedMemory::WatchMemoryRange takes it internally before touching
+    // the watch lists (shared_memory.cpp), so registration can never
+    // duplicate or corrupt a range. If a guest write fires between the
+    // handle read here and the registration, the worst case is a skipped
+    // re-arm: the callback already cleared the progress and set the
+    // invalidated flag, and the load's invalidation check discards the
+    // mixed work and re-arms in the same submission (texture_cache.cpp).
+    // The remaining formal data race on the plain handle members is
+    // benign on arm64 (aligned pointer, single-copy) and both values
+    // observed lead to a correct outcome; making the handles atomic is
+    // left as future hardening. (Hunt v1.4.6 round 9, A2-R9-08: this
+    // comment previously demanded the lock, which no caller held.)
+void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
     // Unregisters the partial-load watch, if armed. Called when the load
     // completes and from the destructor. The caller must hold the global
     // critical region (pass it in): the handle read and the unwatch must
