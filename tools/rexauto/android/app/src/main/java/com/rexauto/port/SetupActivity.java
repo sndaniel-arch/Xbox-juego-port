@@ -170,6 +170,13 @@ public class SetupActivity extends Activity {
      * else this screen can do for a broken FULL build.
      */
     private void showBundledAssetMissingError() {
+        // (Hunt v1.4.6 ronda 8, A4-R8-02.) Residuo de A4-R7-03: el
+        // guard exacto del patron A4-R6-07/A4-R7-03 (LogsDialog,
+        // GraphicsDialog). Sin el, un show() con la activity
+        // terminada/destruida tira WindowManager$BadTokenException.
+        // Corre en la cadena de onCreate, misma ventana estrecha que
+        // los dos gates que R7-03 si arreglo.
+        if (isFinishing() || isDestroyed()) return;
         new AlertDialog.Builder(this)
                 .setMessage(R.string.err_full_missing_asset)
                 .setPositiveButton(android.R.string.ok, (d, w) -> finish())
