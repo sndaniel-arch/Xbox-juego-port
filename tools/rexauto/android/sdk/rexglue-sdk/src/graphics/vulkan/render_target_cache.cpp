@@ -2162,6 +2162,12 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
         if (view_srgb != VK_NULL_HANDLE) {
           dfn.vkDestroyImageView(device, view_srgb, nullptr);
         }
+        if (view_depth_stencil != VK_NULL_HANDLE) {
+          dfn.vkDestroyImageView(device, view_depth_stencil, nullptr);
+        }
+        if (view_stencil != VK_NULL_HANDLE) {
+          dfn.vkDestroyImageView(device, view_stencil, nullptr);
+        }
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
         dfn.vkFreeMemory(device, memory, nullptr);
