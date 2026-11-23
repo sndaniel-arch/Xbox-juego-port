@@ -1472,7 +1472,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
       // Release the self-reference to the thread.
       thread->ReleaseHandle();
     });
-      // (Hunt v1.4.6, ronda 9, A3-R9-12.) Mirror A3-R8-11 in
+    // (Hunt v1.4.6, ronda 9, A3-R9-12.) Mirror A3-R8-11 in
     // XThread::Create: Thread::Create can return null (posix
     // threading_posix.cpp returns nullptr when Initialize fails),
     // and the assert below is a no-op in Release. Without this,
@@ -1490,7 +1490,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
       return nullptr;
     }
     assert_not_null(thread->thread_);
-  
+
     // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
     //             this needs to send a signal to the processor that a thread was started
   }
