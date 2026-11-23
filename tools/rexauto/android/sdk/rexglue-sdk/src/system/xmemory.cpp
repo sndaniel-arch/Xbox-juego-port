@@ -627,7 +627,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         uint32_t prev_sp = sp;
         // Read saved SP (at sp+0) and saved LR (at sp+4)
         uint32_t saved_sp = 0, saved_lr = 0;
-        if (prev_sp >= 0x10000000 && prev_sp < 0x20000000) &&
+        if (prev_sp >= 0x10000000 && prev_sp < 0x20000000 &&
             stack_slot_readable(prev_sp) && stack_slot_readable(prev_sp + 4)) {
           auto* sp_host = reinterpret_cast<uint8_t*>(virtual_membase_) + prev_sp;
           saved_sp = *reinterpret_cast<uint32_t*>(sp_host);
