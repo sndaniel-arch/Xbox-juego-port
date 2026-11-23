@@ -48,7 +48,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -67,7 +67,25 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
@@ -278,11 +296,27 @@ u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> lo
 }
 
 u32 XMAGetInputBufferReadOffset_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_read_offset;
 }
 
 u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_read_offset = value;
   context.Store(context_ptr);
@@ -291,6 +325,14 @@ u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
 }
 
 u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 packet_count) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint32_t buffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -312,11 +354,27 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
 }
 
 u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_0_valid;
 }
 
 u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_0_valid = 1;
   context.Store(context_ptr);
@@ -325,6 +383,14 @@ u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
 }
 
 u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 packet_count) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint32_t buffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -346,11 +412,27 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
 }
 
 u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_1_valid;
 }
 
 u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_1_valid = 1;
   context.Store(context_ptr);
@@ -359,11 +441,27 @@ u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
 }
 
 u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_valid;
 }
 
 u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_valid = 1;
   context.Store(context_ptr);
@@ -372,11 +470,27 @@ u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
 }
 
 u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_read_offset;
 }
 
 u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context and Store writes
+  // it back; validate it first, like XMAInitializeContext
+  // (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeWritable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_read_offset = value;
   context.Store(context_ptr);
@@ -385,11 +499,27 @@ u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
 }
 
 u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_write_offset;
 }
 
 u32 XMAGetPacketMetadata_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The XMA_CONTEXT_DATA
+  // ctor reads the whole 64-byte context; validate it first,
+  // like XMAInitializeContext (A3-R7-06). A getter on an
+  // invalid context reads as 0.
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return 0;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
   return context.packet_metadata;
 }
@@ -411,6 +541,13 @@ u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
 }
 
 u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-07.) The loop below rebuilds
+  // the 64-byte context on every iteration; validate it once
+  // up front, like XMAInitializeContext (A3-R7-06).
+  if (!context_ptr ||
+      !GuestRangeReadable(context_ptr.guest_address(), sizeof(XMA_CONTEXT_DATA))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   do {
     XMA_CONTEXT_DATA context(context_ptr);
     if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
