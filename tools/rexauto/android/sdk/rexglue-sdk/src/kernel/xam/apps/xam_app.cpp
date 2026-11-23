@@ -27,6 +27,9 @@ using namespace rex::system;
 // and never returns null, so a guest pointer + length that runs past
 // the end of the mapping SIGSEGVs the host on the memset/memcpy. Same
 // heap validation as A2-R3-01 (see xam_user.cpp for the full comment).
+// Guest-0 rejections here depend on protect_zero=true
+// (xmemory.cpp, A3-R8-15): if the zero page ever becomes
+// readable, guest address 0 stops being rejected.
 static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_address,
                                  size_t length, bool writable) {
   if (!length) {
@@ -37,7 +40,7 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = memory->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -55,7 +58,25 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 XamApp::XamApp(KernelState* kernel_state) : App(kernel_state, 0xFE) {}
