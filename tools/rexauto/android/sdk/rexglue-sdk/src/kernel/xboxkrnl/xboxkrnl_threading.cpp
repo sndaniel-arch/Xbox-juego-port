@@ -86,8 +86,10 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   // uncommitted or NoAccess sailed through every GuestRange* check.
   // Validate both ends instead: the tail of the start heap and the
   // head of the end heap, with the same read/write rule as above.
-  // (A range spanning more than two heaps still has only its two
-  // ends checked; no legitimate range spans even one boundary.)
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // two heaps is rejected outright below: the middle heap would
+  // otherwise go unchecked, and no legitimate range spans even
+  // one boundary (see the R8-13 comment above).
   auto range_ok = [&](rex::memory::PageAccess access) {
     if (start_physical) {
       return access == rex::memory::PageAccess::kReadWrite;
@@ -96,6 +98,14 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
                     : access != rex::memory::PageAccess::kNoAccess;
   };
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) The heap right after the start
+  // heap must be the end heap: anything else means the range spans
+  // three or more heaps (or a gap in the heap map) and the middle heap
+  // would go unchecked. Reject outright instead of validating only
+  // the two ends.
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
          range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
@@ -299,6 +309,15 @@ u32 ExTerminateThread_entry(u32 exit_code) {
 }
 
 u32 NtResumeThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) suspend_count_ptr is a 4-byte
+  // out-param written below even on the invalid-handle path; a wild
+  // pointer SIGSEGVs the host on a call that was going to fail
+  // anyway. Fail fast, NULL stays allowed (same contract as
+  // NtReleaseSemaphore, R8-03).
+  if (suspend_count_ptr &&
+      !GuestRangeWritable(suspend_count_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_RESULT result = X_STATUS_INVALID_HANDLE;
   uint32_t suspend_count = 0;
 
@@ -319,6 +338,18 @@ u32 NtResumeThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
 
 u32 KeResumeThread_entry(mapped_void thread_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) GetNativeObject reads the
+  // dispatch header of a wild pointer with no range check (see NOTES:
+  // validating inside GetNativeObject itself is unsafe because
+  // HostToGuestVirtual only corrects the vE0000000 host offset, so
+  // the entries validate instead, as ObOpenObjectByPointer already
+  // does in R8-02). The KTHREAD is a kernel struct (0xAB0 B,
+  // allocated by XThread::Create via CreateNative); Resume() touches
+  // fields past the header, so validate the whole struct. NULL keeps
+  // the existing INVALID_HANDLE path below.
+  if (thread_ptr && !GuestRangeWritable(thread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
   if (thread) {
     REXKRNL_TRACE("[KeResumeThread] ptr={:08X} thread={}", thread_ptr.guest_address(),
@@ -334,6 +365,12 @@ u32 KeResumeThread_entry(mapped_void thread_ptr) {
 }
 
 u32 NtSuspendThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) As in NtResumeThread_entry
+  // above: 4-byte out-param, written even on the invalid-handle path.
+  if (suspend_count_ptr &&
+      !GuestRangeWritable(suspend_count_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_RESULT result = X_STATUS_SUCCESS;
   uint32_t suspend_count = 0;
 
@@ -400,9 +437,22 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
   if (!thread || !current_thread) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-09.) UpdateGuestStackPointers writes
+  // the stack fields of the KTHREAD below; validate the whole struct
+  // first (see A3-R9-04 for why the whole KTHREAD, not just the
+  // header).
+  if (!GuestRangeWritable(thread.guest_address(), sizeof(X_KTHREAD))) {
+    return;
+  }
   auto context = current_thread->thread_state()->context();
-  auto pcr =
-      REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
+  uint32_t pcr_address = static_cast<uint32_t>(context->r13.u64);
+  // (Hunt v1.4.6, ronda 9, A3-R9-09.) UpdateGuestStackPointers also
+  // writes the PCR's stack pointers; r13 is guest-controlled, so the
+  // PCR address is validated the same way xeKfRaiseIrql validates it.
+  if (!GuestRangeWritable(pcr_address, sizeof(X_KPCR))) {
+    return;
+  }
+  auto pcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(pcr_address);
 
   UpdateGuestStackPointers(thread, pcr, context, stack_ptr.guest_address(),
                            stack_alloc_base.value(), stack_base.value(), stack_limit.value());
@@ -410,6 +460,19 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
 
 u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
                               mapped_u32 previous_affinity_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) previous_affinity_ptr is a
+  // 4-byte out-param (see the write below); fail fast before any
+  // other validation, NULL stays allowed (R8-03 contract).
+  if (previous_affinity_ptr &&
+      !GuestRangeWritable(previous_affinity_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeResumeThread_entry
+  // above: validate the whole KTHREAD before GetNativeObject reads
+  // its header.
+  if (thread_ptr && !GuestRangeWritable(thread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   REXKRNL_IMPORT_TRACE("KeSetAffinityThread", "thread={:#x} affinity={:#x}",
                        thread_ptr.guest_address(), (uint32_t)affinity);
   // The Xbox 360, according to disassembly of KeSetAffinityThread, unlike
@@ -437,6 +500,14 @@ u32 KeQueryBasePriorityThread_entry(mapped_void thread_ptr) {
   REXKRNL_IMPORT_TRACE("KeQueryBasePriorityThread", "thread={:#x}", thread_ptr.guest_address());
   int32_t priority = 0;
 
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeResumeThread_entry
+  // above: validate the whole KTHREAD before GetNativeObject reads
+  // its header. The failure value is the same 0 the not-found path
+  // below returns.
+  if (thread_ptr && !GuestRangeWritable(thread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    REXKRNL_IMPORT_RESULT("KeQueryBasePriorityThread", "{}", priority);
+    return priority;
+  }
   auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
   if (thread) {
     priority = thread->QueryPriority();
@@ -450,6 +521,14 @@ u32 KeSetBasePriorityThread_entry(mapped_void thread_ptr, u32 increment) {
   REXKRNL_IMPORT_TRACE("KeSetBasePriorityThread", "thread={:#x} increment={}",
                        thread_ptr.guest_address(), (int32_t)increment);
   int32_t prev_priority = 0;
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeResumeThread_entry
+  // above: validate the whole KTHREAD before GetNativeObject reads
+  // its header. The failure value is the same 0 the not-found path
+  // below returns.
+  if (thread_ptr && !GuestRangeWritable(thread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    REXKRNL_IMPORT_RESULT("KeSetBasePriorityThread", "prev_priority={}", prev_priority);
+    return prev_priority;
+  }
   auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
 
   if (thread) {
@@ -467,6 +546,13 @@ u32 KeSetDisableBoostThread_entry(ppc_ptr_t<X_KTHREAD> thread_ptr, u32 disabled)
   if (!thread_ptr) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) No GetNativeObject here, but
+  // the same wild-pointer hole: boost_disabled sits at offset 0xBB
+  // in the KTHREAD, so a header-only check would not cover the
+  // atomic exchange. Validate the whole KTHREAD (0xAB0 B).
+  if (!GuestRangeWritable(thread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    return 0;
+  }
   auto old_boost_disabled = reinterpret_cast<std::atomic_uint8_t*>(&thread_ptr->boost_disabled)
                                 ->exchange(static_cast<uint8_t>(disabled));
   return old_boost_disabled;
@@ -479,14 +565,28 @@ u32 KeGetCurrentProcessType_entry() {
     return 0;
   }
   auto context = current_thread->thread_state()->context();
-  auto pcr =
-      REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
+  uint32_t pcr_address = static_cast<uint32_t>(context->r13.u64);
+  // (Hunt v1.4.6, ronda 9, A3-R9-09.) r13 is guest-controlled; the
+  // PCR is dereferenced below, so validate it the same way
+  // xeKfRaiseIrql does.
+  if (!GuestRangeWritable(pcr_address, sizeof(X_KPCR))) {
+    return 0;
+  }
+  auto pcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(pcr_address);
 
   if (pcr->prcb_data.dpc_active) {
     return pcr->processtype_value_in_dpc;
   }
 
-  auto thread = REX_KERNEL_MEMORY()->TranslateVirtual<X_KTHREAD*>(pcr->prcb_data.current_thread);
+  // (Hunt v1.4.6, ronda 9, A3-R9-09.) current_thread is a second
+  // guest-controlled pointer: it is stored in the PCR by the kernel,
+  // but the guest can rewrite its own PCR. Validate the KTHREAD
+  // before dereferencing its process_type.
+  uint32_t current_thread_ptr = pcr->prcb_data.current_thread;
+  if (!GuestRangeReadable(current_thread_ptr, sizeof(X_KTHREAD))) {
+    return 0;
+  }
+  auto thread = REX_KERNEL_MEMORY()->TranslateVirtual<X_KTHREAD*>(current_thread_ptr);
   return thread->process_type;
 }
 
@@ -503,8 +603,16 @@ void KeSetCurrentProcessType_entry(u32 type) {
     return;
   }
   auto context = current_thread->thread_state()->context();
-  auto pcr =
-      REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
+  uint32_t pcr_address = static_cast<uint32_t>(context->r13.u64);
+  // (Hunt v1.4.6, ronda 9, A3-R9-09.) r13 is guest-controlled; the
+  // PCR is dereferenced below, so validate it the same way
+  // xeKfRaiseIrql does. The process type in the kernel state above
+  // is already set, matching the existing early return for a null
+  // current thread, so only the PCR write is skipped.
+  if (!GuestRangeWritable(pcr_address, sizeof(X_KPCR))) {
+    return;
+  }
+  auto pcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(pcr_address);
 
   if (pcr->prcb_data.dpc_active) {
     pcr->processtype_value_in_dpc = static_cast<uint8_t>(type);
@@ -523,6 +631,12 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
   // dereferenced unconditionally, and thread is null on a host thread
   // with no guest TLS.
   if (!interval_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) interval_ptr is an 8-byte
+  // in-param read by Delay() below; NULL is already rejected above,
+  // so a non-NULL pointer must name a readable range.
+  if (!GuestRangeReadable(interval_ptr.guest_address(), sizeof(uint64_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
   if (!thread) {
@@ -548,6 +662,11 @@ u32 NtYieldExecution_entry() {
 
 void KeQuerySystemTime_entry(mapped_u64 time_ptr) {
   uint64_t time = chrono::Clock::QueryGuestSystemTime();
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) time_ptr is an 8-byte out-param
+  // written below; NULL stays allowed (no time out), as before.
+  if (time_ptr && !GuestRangeWritable(time_ptr.guest_address(), sizeof(uint64_t))) {
+    return;
+  }
   if (time_ptr) {
     *time_ptr = time;
   }
@@ -634,6 +753,12 @@ void KeInitializeMutant_entry(ppc_ptr_t<X_DISPATCH_HEADER> mutant_ptr, u32 initi
   if (!mutant_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-03.) The writes below span the
+  // 16-byte dispatch header (Zero + type + signal_state); the sibling
+  // KeInitializeSemaphore already validates its struct (R8-03).
+  if (!GuestRangeWritable(mutant_ptr.guest_address(), sizeof(X_DISPATCH_HEADER))) {
+    return;
+  }
   mutant_ptr.Zero();
   mutant_ptr->type = 2;  // MutantObject
   mutant_ptr->signal_state = initial_owner ? 0 : 1;
@@ -648,6 +773,12 @@ void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 event_type, u32 
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) Zero() is null-safe, the header
   // writes below are not.
   if (!event_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-03.) The writes below span the whole
+  // X_KEVENT (16 B: the dispatch header); same shape as
+  // KeInitializeSemaphore (R8-03).
+  if (!GuestRangeWritable(event_ptr.guest_address(), sizeof(X_KEVENT))) {
     return;
   }
   event_ptr.Zero();
@@ -671,10 +802,23 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
 }
 
 u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) xeKeSetEvent below hands the
+  // pointer straight to GetNativeObject, which reads the dispatch
+  // header (and StashHandle writes it on first use). Validate the
+  // whole X_KEVENT here, where the guest address is known; the other
+  // xeKeSetEvent caller (ExReleaseReadWriteLock) passes a member of
+  // an ERWLOCK validated whole by A3-R9-08.
+  if (event_ptr && !GuestRangeWritable(event_ptr.guest_address(), sizeof(X_KEVENT))) {
+    return 0;
+  }
   return xeKeSetEvent(event_ptr, increment, wait);
 }
 
 u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeSetEvent_entry above.
+  if (event_ptr && !GuestRangeWritable(event_ptr.guest_address(), sizeof(X_KEVENT))) {
+    return 0;
+  }
   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
   if (!ev) {
     assert_always();
@@ -685,6 +829,10 @@ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
 }
 
 u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeSetEvent_entry above.
+  if (event_ptr && !GuestRangeWritable(event_ptr.guest_address(), sizeof(X_KEVENT))) {
+    return 0;
+  }
   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
   if (!ev) {
     assert_always();
@@ -751,10 +899,25 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) previous_state_ptr is a 4-byte
+  // out-param written by xeNtSetEvent below when the handle is valid.
+  // Validated here, where the guest address is still known (the
+  // callee only sees the translated host pointer); NULL stays
+  // allowed (R8-03 contract).
+  if (previous_state_ptr &&
+      !GuestRangeWritable(previous_state_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
 u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) As in NtSetEvent_entry above:
+  // 4-byte out-param, written below when the handle is valid.
+  if (previous_state_ptr &&
+      !GuestRangeWritable(previous_state_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
@@ -831,6 +994,15 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
 
 u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
                              u32 wait) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) xeKeReleaseSemaphore below hands
+  // the pointer straight to GetNativeObject; validate the whole
+  // X_KSEMAPHORE here, where the guest address is known. The other
+  // xeKeReleaseSemaphore caller (ExReleaseReadWriteLock) passes a
+  // member of an ERWLOCK validated whole by A3-R9-08.
+  if (semaphore_ptr &&
+      !GuestRangeWritable(semaphore_ptr.guest_address(), sizeof(X_KSEMAPHORE))) {
+    return 0;
+  }
   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
 }
 
@@ -1027,9 +1199,23 @@ u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u
 void KeInitializeTimerEx_entry(ppc_ptr_t<X_KTIMER> timer_ptr, u32 timer_type, u32 proc_type) {
   assert_true(timer_type == 0 || timer_type == 1);
   assert_true(proc_type < 3);
+  // (Hunt v1.4.6, ronda 9, A3-R9-03.) The asserts above are no-ops in
+  // Release: a timer_type >= 2 used to write header.type = type + 8
+  // (an object type that does not exist) and a proc_type >= 3 was
+  // truncated into the header. Reject with the same criterion
+  // NtCreateTimer_entry already enforces for timer_type (> 1), plus
+  // the proc_type < 3 bound the assert states.
+  if (timer_type > 1 || proc_type >= 3) {
+    return;
+  }
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) Every write below dereferences
   // timer_ptr with no check.
   if (!timer_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-03.) The writes below span the whole
+  // X_KTIMER (0x28 B: header + due_time + period).
+  if (!GuestRangeWritable(timer_ptr.guest_address(), sizeof(X_KTIMER))) {
     return;
   }
   // Other fields are unmodified; they must carry through multiple calls.
@@ -1057,6 +1243,12 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
   if (!due_time_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) due_time_ptr is an 8-byte
+  // in-param read below; NULL is already rejected above, so a
+  // non-NULL pointer must name a readable range.
+  if (!GuestRangeReadable(due_time_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t due_time = *due_time_ptr;
 
   X_STATUS result = X_STATUS_SUCCESS;
@@ -1073,6 +1265,14 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
 }
 
 u32 NtCancelTimer_entry(u32 timer_handle, mapped_u32 current_state_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-02.) current_state_ptr is a 4-byte
+  // out-param written below even on the invalid-handle path; fail
+  // fast, NULL stays allowed (same contract as NtReleaseSemaphore,
+  // R8-03).
+  if (current_state_ptr &&
+      !GuestRangeWritable(current_state_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto timer = REX_KERNEL_OBJECTS()->LookupObject<XTimer>(timer_handle);
@@ -1111,6 +1311,19 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-01.) timeout_ptr is dereferenced
+  // below with only a NULL check; a wild pointer SIGSEGVs the host
+  // on the read. NULL stays allowed (infinite wait), as before.
+  if (timeout_ptr && !GuestRangeReadable(timeout_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) object_ptr names an object of
+  // unknown type; xeKeWaitForSingleObject below hands it straight to
+  // GetNativeObject, which reads the dispatch header (and StashHandle
+  // writes it on first use). Validate at least the header here.
+  if (object_ptr && !GuestRangeWritable(object_ptr.guest_address(), sizeof(X_DISPATCH_HEADER))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -1125,6 +1338,12 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-01.) As in KeWaitForSingleObject_entry
+  // above: fail fast on a wild timeout pointer, before the handle
+  // lookup (same fail-fast contract as NtReleaseSemaphore, R8-03).
+  if (timeout_ptr && !GuestRangeReadable(timeout_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -1174,6 +1393,12 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
+    // (Hunt v1.4.6, ronda 9, A3-R9-04.) Each element is a guest object
+    // pointer read from the array validated above; GetNativeObject
+    // reads its dispatch header, so validate the header per element.
+    if (!GuestRangeWritable(objects_ptr[n], sizeof(X_DISPATCH_HEADER))) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
     auto object_ref = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
     if (!object_ref) {
@@ -1183,6 +1408,11 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
     objects.push_back(std::move(object_ref));
   }
 
+  // (Hunt v1.4.6, ronda 9, A3-R9-01.) As in KeWaitForSingleObject_entry
+  // above: the timeout is read below with only a NULL check.
+  if (timeout_ptr && !GuestRangeReadable(timeout_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
@@ -1246,6 +1476,11 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
                                    static_cast<size_t>(count) * sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-01.) As in KeWaitForSingleObject_entry
+  // above: the timeout is read below with only a NULL check.
+  if (timeout_ptr && !GuestRangeReadable(timeout_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);
@@ -1253,6 +1488,12 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
 
 u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
                                            u32 r6, mapped_u64 timeout_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-01.) As in KeWaitForSingleObject_entry
+  // above: fail fast on a wild timeout pointer, before the handle
+  // lookups (same fail-fast contract as NtReleaseSemaphore, R8-03).
+  if (timeout_ptr && !GuestRangeReadable(timeout_ptr.guest_address(), sizeof(uint64_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
@@ -1277,9 +1518,27 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
 // Guest-memory IRQL helpers - read/write current_irql directly from PCR.
 // Take PPCContext* explicitly so they work from any thread (including host threads
 // during InitializeGuestObject, dispatch thread creation, etc.).
+// (Hunt v1.4.6, ronda 9, A3-R9-09.) r13 is a guest-controlled GPR, and
+// the PCR it names is dereferenced below with no check. The PCR is
+// allocated by XThread::Create in the system heap (0x2D8 B, committed
+// read/write, v00000000), so a real PCR always passes
+// GuestRangeWritable(sizeof(X_KPCR)); anything else is not a PCR and
+// the write is skipped instead of SIGSEGVing the host. Validating
+// here (rather than caching the host PCR pointer in ThreadState) is
+// the smaller change: the PCR host pointer already lives in the
+// per-thread ThreadState, but every site below re-derives it from
+// r13, and the cached pointer would still have to be plumbed through
+// the PPCContext* callers that have no ThreadState (host threads).
+// Raise returns IRQL_PASSIVE (0) when there is no PCR to read an old
+// IRQL from; the spinlock itself still works, only the IRQL
+// bookkeeping is skipped.
 static unsigned char xeKfRaiseIrql(PPCContext* ctx, unsigned char new_irql) {
   auto* mem = rex::system::kernel_state()->memory();
-  auto pcr = mem->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  uint32_t pcr_address = static_cast<uint32_t>(ctx->r13.u64);
+  if (!GuestRangeWritable(pcr_address, sizeof(X_KPCR))) {
+    return 0;
+  }
+  auto pcr = mem->TranslateVirtual<X_KPCR*>(pcr_address);
   uint8_t old_irql = pcr->current_irql;
   pcr->current_irql = new_irql;
   return old_irql;
@@ -1287,7 +1546,11 @@ static unsigned char xeKfRaiseIrql(PPCContext* ctx, unsigned char new_irql) {
 
 static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   auto* mem = rex::system::kernel_state()->memory();
-  auto pcr = mem->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  uint32_t pcr_address = static_cast<uint32_t>(ctx->r13.u64);
+  if (!GuestRangeWritable(pcr_address, sizeof(X_KPCR))) {
+    return;
+  }
+  auto pcr = mem->TranslateVirtual<X_KPCR*>(pcr_address);
   pcr->current_irql = new_irql;
 }
 
@@ -1338,6 +1601,15 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
   if (!thread_guest_pointer) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) thread_guest_pointer is
+  // guest-controlled (it is read out of the APC struct itself); the
+  // spinlock below writes target_thread->apc_lock and the list insert
+  // writes its apc_lists, so the whole KTHREAD must be writable, not
+  // just readable. A system-heap APC (NtQueueApcThread) always names
+  // a real KTHREAD, so this passes for it.
+  if (!GuestRangeWritable(thread_guest_pointer, sizeof(X_KTHREAD))) {
+    return 0;
+  }
   auto* mem = rex::system::kernel_state()->memory();
   auto target_thread = mem->TranslateVirtual<X_KTHREAD*>(thread_guest_pointer);
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &target_thread->apc_lock);
@@ -1381,6 +1653,12 @@ u32 KfAcquireSpinLock_entry(mapped_u32 lock_ptr) {
   if (!lock_ptr) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-06.) The CAS below writes
+  // prcb_of_owner through host_address(); validate the 4-byte
+  // X_KSPINLOCK first.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_KSPINLOCK))) {
+    return 0;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   return xeKeKfAcquireSpinLock(current_ppc_context(), lock);
 }
@@ -1388,6 +1666,11 @@ u32 KfAcquireSpinLock_entry(mapped_u32 lock_ptr) {
 void KfReleaseSpinLock_entry(mapped_u32 lock_ptr, u32 old_irql) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
   if (!lock_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-06.) As in KfAcquireSpinLock_entry
+  // above: the release stores 0 to prcb_of_owner.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_KSPINLOCK))) {
     return;
   }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
@@ -1399,6 +1682,11 @@ void KeAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
   if (!lock_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-06.) As in KfAcquireSpinLock_entry
+  // above.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_KSPINLOCK))) {
+    return;
+  }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   xeKeKfAcquireSpinLock(current_ppc_context(), lock, false);
 }
@@ -1406,6 +1694,11 @@ void KeAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
 u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
   if (!lock_ptr) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-06.) As in KfAcquireSpinLock_entry
+  // above: the atomic_cas below writes prcb_of_owner.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_KSPINLOCK))) {
     return 0;
   }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
@@ -1420,6 +1713,11 @@ u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
 void KeReleaseSpinLockFromRaisedIrql_entry(mapped_u32 lock_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As KfAcquireSpinLock above.
   if (!lock_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-06.) As in KfReleaseSpinLock_entry
+  // above.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_KSPINLOCK))) {
     return;
   }
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
@@ -1496,6 +1794,11 @@ void KeInitializeApc_entry(ppc_ptr_t<XAPC> apc, mapped_void thread_ptr, mapped_v
   if (!apc) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) xeKeInitializeApc writes the
+  // whole 40-byte XAPC below.
+  if (!GuestRangeWritable(apc.guest_address(), sizeof(XAPC))) {
+    return;
+  }
   xeKeInitializeApc(apc.host_address(), thread_ptr.guest_address(), kernel_routine.guest_address(),
                     rundown_routine.guest_address(), normal_routine.guest_address(), processor_mode,
                     normal_context.guest_address());
@@ -1508,6 +1811,12 @@ u32 KeInsertQueueApc_entry(ppc_ptr_t<XAPC> apc, mapped_void arg1, mapped_void ar
   if (!apc) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) xeKeInsertQueueApc writes
+  // apc->arg1/arg2/enqueued below, and validates the thread pointer
+  // itself; the APC struct must be writable first.
+  if (!GuestRangeWritable(apc.guest_address(), sizeof(XAPC))) {
+    return 0;
+  }
   return xeKeInsertQueueApc(apc.host_address(), arg1.guest_address(), arg2.guest_address(),
                             priority_increment, current_ppc_context());
 }
@@ -1518,8 +1827,19 @@ u32 KeRemoveQueueApc_entry(ppc_ptr_t<XAPC> apc) {
   if (!apc) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) apc->thread_ptr is read below
+  // and apc->enqueued is written; validate the APC struct first.
+  if (!GuestRangeWritable(apc.guest_address(), sizeof(XAPC))) {
+    return 0;
+  }
   uint32_t thread_guest_pointer = apc->thread_ptr;
   if (!thread_guest_pointer) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) As in xeKeInsertQueueApc
+  // above: the spinlock below writes target_thread->apc_lock, so the
+  // whole KTHREAD must be writable before translating.
+  if (!GuestRangeWritable(thread_guest_pointer, sizeof(X_KTHREAD))) {
     return 0;
   }
   auto* ctx = current_ppc_context();
@@ -1548,6 +1868,11 @@ void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void
   if (!dpc) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) XDPC::Initialize writes
+  // type/routine/context below (sizeof(XDPC) = 28 B).
+  if (!GuestRangeWritable(dpc.guest_address(), sizeof(XDPC))) {
+    return;
+  }
   dpc->Initialize(routine.guest_address(), context.guest_address());
 }
 
@@ -1557,6 +1882,11 @@ u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) dpc->arg1/arg2 are written
   // below; a NULL dpc used to crash the host there.
   if (!dpc) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) dpc->arg1/arg2 are written
+  // below; validate the XDPC first.
+  if (!GuestRangeWritable(dpc.guest_address(), sizeof(XDPC))) {
     return 0;
   }
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
@@ -1584,6 +1914,12 @@ u32 KeRemoveQueueDpc_entry(ppc_ptr_t<XDPC> dpc) {
   // KeInsertQueueDpc (R3-07): a null DPC used to compute a list entry
   // at guest address 4 and walk the queue with it.
   if (!dpc) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-05.) This entry only derives the
+  // list-entry address from the DPC, but a wild pointer names no
+  // DPC at all; validate the struct for symmetry with its sisters.
+  if (!GuestRangeWritable(dpc.guest_address(), sizeof(XDPC))) {
     return 0;
   }
   bool result = false;
@@ -1618,6 +1954,13 @@ void ExInitializeReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   if (!lock_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) The writes below span the whole
+  // 0x38-byte X_ERWLOCK; validate it first. (This also covers the
+  // writer_event / reader_semaphore members passed to the KeInitialize
+  // entries below.)
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
+    return;
+  }
   lock_ptr->lock_count = -1;
   lock_ptr->writers_waiting_count = 0;
   lock_ptr->readers_waiting_count = 0;
@@ -1636,6 +1979,13 @@ void ExAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) &lock_ptr->spin_lock is taken
   // first thing below.
   if (!lock_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) The spinlock and counter
+  // accesses below span the whole 0x38-byte X_ERWLOCK; validate it
+  // first. (This also covers the &writer_event passed to
+  // xeKeWaitForSingleObject below.)
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
     return;
   }
   auto* ctx = current_ppc_context();
@@ -1658,6 +2008,11 @@ u32 ExTryToAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   if (!lock_ptr) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) As in
+  // ExAcquireReadWriteLockExclusive_entry above.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
+    return 0;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1676,6 +2031,12 @@ u32 ExTryToAcquireReadWriteLockExclusive_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 void ExAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
   if (!lock_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) As in
+  // ExAcquireReadWriteLockExclusive_entry above. (This also covers
+  // the &reader_semaphore passed to xeKeWaitForSingleObject below.)
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
     return;
   }
   auto* ctx = current_ppc_context();
@@ -1699,6 +2060,11 @@ u32 ExTryToAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   if (!lock_ptr) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) As in
+  // ExAcquireReadWriteLockExclusive_entry above.
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
+    return 0;
+  }
   auto* ctx = current_ppc_context();
   auto old_irql = xeKeKfAcquireSpinLock(ctx, &lock_ptr->spin_lock);
 
@@ -1719,6 +2085,13 @@ u32 ExTryToAcquireReadWriteLockShared_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
 void ExReleaseReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
   if (!lock_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-08.) As in
+  // ExAcquireReadWriteLockExclusive_entry above. (This also covers
+  // the &reader_semaphore / &writer_event passed to
+  // xeKeReleaseSemaphore / xeKeSetEvent below.)
+  if (!GuestRangeWritable(lock_ptr.guest_address(), sizeof(X_ERWLOCK))) {
     return;
   }
   auto* ctx = current_ppc_context();
@@ -1763,6 +2136,13 @@ u32 InterlockedPushEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr,
   if (!plist_ptr || !entry) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-07.) The CAS below writes the
+  // 8-byte header and entry->next is written in the loop; validate
+  // both structs first.
+  if (!GuestRangeWritable(plist_ptr.guest_address(), sizeof(X_SLIST_HEADER)) ||
+      !GuestRangeWritable(entry.guest_address(), sizeof(X_SINGLE_LIST_ENTRY))) {
+    return 0;
+  }
 
   alignas(8) X_SLIST_HEADER old_hdr = *plist_ptr;
   alignas(8) X_SLIST_HEADER new_hdr = {};
@@ -1786,6 +2166,11 @@ u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
   if (!plist_ptr) {
     return 0;
   }
+  // (Hunt v1.4.6, ronda 9, A3-R9-07.) The CAS below writes the
+  // 8-byte header; validate it first.
+  if (!GuestRangeWritable(plist_ptr.guest_address(), sizeof(X_SLIST_HEADER))) {
+    return 0;
+  }
 
   uint32_t popped = 0;
   alignas(8) X_SLIST_HEADER old_hdr = {0};
@@ -1794,6 +2179,12 @@ u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
     old_hdr = *plist_ptr;
     auto next = REX_KERNEL_MEMORY()->TranslateVirtual<X_SINGLE_LIST_ENTRY*>(old_hdr.next.next);
     if (!old_hdr.next.next) {
+      return 0;
+    }
+    // (Hunt v1.4.6, ronda 9, A3-R9-07.) `next` is a guest pointer
+    // read out of the list itself; validate it before reading
+    // next->next below.
+    if (!GuestRangeReadable(old_hdr.next.next, sizeof(X_SINGLE_LIST_ENTRY))) {
       return 0;
     }
     popped = old_hdr.next.next;
@@ -1810,6 +2201,11 @@ u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
 u32 InterlockedFlushSList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) As above.
   if (!plist_ptr) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 9, A3-R9-07.) The CAS below writes the
+  // 8-byte header; validate it first.
+  if (!GuestRangeWritable(plist_ptr.guest_address(), sizeof(X_SLIST_HEADER))) {
     return 0;
   }
 
@@ -1843,6 +2239,13 @@ REX_EXPORT_STUB(__imp__KeSetEventBoostPriority);
 REX_EXPORT_STUB(__imp__KiApcNormalRoutineNop_);
 
 u32 KeSuspendThread_entry(mapped_void kthread_ptr) {
+  // (Hunt v1.4.6, ronda 9, A3-R9-04.) As in KeResumeThread_entry
+  // above: validate the whole KTHREAD before GetNativeObject reads
+  // its header. The failure value is the same 0 the not-found path
+  // below returns.
+  if (kthread_ptr && !GuestRangeWritable(kthread_ptr.guest_address(), sizeof(X_KTHREAD))) {
+    return 0;
+  }
   auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), kthread_ptr);
   uint32_t old_suspend_count = 0;
 
