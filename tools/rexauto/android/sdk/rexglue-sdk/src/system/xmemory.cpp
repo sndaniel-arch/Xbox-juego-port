@@ -620,8 +620,8 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         }
         HeapAllocationInfo info{};
         return stack_heap->QueryRegionInfo(address, &info) &&
-                 (info.state & kMemoryAllocationCommit) &&
-                 (info.protect & kMemoryProtectRead);
+               (info.state & kMemoryAllocationCommit) &&
+               (info.protect & kMemoryProtectRead);
       };
       for (int i = 0; i < 16; i++) {
         uint32_t prev_sp = sp;
@@ -1750,15 +1750,14 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) >> page_size_shift_;
-  if (base_page_number >= page_table_.size() {
+  if (base_page_number >= page_table_.size()) {
     // Below heap_base_ the subtraction wraps to a huge index; past the
     // end of the heap it is simply out of range. Either way there is no
     // page entry to read. (Hunt v1.4.6 round 9, A2-R9-03.)
     REXSYS_ERROR("BaseHeap::Release failed because address is out of range");
     return false;
   }
-    
-  auto base_page_entry = page_table_[base_page_number];
+      auto base_page_entry = page_table_[base_page_number];
   if (base_page_entry.base_address != base_page_number) {
     REXSYS_ERROR("BaseHeap::Release failed because address is not a region start");
     return false;
