@@ -37,6 +37,72 @@ namespace rex {
 namespace kernel {
 namespace xam {
 
+// (Hunt v1.4.6, ronda 8, A3-R8-06.) This file had no range helper:
+// every entry below only NULL-checked its guest pointers, and
+// TranslateVirtual never validates or returns null, so a wild
+// pointer SIGSEGVd the host. Same heap validation as A3-R4-07
+// (xam_app.cpp): reject a range that wraps past 4 GiB, starts or
+// ends outside any heap, or spans heaps of different kinds (or
+// two physical heaps); inside a single heap require the pages to
+// be accessible; across a heap boundary validate both ends
+// (A3-R8-13).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+    if (!length) {
+          return true;
+    }
+    if (length > UINT32_MAX - guest_address) {
+          return false;
+      }
+    uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+    rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+    rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+    if (!start_heap || !end_heap) {
+          return false;
+    }
+    bool start_physical =
+        start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+    bool end_physical =
+        end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+    if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+          return false;
+      }
+    if (start_heap == end_heap) {
+          auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+          if (start_physical) {
+                  return access == rex::memory::PageAccess::kReadWrite;
+          }
+          return writable ? access == rex::memory::PageAccess::kReadWrite
+                                : access != rex::memory::PageAccess::kNoAccess;
+    }
+    // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+    // boundary -- legitimate allocations never do (each allocation
+    // lives in a single heap) -- and the old code returned true here
+    // without checking anything, so a buffer whose first page is
+    // uncommitted or NoAccess sailed through every GuestRange* check.
+    // Validate both ends instead: the tail of the start heap and the
+    // head of the end heap, with the same read/write rule as above.
+    // (A range spanning more than two heaps still has only its two
+    // ends checked; no legitimate range spans even one boundary.)
+    auto range_ok = [&](rex::memory::PageAccess access) {
+          if (start_physical) {
+                  return access == rex::memory::PageAccess::kReadWrite;
+          }
+          return writable ? access == rex::memory::PageAccess::kReadWrite
+                                : access != rex::memory::PageAccess::kNoAccess;
+    };
+    uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+    return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+               range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+    return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+    return GuestRangeAccessible(guest_address, length, true);
+}
+
 // Table lookups.
 
 uint8_t xeXamGetOnlineCountryFromLocale(uint8_t id) {
@@ -242,7 +308,15 @@ u32 XamGetOnlineCountryString_entry(u32 id, u32 buffer_length, mapped_wstring bu
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -266,7 +340,15 @@ u32 XamGetCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) 
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -290,7 +372,15 @@ u32 XamGetLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer)
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -320,7 +410,15 @@ u32 XamGetLanguageLocaleString_entry(u32 language_id, u32 locale_id, u32 buffer_
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -350,7 +448,15 @@ u32 XamGetOnlineLanguageAndCountryString_entry(u32 language_id, u32 country_id, 
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -374,7 +480,15 @@ u32 XamGetLocaleString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
@@ -406,7 +520,15 @@ u32 XamGetOnlineLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring b
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
-  memory::store_and_swap<std::u16string>(buffer, value);
+  // (Hunt v1.4.6, ronda 8, A3-R8-06.) The buffer is written below
+    // ((value.size() + 1) u16, NUL included); validate the range
+    // before the first store.
+    if (!GuestRangeWritable(buffer.guest_address(),
+                                (value.size() + 1) * sizeof(char16_t))) {
+          return X_E_INVALIDARG;
+    }
+  
+    memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
 }
