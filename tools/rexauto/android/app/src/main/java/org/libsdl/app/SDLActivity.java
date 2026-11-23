@@ -417,6 +417,12 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                     }
                 });
            dlgAlert.setCancelable(false);
+           // (Hunt v1.4.6 ronda 8, A4-R8-02.) Residuo de A4-R7-03: el
+           // guard exacto del patron A4-R6-07/A4-R7-03. Sin el, un
+           // show() con la activity terminada/destruida tira
+           // WindowManager$BadTokenException. Tambien en onCreate,
+           // misma ventana estrecha que los gates de app.
+           if (isFinishing() || isDestroyed()) return;
            dlgAlert.create().show();
 
            return;
@@ -1647,6 +1653,22 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     }
 
     protected void messageboxCreateAndShow(Bundle args) {
+
+        // (Hunt v1.4.6 ronda 8, A4-R8-02.) Residuo de A4-R7-03: el guard
+        // exacto del patron A4-R6-07/A4-R7-03 -- sin el, un show() con
+        // la activity terminada/destruida tira
+        // WindowManager$BadTokenException. OJO: messageboxShowMessageBox
+        // tiene al hilo llamador (JNI) bloqueado en
+        // messageboxSelection.wait() hasta que el dialogo se descarte;
+        // si no se muestra el dialogo hay que despertar ese hilo aqui
+        // mismo (notify), o el llamador quedaria bloqueado para siempre.
+        // La seleccion queda en -1, el valor de "sin eleccion".
+        if (isFinishing() || isDestroyed()) {
+            synchronized (messageboxSelection) {
+                messageboxSelection.notify();
+            }
+            return;
+        }
 
         // TODO set values from "flags" to messagebox dialog
 
