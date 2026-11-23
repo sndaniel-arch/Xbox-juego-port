@@ -60,8 +60,25 @@ public final class LogsDialog {
             long from = Math.max(0, len - maxChars);
             raf.seek(from);
             byte[] buf = new byte[(int) (len - from)];
-            raf.readFully(buf);
-            return new String(buf, java.nio.charset.StandardCharsets.UTF_8);
+            // (Hunt v1.4.6 ronda 8, A4-R8-03.) Misma familia que el
+            // readHeader de StfsExtractor: el readFully() de antes
+            // tiraba EOFException en lectura corta (log truncado a
+            // mitad de escritura, o fichero encogido entre length()
+            // y la lectura) y el catch lo convertia en texto vacio --
+            // el visor mostraba "log vacio" en vez del contenido
+            // parcial. Leer en bucle y devolver lo que si se leyo;
+            // solo el camino corto anade el marcador de truncado.
+            // Camino normal (lectura completa) y log vacio real
+            // (len 0 -> buf vacio -> "") quedan exactamente igual.
+            int got = 0;
+            while (got < buf.length) {
+                int n = raf.read(buf, got, buf.length - got);
+                if (n <= 0) break;
+                got += n;
+            }
+            String text = new String(buf, 0, got, java.nio.charset.StandardCharsets.UTF_8);
+            if (got < buf.length) text += "\n[registro truncado durante la lectura]";
+            return text;
         } catch (Exception e) {
             return "";
         }
