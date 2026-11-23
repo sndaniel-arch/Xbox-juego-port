@@ -43,7 +43,7 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -57,7 +57,14 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
     return start_heap->QueryRangeAccess(guest_address, high_address) ==
            rex::memory::PageAccess::kReadWrite;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) Cross-heap range: the old code
+  // returned true without checking anything (same hole as the
+  // GuestRangeAccessible copies). Validate both ends for ReadWrite.
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return start_heap->QueryRangeAccess(guest_address, start_heap_end) ==
+             rex::memory::PageAccess::kReadWrite &&
+         end_heap->QueryRangeAccess(end_heap->heap_base(), high_address) ==
+             rex::memory::PageAccess::kReadWrite;
 }
 
 // https://github.com/LestaD/SourceEngine2007/blob/master/se2007/engine/xboxsystem.cpp#L518
