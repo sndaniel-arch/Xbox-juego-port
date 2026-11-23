@@ -55,7 +55,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -73,7 +73,25 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+  }
+      return writable ? access == rex::memory::PageAccess::kReadWrite
+                        : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
@@ -645,7 +663,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     } else if (buffer_size_check) {
       uint32_t high_address = buffer_guest + static_cast<uint32_t>(buffer_size_check) - 1;
       rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(buffer_guest);
-      const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+    rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
       range_ok = start_heap && end_heap;
       if (range_ok) {
         bool start_physical =
@@ -657,6 +675,15 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
       if (range_ok && start_heap == end_heap) {
         range_ok = start_heap->QueryRangeAccess(buffer_guest, high_address) ==
                    rex::memory::PageAccess::kReadWrite;
+      } else if (range_ok) {
+        // (Hunt v1.4.6, ronda 8, A3-R8-13.) Cross-heap range: the
+        // old code left range_ok true without checking anything.
+        // Validate both ends for ReadWrite, as above.
+        uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+        range_ok = start_heap->QueryRangeAccess(buffer_guest, start_heap_end) ==
+                         rex::memory::PageAccess::kReadWrite &&
+                     end_heap->QueryRangeAccess(end_heap->heap_base(), high_address) ==
+                         rex::memory::PageAccess::kReadWrite;
       }
     }
     if (!range_ok) {
