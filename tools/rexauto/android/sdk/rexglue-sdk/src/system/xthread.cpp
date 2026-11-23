@@ -1380,11 +1380,24 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
   thread->kernel_state_ = kernel_state;
 
   if (!thread->RestoreObject(stream)) {
+    // (Hunt v1.4.6, ronda 9, A3-R9-12.) The `new` above leaks on
+    // this path: no object_ref ever wraps the thread. Drop the
+    // object-table entry first (RestoreObject may already have
+    // restored handles into it; Delete is a no-op with no handles),
+    // then free the object itself -- the same delete-and-nullptr
+    // pattern XFile::Restore uses (A2-R6-10).
+    thread->Delete();
+    delete thread;
     return nullptr;
   }
 
   if (stream->Read<uint32_t>() != kThreadSaveSignature) {
     REXSYS_ERROR("Could not restore XThread - invalid magic!");
+    // (Hunt v1.4.6, ronda 9, A3-R9-12.) As above: RestoreObject
+    // already succeeded, so the handles ARE in the object table --
+    // Delete removes the entry before the object is freed.
+    thread->Delete();
+    delete thread;
     return nullptr;
   }
 
@@ -1459,8 +1472,25 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
       // Release the self-reference to the thread.
       thread->ReleaseHandle();
     });
+      // (Hunt v1.4.6, ronda 9, A3-R9-12.) Mirror A3-R8-11 in
+    // XThread::Create: Thread::Create can return null (posix
+    // threading_posix.cpp returns nullptr when Initialize fails),
+    // and the assert below is a no-op in Release. Without this,
+    // Restore hands back a registered thread with running_ == true
+    // and thread_ == nullptr, and the RetainHandle above is never
+    // released (the lambda that would release it never runs).
+    // NOTE: no `delete thread` here, unlike the two early returns
+    // above -- RestoreObject already Retain'd this thread into the
+    // object table, so deleting it would dangle the table entry; the
+    // restore aborts on the nullptr return (KernelState::Restore),
+    // exactly as it does for every other failed object restore.
+    if (!thread->thread_) {
+      REXSYS_ERROR("Could not restore XThread - thread creation failed!");
+      thread->ReleaseHandle();
+      return nullptr;
+    }
     assert_not_null(thread->thread_);
-
+  
     // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
     //             this needs to send a signal to the processor that a thread was started
   }
