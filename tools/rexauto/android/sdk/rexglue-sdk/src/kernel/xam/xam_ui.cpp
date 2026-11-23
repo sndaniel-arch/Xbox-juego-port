@@ -80,7 +80,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   // uncommitted or NoAccess sailed through every GuestRange* check.
   // Validate both ends instead: the tail of the start heap and the
   // head of the end heap, with the same read/write rule as above.
-    // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
   // two heaps is rejected outright below: the middle heap would
   // otherwise go unchecked, and no legitimate range spans even
   // one boundary (see the R8-13 comment above).
@@ -695,7 +695,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
         // end heap, or the range spans three or more heaps (or a
         // gap) and the middle heap would go unchecked.
         range_ok = REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) == end_heap &&
-                     start_heap->QueryRangeAccess(buffer_guest, start_heap_end) ==
+                   start_heap->QueryRangeAccess(buffer_guest, start_heap_end) ==
                        rex::memory::PageAccess::kReadWrite &&
                    end_heap->QueryRangeAccess(end_heap->heap_base(), high_address) ==
                        rex::memory::PageAccess::kReadWrite;
