@@ -259,7 +259,25 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // TODO: set_can_debugger_suspend not yet ported
   // vsync_worker_thread_->set_can_debugger_suspend(true);
   vsync_worker_thread_->set_name("GPU VSync");
-  vsync_worker_thread_->Create();
+  // (Caza v1.4.6 ronda 9, A1-R9-02.) XThread::Create() can fail
+  // (X_STATUS_NO_MEMORY when the KTHREAD object, stack, TLS block, PCR
+  // block, or host thread cannot be allocated — xthread.cpp:335): the old
+  // code ignored the return and reported X_STATUS_SUCCESS, so the game
+  // ran with no vblank worker at all — MarkVblank() never ran, no vblank
+  // interrupt ever fired, and a title waiting on vblank hung on a black
+  // screen with no log pointing at the cause. Fail setup instead: the
+  // caller (Runtime::Setup, via IGraphicsSystem::Setup) logs "GPU setup
+  // failed" and shuts down. Drop the half-created thread first so
+  // Shutdown() — which Waits on vsync_worker_thread_ when set — never
+  // touches a thread that was never created, and clear the running flag
+  // the worker lambda reads. Same shape as the kernel dispatch thread
+  // failure path (kernel_state.cpp).
+  if (XFAILED(vsync_worker_thread_->Create())) {
+    REXGPU_ERROR("Unable to create GPU vblank worker thread");
+    vsync_worker_running_ = false;
+    vsync_worker_thread_.reset();
+    return X_STATUS_UNSUCCESSFUL;
+  }
 
   return X_STATUS_SUCCESS;
 }
