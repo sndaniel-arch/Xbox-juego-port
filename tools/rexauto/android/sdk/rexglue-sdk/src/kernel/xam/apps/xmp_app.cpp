@@ -133,7 +133,7 @@ static bool LoadGuestU16StringBounded(rex::memory::Memory* memory, uint32_t gues
     }
     const uint16_t* host =
         memory->TranslateVirtual<const uint16_t*>(guest_ptr + static_cast<uint32_t>(
-                                                                                    i * sizeof(uint16_t)));
+                                                                i * sizeof(uint16_t)));
     uint16_t c = memory::load_and_swap<uint16_t>(host);
     if (!c) {
       return true;
@@ -198,7 +198,7 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
     // arrays up front with 64-bit math, so a wrapped count cannot slip
     // through. (The per-song u16string scans inside the loop were
     // the documented V-R6-02 residue; ronda 8, A3-R8-04, bounds
-    // them below -- see LoadGuestU16StringBounded above.
+    // them below -- see LoadGuestU16StringBounded above.)
     constexpr uint32_t kMaxPlaylistSongs = 1024;
     if (song_count > kMaxPlaylistSongs) {
       return X_E_INVALIDARG;
