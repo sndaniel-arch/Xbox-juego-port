@@ -37,7 +37,7 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = memory->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -55,7 +55,25 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(rex::memory::Memory* memory, uint32_t guest_address,
@@ -112,9 +130,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0008: {
       // (Hunt v1.4.6, ronda 7, A3-R7-02.) Validate the 8-byte message
-      // struct before reading it (XamApp pattern, A3-R4-07). The
-      // achievements array itself is already validated below (cap
-      // 1000 + LookupHeap on both ends); the struct was not.
+      // struct before reading it (XamApp pattern, A3-R4-07).
+      // (Ronda 8, A3-R8-12: the array check below no longer uses
+      // LookupHeap -- see below.)
       if (!GuestRangeReadable(memory_, buffer_ptr, 8)) {
         return X_E_INVALIDARG;
       }
@@ -140,8 +158,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                        achievement_count);
           return X_E_FAIL;
         }
-        uint32_t span_end = achievements_ptr + achievement_count * kEntryStride - 1;
-        if (!memory_->LookupHeap(achievements_ptr) || !memory_->LookupHeap(span_end)) {
+        // (Hunt v1.4.6, ronda 8, A3-R8-12.) LookupHeap only proves
+        // the address falls inside a heap range, not that the pages
+        // are committed and accessible: a pointer inside a heap but
+        // on NoAccess pages passed both checks and the load loop
+        // below SIGSEGVd the host. Validate the whole array for
+        // readability instead (count is already capped at 1000
+        // above, so count*8 cannot wrap past the range check).
+        if (!GuestRangeReadable(memory_, achievements_ptr,
+                                static_cast<size_t>(achievement_count) * kEntryStride)) {
           REXKRNL_WARN("XGIUserWriteAchievements: ptr {:08X} OOB", achievements_ptr);
           return X_E_FAIL;
         }
