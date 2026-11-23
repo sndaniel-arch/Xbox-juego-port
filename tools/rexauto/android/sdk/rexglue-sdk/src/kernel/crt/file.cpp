@@ -48,7 +48,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -67,7 +67,25 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+}
+      return writable ? access == rex::memory::PageAccess::kReadWrite
+                        : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
@@ -178,7 +196,15 @@ u32 CreateFileA_entry(mapped_string lpFileName, u32 dwDesiredAccess, u32 dwShare
 
 u32 ReadFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToRead,
                    mapped_u32 lpNumberOfBytesRead, mapped_void lpOverlapped) {
-  auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
+  // (Hunt v1.4.6, ronda 8, A3-R8-08.) lpNumberOfBytesRead is written
+  // on both paths below (0 on invalid handle, the count otherwise);
+  // validate it up front instead of writing through a wild pointer.
+  // (NULL stays allowed: no count out.)
+  if (lpNumberOfBytesRead &&
+        !GuestRangeWritable(lpNumberOfBytesRead.guest_address(), sizeof(uint32_t)) {
+    return 0;
+  }
+      auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file) {
     REXKRNL_WARN("rexcrt_ReadFile: invalid handle {:#x}", static_cast<uint32_t>(hFile));
     if (lpNumberOfBytesRead)
@@ -219,6 +245,11 @@ u32 ReadFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToRead,
 
 u32 WriteFile_entry(u32 hFile, mapped_void lpBuffer, u32 nNumberOfBytesToWrite,
                     mapped_u32 lpNumberOfBytesWritten, mapped_void lpOverlapped) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-08.) See ReadFile above.
+  if (lpNumberOfBytesWritten &&
+        !GuestRangeWritable(lpNumberOfBytesWritten.guest_address(), sizeof(uint32_t))) {
+        return 0;
+  }
   auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file) {
     if (lpNumberOfBytesWritten)
