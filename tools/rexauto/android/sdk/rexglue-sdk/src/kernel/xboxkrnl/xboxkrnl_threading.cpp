@@ -61,7 +61,7 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
   }
   uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
   rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
-  const rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
   if (!start_heap || !end_heap) {
     return false;
   }
@@ -79,11 +79,69 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
     return writable ? access == rex::memory::PageAccess::kReadWrite
                     : access != rex::memory::PageAccess::kNoAccess;
   }
-  return true;
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (A range spanning more than two heaps still has only its two
+  // ends checked; no legitimate range spans even one boundary.)
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
 static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 8, A3-R8-03.) An X_ANSI_STRING guest struct
+// plus the bytes it points at, and the X_OBJECT_ATTRIBUTES struct
+// that carries it: the 16-byte struct first, then the name string.
+// A NULL pointer means "no name", which LookupNamedObject already
+// tolerates (it returns nullptr for a NULL attributes pointer).
+static bool GuestAnsiStringReadable(uint32_t guest_address) {
+  if (!guest_address) {
+    return true;
+  }
+  if (!GuestRangeReadable(guest_address, sizeof(X_ANSI_STRING))) {
+    return false;
+  }
+  auto* ansi = REX_KERNEL_MEMORY()->TranslateVirtual<const X_ANSI_STRING*>(guest_address);
+  uint32_t length = ansi->length;
+  if (!length) {
+    return true;
+  }
+  uint32_t pointer = ansi->pointer;
+  if (!pointer) {
+    return false;
+  }
+  return GuestRangeReadable(pointer, length);
+}
+
+static bool GuestObjectAttributesReadable(uint32_t guest_address) {
+  if (!guest_address) {
+    return true;
+  }
+  if (!GuestRangeReadable(guest_address, sizeof(X_OBJECT_ATTRIBUTES))) {
+    return false;
+  }
+  auto* attrs =
+      REX_KERNEL_MEMORY()->TranslateVirtual<const X_OBJECT_ATTRIBUTES*>(guest_address);
+  return GuestAnsiStringReadable(attrs->name_ptr);
 }
 
 // r13 + 0x100: pointer to thread local state
@@ -128,6 +186,15 @@ object_ref<T> LookupNamedObject(KernelState* kernel_state, uint32_t obj_attribut
   if (!obj_attributes_ptr) {
     return nullptr;
   }
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) The attributes struct and its
+  // name string are guest memory; the old code read both with only
+  // the assert_true above, a no-op in Release. The NtCreate*
+  // entries below reject an invalid pointer up front; this check is
+  // defense in depth for future callers (nullptr here means "no
+  // named object", as before).
+  if (!GuestObjectAttributesReadable(obj_attributes_ptr)) {
+    return nullptr;
+  }
   auto obj_attributes =
       kernel_state->memory()->TranslateVirtual<X_OBJECT_ATTRIBUTES*>(obj_attributes_ptr);
   assert_true(obj_attributes->name_ptr != 0);
@@ -155,6 +222,12 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
       "ExCreateThread", "stack={:#x} xapi_startup={:#x} start={:#x} context={:#x} flags={:#x}",
       (uint32_t)stack_size, (uint32_t)xapi_thread_startup, start_address.guest_address(),
       start_context.guest_address(), (uint32_t)creation_flags);
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) Both out-params are written
+  // on success (NULL stays allowed for either).
+  if ((handle_ptr && !GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) ||
+      (thread_id_ptr && !GuestRangeWritable(thread_id_ptr.guest_address(), sizeof(uint32_t)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // http://jafile.com/uploads/scoop/main.cpp.txt
   // DWORD
   // LPHANDLE Handle,
@@ -623,6 +696,15 @@ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
 
 u32 NtCreateEvent_entry(mapped_u32 handle_ptr, ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
                         u32 event_type, u32 initial_state) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) handle_ptr is written on
+  // every success path below (NULL stays allowed: no handle out);
+  // obj_attributes is read by LookupNamedObject and SetAttributes.
+  if (handle_ptr && !GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestObjectAttributesReadable(obj_attributes_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Check for an existing timer with the same name.
   auto existing_object =
       LookupNamedObject<XEvent>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
@@ -712,6 +794,12 @@ void KeInitializeSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 coun
   if (!semaphore_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) The three writes below span
+  // sizeof(X_KSEMAPHORE) (20 B: header type/signal_state at +0/+4
+  // and limit at +0x10), not just the 12 bytes written.
+  if (!GuestRangeWritable(semaphore_ptr.guest_address(), sizeof(X_KSEMAPHORE))) {
+    return;
+  }
   semaphore_ptr->header.type = 5;  // SemaphoreObject
   semaphore_ptr->header.signal_state = (uint32_t)count;
   semaphore_ptr->limit = (uint32_t)limit;
@@ -748,6 +836,13 @@ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 incremen
 
 u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u32 count,
                             u32 limit) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) See NtCreateEvent above.
+  if (handle_ptr && !GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestObjectAttributesReadable(obj_attributes_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Check for an existing semaphore with the same name.
   auto existing_object =
       LookupNamedObject<XSemaphore>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
@@ -785,6 +880,14 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
 }
 
 u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) previous_count_ptr is written
+  // on every path below, including the invalid-handle path (which
+  // used to write 0 through a wild pointer before failing). Fail
+  // fast: no release happens on an invalid out-pointer.
+  if (previous_count_ptr &&
+      !GuestRangeWritable(previous_count_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
   int32_t previous_count = 0;
 
@@ -806,6 +909,13 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
 
 u32 NtCreateMutant_entry(mapped_u32 handle_out, ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attributes,
                          u32 initial_owner) {
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) See NtCreateEvent above.
+  if (handle_out && !GuestRangeWritable(handle_out.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestObjectAttributesReadable(obj_attributes.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Check for an existing timer with the same name.
   auto existing_object =
       LookupNamedObject<XMutant>(REX_KERNEL_STATE(), obj_attributes.guest_address());
@@ -870,6 +980,13 @@ u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 8, A3-R8-03.) See NtCreateEvent above.
+  if (handle_ptr && !GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!GuestObjectAttributesReadable(obj_attributes_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Check for an existing timer with the same name.
   auto existing_object =
       LookupNamedObject<XTimer>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
