@@ -65,7 +65,7 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
   // uncommitted or NoAccess sailed through every GuestRange* check.
   // Validate both ends instead: the tail of the start heap and the
   // head of the end heap, with the same read/write rule as above.
-    // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
   // two heaps is rejected outright below: the middle heap would
   // otherwise go unchecked, and no legitimate range spans even
   // one boundary (see the R8-13 comment above).
@@ -82,7 +82,7 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
   // three or more heaps (or a gap in the heap map) and the middle heap
   // would go unchecked. Reject outright instead of validating only
   // the two ends.
-  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+  if (memory->LookupHeap(start_heap_end + 1) != end_heap) {
     return false;
   }
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
