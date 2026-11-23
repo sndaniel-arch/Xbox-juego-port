@@ -126,12 +126,12 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-// (Hunt v1.4.6, ronda 8, A3-R8-05.) The driver memsets the whole
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) The driver memsets the whole
   // 20-byte capabilities struct through this pointer.
   if (!GuestRangeWritable(caps.guest_address(), sizeof(X_INPUT_CAPABILITIES))) {
     return X_ERROR_BAD_ARGUMENTS;
   }
-  
+
   uint32_t actual_user_index = user_index;
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
@@ -160,7 +160,7 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
   }
 
   (void)unk;  // Unused in this implementation
-// (Hunt v1.4.6, ronda 8, A3-R8-05.) See GetCapabilities above.
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) See GetCapabilities above.
   if (!GuestRangeWritable(caps.guest_address(), sizeof(X_INPUT_CAPABILITIES))) {
     return X_ERROR_BAD_ARGUMENTS;
   }
@@ -188,7 +188,7 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     actual_user_index = 0;
   }
 
-// (Hunt v1.4.6, ronda 8, A3-R8-05.) GetState writes the 16-byte
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) GetState writes the 16-byte
   // state when the pointer is non-NULL (NULL is a deliberate query
   // and stays allowed, R-01); validate only a non-NULL pointer.
   if (input_state &&
@@ -204,12 +204,12 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
   if (!vibration) {
     return X_ERROR_BAD_ARGUMENTS;
   }
-
-// (Hunt v1.4.6, ronda 8, A3-R8-05.) The 4-byte vibration struct
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) The 4-byte vibration struct
   // is read by the driver below.
   if (!GuestRangeReadable(vibration.guest_address(), sizeof(X_INPUT_VIBRATION))) {
     return X_ERROR_BAD_ARGUMENTS;
   }
+
   uint32_t actual_user_index = user_index;
   if ((user_index & 0xFF) == 0xFF) {
     // Always pin user to 0.
@@ -242,7 +242,7 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
     actual_user_index = 0;
   }
 
-// (Hunt v1.4.6, ronda 8, A3-R8-05.) The 8-byte keystroke is
+  // (Hunt v1.4.6, ronda 8, A3-R8-05.) The 8-byte keystroke is
   // written by the driver below.
   if (!GuestRangeWritable(keystroke.guest_address(), sizeof(X_INPUT_KEYSTROKE))) {
     return X_ERROR_BAD_ARGUMENTS;
@@ -277,7 +277,7 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-    uint32_t user_index = *user_index_ptr;
+  uint32_t user_index = *user_index_ptr;
   if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     user_index = 0;
