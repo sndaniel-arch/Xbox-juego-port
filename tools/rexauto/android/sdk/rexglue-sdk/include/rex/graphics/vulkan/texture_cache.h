@@ -344,7 +344,7 @@ class VulkanTextureCache final : public TextureCache {
     // observed lead to a correct outcome; making the handles atomic is
     // left as future hardening. (Hunt v1.4.6 round 9, A2-R9-08: this
     // comment previously demanded the lock, which no caller held.)
-void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
+    void ArmEtc2PartialLoadWatch(SharedMemory& shared_memory);
     // Unregisters the partial-load watch, if armed. Called when the load
     // completes and from the destructor. The caller must hold the global
     // critical region (pass it in): the handle read and the unwatch must
