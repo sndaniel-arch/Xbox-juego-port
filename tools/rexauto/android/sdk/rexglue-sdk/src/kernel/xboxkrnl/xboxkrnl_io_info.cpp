@@ -72,16 +72,16 @@ static bool GuestInfoBufferIsWritable(uint32_t guest_address, uint32_t length) {
   // legitimate range spans even one boundary).
   if (start_heap == end_heap) {
     return start_heap->QueryRangeAccess(guest_address, guest_high_address) ==
-             rex::memory::PageAccess::kReadWrite;
+           rex::memory::PageAccess::kReadWrite;
   }
   uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
   if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
     return false;
   }
   return start_heap->QueryRangeAccess(guest_address, start_heap_end) ==
-               rex::memory::PageAccess::kReadWrite &&
-           end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address) ==
-               rex::memory::PageAccess::kReadWrite;
+             rex::memory::PageAccess::kReadWrite &&
+         end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address) ==
+             rex::memory::PageAccess::kReadWrite;
 }
 
 // (Hunt v1.4.6, verificación profunda, segundo barrido, V-FE-16.)
@@ -128,7 +128,7 @@ static bool GuestInfoBufferIsReadable(uint32_t guest_address, uint32_t length) {
     return false;
   }
   return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
-           range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address));
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), guest_high_address));
 }
 
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
