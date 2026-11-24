@@ -488,9 +488,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   static inline uint64_t MakeReadbackResolveKey(uint32_t address, uint32_t length) {
     return (uint64_t(address) << 32) | uint64_t(length);
   }
-  static inline uint64_t MakeMemexportReadbackKey(uint32_t first_base_address_dwords,
-                                                  uint32_t total_size) {
-    return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
+  static inline uint64_t MakeMemexportReadbackKey(
+      const std::vector<draw_util::MemExportRange>& memexport_ranges, uint32_t total_size) {
+    // (Hunt v1.4.6, ronda 10, A1-R10-05.) The old key covered only the first
+    // base + total size, so two draws with the same first range and total
+    // but a different split of the ranges shared one readback entry and the
+    // previous split's bytes landed at the current split's guest addresses.
+    // Hash every (base, size) pair (FNV-1a) so distinct splits get distinct
+    // keys; the first base and the total stay in the hash as well.
+    uint64_t hash = 14695981039346656037ull;
+    auto mix = [&hash](uint32_t value) {
+      hash ^= uint64_t(value);
+      hash *= 1099511628211ull;
+    };
+    mix(total_size);
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges) {
+      mix(memexport_range.base_address_dwords);
+      mix(memexport_range.size_bytes);
+    }
+    return hash;
   }
   struct ResolveDownscaleConstants {
     uint32_t scale_x;
