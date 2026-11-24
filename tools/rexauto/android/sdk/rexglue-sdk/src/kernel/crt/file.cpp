@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <span>
+#include <string>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -106,6 +107,44 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, true);
 }
 
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded guest C-string read:
+// MappedPtr<char>::value() builds a string_view straight off the
+// host pointer -- a strlen to NUL with no cap -- so a guest path
+// with no NUL in its page ran the host scan into unmapped memory.
+// Read page by page (each chunk validated readable first, like the
+// R6-05 ReadGuestU16String reader in xam_ui.cpp), stop at the first
+// NUL, truncate at 4096 chars if there is none. Returns false on an
+// invalid range. NOTE: this also makes GuestRangeReadable live again
+// in this file (A3-R10-11): it was definition-only until now because
+// every call site used Writable.
+// (Hunt v1.4.6, ronda 10, A3-R10-11.) See above: do NOT remove
+// GuestRangeReadable here -- ReadGuestCString below calls it.
+constexpr size_t kMaxGuestPathChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestPathChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
 
 constexpr uint32_t kCreateNew = 1;
 constexpr uint32_t kCreateAlways = 2;
@@ -183,7 +222,14 @@ u32 CreateFileA_entry(mapped_string lpFileName, u32 dwDesiredAccess, u32 dwShare
   if (!lpFileName) {
     return kInvalidHandleValue;
   }
-  const char* path = static_cast<const char*>(lpFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpFileName.guest_address(), &path)) {
+    return kInvalidHandleValue;
+  }
   auto* ks = REX_KERNEL_STATE();
   auto disposition = MapDisposition(static_cast<uint32_t>(dwCreationDisposition));
 
@@ -305,6 +351,13 @@ u32 SetFilePointer_entry(u32 hFile, u32 lDistanceToMove, mapped_u32 lpDistanceTo
   if (!file)
     return kInvalidHandleValue;
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) lpDistanceToMoveHigh is
+  // read below and written at the end (4 B) with only a NULL check:
+  // validate the range first (writable covers the read too).
+  if (lpDistanceToMoveHigh &&
+      !GuestRangeWritable(lpDistanceToMoveHigh.guest_address(), sizeof(uint32_t))) {
+    return kInvalidHandleValue;
+  }
   int64_t distance = static_cast<int32_t>(static_cast<uint32_t>(lDistanceToMove));
   if (lpDistanceToMoveHigh) {
     distance |=
@@ -329,6 +382,13 @@ u32 GetFileSize_entry(u32 hFile, mapped_u32 lpFileSizeHigh) {
   auto file = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XFile>(static_cast<uint32_t>(hFile));
   if (!file)
     return kInvalidHandleValue;
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) lpFileSizeHigh is written
+  // below with only a NULL check: validate the 4-byte range first.
+  if (lpFileSizeHigh &&
+      !GuestRangeWritable(lpFileSizeHigh.guest_address(), sizeof(uint32_t))) {
+    return kInvalidHandleValue;
+  }
 
   uint64_t size = file->entry()->size();
   if (lpFileSizeHigh)
@@ -382,7 +442,14 @@ u32 DeleteFileA_entry(mapped_string lpFileName) {
   if (!lpFileName) {
     return 0;
   }
-  const char* path = static_cast<const char*>(lpFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpFileName.guest_address(), &path)) {
+    return 0;
+  }
   bool ok = REX_KERNEL_FS()->DeletePath(path);
   if (!ok)
     REXKRNL_NOISY_DEBUG("rexcrt_DeleteFileA: FAILED '{}'", path);
@@ -406,6 +473,13 @@ static bool FillFindData(mapped_void lpFindFileData, rex::filesystem::Entry* ent
   // through unchecked (host SIGSEGV); a NULL entry is the same hole.
   // Callers fail the find instead.
   if (!lpFindFileData || !entry) {
+    return false;
+  }
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) The 0x140-byte
+  // WIN32_FIND_DATA below was mem/filled with only the NULL check
+  // above: validate the whole struct range first. (Single choke
+  // point: FindFirstFileA and FindNextFileA both go through here.)
+  if (!GuestRangeWritable(lpFindFileData.guest_address(), 0x140)) {
     return false;
   }
   auto* buf = static_cast<uint8_t*>(static_cast<void*>(lpFindFileData));
@@ -439,7 +513,14 @@ u32 FindFirstFileA_entry(mapped_string lpFileName, mapped_void lpFindFileData) {
   if (!lpFileName || !lpFindFileData) {
     return kInvalidHandleValue;
   }
-  const char* path = static_cast<const char*>(lpFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpFileName.guest_address(), &path)) {
+    return kInvalidHandleValue;
+  }
   auto dir = rex::string::utf8_find_base_guest_path(path);
   auto pattern = rex::string::utf8_find_name_from_guest_path(path);
 
@@ -499,7 +580,14 @@ u32 CreateDirectoryA_entry(mapped_string lpPathName, mapped_void lpSecurityAttri
   if (!lpPathName) {
     return 0;
   }
-  const char* path = static_cast<const char*>(lpPathName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpPathName.guest_address(), &path)) {
+    return 0;
+  }
   auto* entry = REX_KERNEL_FS()->CreatePath(path, rex::filesystem::kFileAttributeDirectory);
   return entry ? 1u : 0u;
 }
@@ -510,8 +598,18 @@ u32 MoveFileA_entry(mapped_string lpExistingFileName, mapped_string lpNewFileNam
   if (!lpExistingFileName || !lpNewFileName) {
     return 0;
   }
-  const char* src = static_cast<const char*>(lpExistingFileName);
-  const char* dst = static_cast<const char*>(lpNewFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string src;
+  if (!ReadGuestCString(lpExistingFileName.guest_address(), &src)) {
+    return 0;
+  }
+  std::string dst;
+  if (!ReadGuestCString(lpNewFileName.guest_address(), &dst)) {
+    return 0;
+  }
 
   auto* fs = REX_KERNEL_FS();
   auto* src_entry = fs->ResolvePath(src);
@@ -546,7 +644,14 @@ u32 GetFileAttributesA_entry(mapped_string lpFileName) {
   if (!lpFileName) {
     return kInvalidHandleValue;  // INVALID_FILE_ATTRIBUTES
   }
-  const char* path = static_cast<const char*>(lpFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpFileName.guest_address(), &path)) {
+    return kInvalidHandleValue;  // INVALID_FILE_ATTRIBUTES
+  }
   auto* entry = REX_KERNEL_FS()->ResolvePath(path);
   if (!entry) {
     REXKRNL_DEBUG("rexcrt_GetFileAttributesA: not found '{}'", path);
@@ -563,7 +668,20 @@ u32 GetFileAttributesExA_entry(u32 fInfoLevelId, mapped_string lpFileName,
   if (!lpFileName || !lpFileInformation) {
     return 0;
   }
-  const char* path = static_cast<const char*>(lpFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpFileName.guest_address(), &path)) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) The 36-byte
+  // WIN32_FILE_ATTRIBUTE_DATA (9 u32) below was written with only
+  // the NULL check above: validate the range first.
+  if (!GuestRangeWritable(lpFileInformation.guest_address(), 36)) {
+    return 0;
+  }
   auto* entry = REX_KERNEL_FS()->ResolvePath(path);
   if (!entry) {
     REXKRNL_DEBUG("rexcrt_GetFileAttributesExA: not found '{}'", path);
@@ -639,6 +757,13 @@ u32 CompareFileTime_entry(mapped_void lpFileTime1, mapped_void lpFileTime2) {
   if (!lpFileTime1 || !lpFileTime2) {
     return static_cast<uint32_t>(-1);
   }
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) Both FILETIMEs (8 B each)
+  // were read below with only the NULL check above: validate both
+  // ranges first.
+  if (!GuestRangeReadable(lpFileTime1.guest_address(), 8) ||
+      !GuestRangeReadable(lpFileTime2.guest_address(), 8)) {
+    return static_cast<uint32_t>(-1);
+  }
   auto* ft1 =
       reinterpret_cast<be<uint32_t>*>(static_cast<uint8_t*>(static_cast<void*>(lpFileTime1)));
   auto* ft2 =
@@ -662,8 +787,18 @@ u32 CopyFileA_entry(mapped_string lpExistingFileName, mapped_string lpNewFileNam
   if (!lpExistingFileName || !lpNewFileName) {
     return 0;
   }
-  const char* src = static_cast<const char*>(lpExistingFileName);
-  const char* dst = static_cast<const char*>(lpNewFileName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string src;
+  if (!ReadGuestCString(lpExistingFileName.guest_address(), &src)) {
+    return 0;
+  }
+  std::string dst;
+  if (!ReadGuestCString(lpNewFileName.guest_address(), &dst)) {
+    return 0;
+  }
 
   auto* ks = REX_KERNEL_STATE();
 
@@ -758,7 +893,14 @@ u32 RemoveDirectoryA_entry(mapped_string lpPathName) {
   if (!lpPathName) {
     return 0;
   }
-  const char* path = static_cast<const char*>(lpPathName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpPathName.guest_address(), &path)) {
+    return 0;
+  }
   bool ok = REX_KERNEL_FS()->DeletePath(path);
   if (!ok)
     REXKRNL_DEBUG("rexcrt_RemoveDirectoryA: FAILED '{}'", path);
@@ -781,7 +923,25 @@ u32 GetDiskFreeSpaceExA_entry(mapped_string lpDirectoryName,
   if (!lpDirectoryName) {
     return 0;
   }
-  const char* path = static_cast<const char*>(lpDirectoryName);
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // the old `static_cast<const char*>` scan looked for NUL with no
+  // cap (MappedPtr<char>::value()). ReadGuestCString above caps the
+  // scan at the heap end / 4096 chars and fails on an invalid range.
+  std::string path;
+  if (!ReadGuestCString(lpDirectoryName.guest_address(), &path)) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 10, A3-R10-16.) The three 8-byte out-params
+  // below were written with only NULL checks: validate each range
+  // first.
+  if ((lpFreeBytesAvailableToCaller &&
+       !GuestRangeWritable(lpFreeBytesAvailableToCaller.guest_address(), 8)) ||
+      (lpTotalNumberOfBytes &&
+       !GuestRangeWritable(lpTotalNumberOfBytes.guest_address(), 8)) ||
+      (lpTotalNumberOfFreeBytes &&
+       !GuestRangeWritable(lpTotalNumberOfFreeBytes.guest_address(), 8))) {
+    return 0;
+  }
   auto* entry = REX_KERNEL_FS()->ResolvePath(path);
   if (!entry) {
     REXKRNL_DEBUG("rexcrt_GetDiskFreeSpaceExA: path not found '{}'", path);
