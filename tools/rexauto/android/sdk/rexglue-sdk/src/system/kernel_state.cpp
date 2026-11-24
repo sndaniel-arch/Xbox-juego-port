@@ -47,6 +47,45 @@ namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 
+// (Hunt v1.4.6, ronda 10, A3-R10-06.) The overlapped completion
+// core translated the guest overlapped pointer with no validation
+// anywhere and wrote result/context/length through it: a wild
+// pointer SIGSEGVd the host on every completion path in the game.
+// Same heap validation as A3-R4-09 (see xam_net.cpp): reject a range
+// that wraps past 4 GiB, starts or ends outside any heap, or spans
+// heaps of different kinds (or two physical heaps); inside a single
+// heap require ReadWrite pages (the struct is always written).
+static bool GuestOverlappedWritable(rex::memory::Memory* memory, uint32_t guest_address) {
+  const size_t length = sizeof(XAM_OVERLAPPED);
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = memory->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = memory->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    return start_heap->QueryRangeAccess(guest_address, high_address) ==
+           rex::memory::PageAccess::kReadWrite;
+  }
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (memory->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return start_heap->QueryRangeAccess(guest_address, start_heap_end) ==
+             rex::memory::PageAccess::kReadWrite &&
+         end_heap->QueryRangeAccess(end_heap->heap_base(), high_address) ==
+             rex::memory::PageAccess::kReadWrite;
+}
+
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
 // be using to stash their variables.
@@ -1143,6 +1182,18 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-06.) Single choke point for every
+  // overlapped completion in the game: validate the 28-byte
+  // XAM_OVERLAPPED as writable before any write below (result /
+  // length / extended_error, event read, completion-routine read).
+  // These functions return void, so there is no status to report --
+  // an invalid overlapped is silently skipped, like a null event
+  // already is below. Callers that already answered IO_PENDING to
+  // the guest leave it waiting; that is the honest outcome for a
+  // corrupt overlapped pointer, and it beats a host SIGSEGV.
+  if (!overlapped_ptr || !GuestOverlappedWritable(memory(), overlapped_ptr)) {
+    return;
+  }
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1176,6 +1227,12 @@ void KernelState::CompleteOverlappedImmediate(uint32_t overlapped_ptr, X_RESULT 
 
 void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESULT result,
                                                 uint32_t extended_error, uint32_t length) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-06.) Same choke-point check as
+  // CompleteOverlappedEx below (which re-validates): the SetContext
+  // write here must not run on an invalid overlapped either.
+  if (!overlapped_ptr || !GuestOverlappedWritable(memory(), overlapped_ptr)) {
+    return;
+  }
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
   CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
@@ -1223,9 +1280,17 @@ void KernelState::CompleteOverlappedDeferredEx(
     std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback, uint32_t overlapped_ptr,
     std::function<void()> pre_callback, std::function<void()> post_callback) {
   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
-  auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  // (Hunt v1.4.6, ronda 10, A3-R10-06.) The IO_PENDING / context
+  // writes below are the same unvalidated 28-byte write as the
+  // immediate path. When the overlapped is invalid the writes are
+  // skipped but the completion is still queued: the callback itself
+  // (content creation, enumeration, ...) must still run, and the
+  // queued CompleteOverlappedEx re-validates before writing.
+  if (overlapped_ptr && GuestOverlappedWritable(memory(), overlapped_ptr)) {
+    auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+    XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+    XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back(
       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
