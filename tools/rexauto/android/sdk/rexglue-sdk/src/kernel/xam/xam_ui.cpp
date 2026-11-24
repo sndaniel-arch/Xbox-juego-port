@@ -432,6 +432,15 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) The 4-byte result out-param
+  // had only the NULL check above, and it is written inside deferred
+  // lambdas that run after the guest may have unmapped the buffer --
+  // so it is validated here at capture AND re-validated inside each
+  // lambda before the write below.
+  if (!GuestRangeWritable(result_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   // (Hunt v1.4.6, ronda 4, A3-R4-16.) A message box with no buttons
   // can never be closed: the guest thread would wait on its fence
   // forever. And active_button must name one of the buttons — the
@@ -521,6 +530,12 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   if (REXCVAR_GET(headless)) {
     // Auto-pick the focused button.
     auto run = [result_ptr, active_button]() -> X_RESULT {
+      // (Hunt v1.4.6, ronda 10, A3-R10-12.) Re-validate inside the
+      // deferred lambda: the range was valid at capture, but the
+      // guest may have unmapped it while the dialog was queued.
+      if (!GuestRangeWritable(result_ptr.guest_address(), sizeof(uint32_t))) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
       *result_ptr = static_cast<uint32_t>(active_button);
       return X_ERROR_SUCCESS;
     };
@@ -542,6 +557,11 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
         break;
     }
     auto close = [result_ptr](MessageBoxDialog* dialog) -> X_RESULT {
+      // (Hunt v1.4.6, ronda 10, A3-R10-12.) Re-validate inside the
+      // deferred lambda, as the headless run above.
+      if (!GuestRangeWritable(result_ptr.guest_address(), sizeof(uint32_t))) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
       *result_ptr = dialog->chosen_button();
       return X_ERROR_SUCCESS;
     };
@@ -554,6 +574,11 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     } else {
       // Fallback to headless if no drawer available
       auto run = [result_ptr, active_button]() -> X_RESULT {
+        // (Hunt v1.4.6, ronda 10, A3-R10-12.) Re-validate inside
+        // the deferred lambda, as above.
+        if (!GuestRangeWritable(result_ptr.guest_address(), sizeof(uint32_t))) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
         *result_ptr = static_cast<uint32_t>(active_button);
         return X_ERROR_SUCCESS;
       };
@@ -710,14 +735,29 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read of the default
+  // text ONCE, up front: both headless lambdas below used
+  // default_text.value() -- an unbounded NUL scan, bypassing the
+  // R6-05 bounded reader the dialog path uses -- and the headless
+  // path is the one that runs on the phone build. The owned copy
+  // (host byte order) is what the lambdas capture, and
+  // copy_and_swap_truncating swaps it back to guest order on write.
+  // A null default_text stays "no default", as before.
+  std::u16string def_text_u16;
+  bool has_default_text = static_cast<bool>(default_text);
+  if (has_default_text &&
+      !ReadGuestU16String(default_text.guest_address(), &def_text_u16)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
-    auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+    auto run = [def_text_u16, has_default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
       // Redirect default_text back into the buffer.
-      if (!default_text) {
+      if (!has_default_text) {
         std::memset(buffer, 0, buffer_size);
       } else {
-        rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+        rex::string::copy_and_swap_truncating(buffer, def_text_u16, buffer_length);
       }
       return X_ERROR_SUCCESS;
     };
@@ -760,12 +800,11 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
       }
       desc_str = rex::string::to_utf8(desc_u16);
     }
+    // (Hunt v1.4.6, ronda 10, A3-R10-03.) The default text was
+    // already read bounded above (shared with the headless path);
+    // reuse that copy instead of scanning the guest string again.
     std::string def_text_str;
-    if (default_text) {
-      std::u16string def_text_u16;
-      if (!ReadGuestU16String(default_text.guest_address(), &def_text_u16)) {
-        return X_ERROR_INVALID_PARAMETER;
-      }
+    if (has_default_text) {
       def_text_str = rex::string::to_utf8(def_text_u16);
     }
 
@@ -779,11 +818,13 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
           close, overlapped.guest_address());
     } else {
       // Fallback to headless
-      auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
-        if (!default_text) {
+      auto run = [def_text_u16, has_default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+        // (Hunt v1.4.6, ronda 10, A3-R10-03.) Same bounded copy as
+        // the headless path above -- no default_text.value() scan.
+        if (!has_default_text) {
           std::memset(buffer, 0, buffer_size);
         } else {
-          rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+          rex::string::copy_and_swap_truncating(buffer, def_text_u16, buffer_length);
         }
         return X_ERROR_SUCCESS;
       };
@@ -803,6 +844,13 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) Same deferred-lambda class
+  // as XamShowMessageBoxUI above: validate the 4-byte out-param at
+  // capture, and re-validate inside the lambda before the write.
+  if (!GuestRangeWritable(device_id_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   REXKRNL_INFO("XamShowDeviceSelectorUI({:08X}, {:08X}, {:08X}, {:016X}, {:08X}, {:08X})",
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
@@ -810,6 +858,11 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
   return xeXamDispatchHeadless(
       [device_id_ptr]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
+        // (Hunt v1.4.6, ronda 10, A3-R10-12.) Re-validate inside the
+        // deferred lambda, as XamShowMessageBoxUI above.
+        if (!GuestRangeWritable(device_id_ptr.guest_address(), sizeof(uint32_t))) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
         *device_id_ptr = 0x00000001;
         return X_ERROR_SUCCESS;
       },
