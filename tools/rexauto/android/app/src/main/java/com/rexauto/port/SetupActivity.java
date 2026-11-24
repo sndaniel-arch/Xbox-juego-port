@@ -533,10 +533,16 @@ public class SetupActivity extends Activity {
             try { pfd.close(); } catch (Exception ignored) { }
             throw e;
         }
-        if (hdr == null) { ch.close(); pfd.close(); return null; }
+        // (Hunt v1.4.6 ronda 11, A4-R11-09.) Sequential closes: if
+        // ch.close() threw, pfd.close() never ran (fd leak) and the
+        // throw escaped importPackage as an import failure instead of
+        // returning null ("not a package"). Close each in its own try.
+        if (hdr == null) { try { ch.close(); } catch (Exception ignored) { } try { pfd.close(); } catch (Exception ignored) { } return null; }
         dest.mkdirs();
         if (StfsExtractor.volumeType(hdr) == StfsExtractor.VOLUME_SVOD) {
-            ch.close(); pfd.close();
+            // (A4-R11-09.) Same sequential-close fix as above.
+            try { ch.close(); } catch (Exception ignored) { }
+            try { pfd.close(); } catch (Exception ignored) { }
             if (hdr.getInt(0x39D) > 1)
                 throw new Exception(appCtx.getString(R.string.err_god_needs_folder, name));
             StfsExtractor.Found f = new StfsExtractor.Found(uri, name, hdr, null);
@@ -565,7 +571,7 @@ public class SetupActivity extends Activity {
             File xex = stfs.extractAll(dest, progress);
             if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_stfs, name));
             return xex;
-        } finally { ch.close(); pfd.close(); }
+        } finally { try { ch.close(); } catch (Exception ignored) { } try { pfd.close(); } catch (Exception ignored) { } } // (A4-R11-09.)
     }
 
     /** Already-extracted folder picked with the tree picker: copy it in. */
@@ -633,7 +639,7 @@ public class SetupActivity extends Activity {
                         requireFreeSpace(staging, total);
                         xex = stfs.extractAll(staging, progress);
                     }
-                    finally { ch.close(); pfd.close(); }
+                    finally { try { ch.close(); } catch (Exception ignored) { } try { pfd.close(); } catch (Exception ignored) { } } // (A4-R11-09.)
                     if (xex == null) throw new Exception(appCtx.getString(R.string.err_no_xex_in_stfs, pkg.name));
                 } else {
                     long[] counter = {0};
