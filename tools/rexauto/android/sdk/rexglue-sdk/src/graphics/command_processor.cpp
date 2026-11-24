@@ -329,22 +329,30 @@ void CommandProcessor::Pause() {
   }
   paused_ = true;
 
-  thread::Fence fence;
-  CallInThread([this, &fence]() {
+  // (Hunt v1.4.6, ronda 10, A1-R10-01.) Heap-owned fence, same pattern as
+  // GraphicsSystem::InitializeShaderStorage (A4-R4-10): a stack fence
+  // captured by reference would be destroyed when the bounded WaitFor below
+  // times out while the queued lambda may still signal it later -- the
+  // worker calls Signal() on a destroyed mutex/condvar (thread::Fence has
+  // inline state). The lambda holds a shared_ptr copy, so the fence stays
+  // alive until the worker runs it; if shutdown discards the queued fn,
+  // the last reference simply drops with the queue.
+  auto fence = std::make_shared<rex::thread::Fence>();
+  CallInThread([this, fence]() {
     // (A4-R3-02.) The fence wait below is bounded now, so this fn can run
     // AFTER a later Resume() cleared paused_: suspending then would park
     // the worker with nobody left to resume it. Only suspend while the
     // pause is still in effect; signal the fence either way so the waiter
     // never blocks on a skipped suspend.
     if (paused_) {
-      fence.Signal();
+      fence->Signal();
       thread::Thread::GetCurrentThread()->Suspend();
     } else {
-      fence.Signal();
+      fence->Signal();
     }
   });
 
-  if (!fence.WaitFor(std::chrono::milliseconds(1000))) {
+  if (!fence->WaitFor(std::chrono::milliseconds(1000))) {
     // The worker is inside ExecutePrimaryBuffer (a long draw batch /
     // shader compile) and has not drained pending_fns_ yet. paused_
     // stays set, so the queued fn suspends it when it runs (the
@@ -1232,6 +1240,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
       } else {
         rex::thread::MaybeYield();
+        // (Hunt v1.4.6, ronda 10, A1-R10-06.) The sleep branch above checks
+        // worker_running_ after every wait and exits, but this short-wait
+        // branch never did: a wait that never matches (e.g. function 0x0
+        // "Never") spun here forever, and Shutdown() -- whose Wait has no
+        // timeout -- hung with it. Mirror the sleep branch.
+        if (!worker_running_) {
+          // Short-circuited exit.
+          return false;
+        }
       }
     }
   } while (!matched);
