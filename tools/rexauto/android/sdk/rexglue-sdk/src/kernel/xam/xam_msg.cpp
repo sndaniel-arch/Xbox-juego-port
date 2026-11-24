@@ -29,6 +29,65 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// (Hunt v1.4.6, ronda 11, A3-R11-01.) The read side of the overlapped
+// protocol had no range helper: XamGetOverlappedResult /
+// XMsgCancelIORequest only NULL-checked the guest overlapped pointer
+// and then read its fields straight out of guest memory. Same heap
+// validation as A3-R4-09 (see xam_net.cpp): reject a range that wraps
+// past 4 GiB, starts or ends outside any heap, or spans heaps of
+// different kinds (or two physical heaps); inside a single heap
+// require the pages to be accessible; across a heap boundary validate
+// both ends (A3-R8-13 / A3-R9-10).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 u32 XMsgInProcessCall_entry(u32 app, u32 message, u32 arg1, u32 arg2) {
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageSync(app, message, arg1, arg2);
   if (result == X_ERROR_NOT_FOUND) {
@@ -91,6 +150,13 @@ u32 XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait
   if (!overlapped_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 11, A3-R11-01.) XOverlappedGetEvent reads
+  // p[3] of the 28-byte struct with no validation (the R3-10 null
+  // check above only caught 0): a wild non-null pointer SIGSEGVd
+  // the host here. Validate the whole struct readable first.
+  if (!GuestRangeReadable(overlapped_ptr.guest_address(), sizeof(XAM_OVERLAPPED))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -133,6 +199,18 @@ u32 XamGetOverlappedResult_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mappe
   // first thing below; a NULL overlapped pointer SIGSEGVd the host.
   // (length_ptr in this same function is already guarded.)
   if (!overlapped_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 11, A3-R11-01.) result / event / length are
+  // read straight out of the 28-byte struct below with only the null
+  // check above; a wild non-null pointer SIGSEGVd the host. Validate
+  // the whole struct readable first. length_ptr is written on the
+  // success path with only a null check (R10-07 / R10-12 class):
+  // validate its 4 bytes writable up front too.
+  if (!GuestRangeReadable(overlapped_ptr.guest_address(), sizeof(XAM_OVERLAPPED))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (length_ptr && !GuestRangeWritable(length_ptr.guest_address(), sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
   uint32_t result;
