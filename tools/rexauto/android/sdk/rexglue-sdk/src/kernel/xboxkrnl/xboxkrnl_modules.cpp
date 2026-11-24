@@ -401,7 +401,18 @@ void ExRegisterTitleTerminateNotification_entry(ppc_ptr_t<X_EX_TITLE_TERMINATE_R
 }
 
 u32 XexLoadImageHeaders_entry(mapped_string path, mapped_void headers) {
-  REXKRNL_DEBUG("XexLoadImageHeaders({}) - stub", path.value());
+  // (Hunt v1.4.6, caza ronda 14, A3-R14-04.) path.value() is an
+  // unbounded NUL scan; the DEBUG macro only evaluates its arguments
+  // when debug logging is on (the default level is info), so this
+  // only crashes the host with debug logging enabled -- but a stub
+  // must not SIGSEGV the host for a wild pointer under any log
+  // level. Bounded-read the path first and log that instead.
+  std::string path_str;
+  if (path && !ReadGuestCString(path.guest_address(), &path_str)) {
+    REXKRNL_DEBUG("XexLoadImageHeaders(<invalid>) - stub");
+    return X_STATUS_NOT_IMPLEMENTED;
+  }
+  REXKRNL_DEBUG("XexLoadImageHeaders({}) - stub", path_str);
   return X_STATUS_NOT_IMPLEMENTED;
 }
 
