@@ -29,7 +29,7 @@ import java.lang.ref.WeakReference;
  * landscape. Changes persist immediately via PadSettings; the onChanged
  * callback lets the overlay re-layout while the dialog stays open.
  */
-final class PadSettingsDialog {
+public final class PadSettingsDialog {
 
     // (Hunt v1.4.6 ronda 4, A4-R4-09.) A fast double-tap on the gear opened
     // two dialogs over the same PadSettings; both wrote on OK and the last
@@ -72,6 +72,14 @@ final class PadSettingsDialog {
             sDialogActivity = null;
         }
         return showing;
+    }
+
+    /**
+     * (Hunt v1.4.6 ronda 11, A4-R11-04.) Eager release of the dialog statics, called from MainActivity.onDestroy(): drops the (possibly dead) activity reference at destroy time instead of waiting for the next gear tap to observe it stale — this closes the R10-02 residual, which had no lifecycle hook. The class is public only so MainActivity (another package) can call this; nothing else about it changes. Safe to call any time: the dismiss listener no-ops once the statics are null.
+     */
+    public static void clearStale() {
+        sDialog = null;
+        sDialogActivity = null;
     }
 
     /** One labeled percent slider bound to a clamped settings value. */
