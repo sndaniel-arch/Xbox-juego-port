@@ -402,11 +402,21 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
 
-    if (license_mask_ptr && XSUCCEEDED(result)) {
+    // (Hunt v1.4.6, caza ronda 13, A3-R13-06.) Re-validate
+    // inside the deferred lambda, as XamShowMessageBoxUI does for
+    // its result_ptr (R10-12): both out-params were validated at
+    // capture, but the guest may have unmapped them while the
+    // creation was queued (100 ms deferred delay,
+    // kernel_state.cpp). A range that went bad is skipped instead
+    // of written through; the content operation itself already
+    // ran, so its result stands.
+    if (license_mask_ptr && XSUCCEEDED(result) &&
+        GuestRangeWritable(license_mask_ptr.guest_address(), sizeof(uint32_t))) {
       *license_mask_ptr = content_license;
     }
 
-    if (disposition_ptr) {
+    if (disposition_ptr &&
+        GuestRangeWritable(disposition_ptr.guest_address(), sizeof(uint32_t))) {
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
 

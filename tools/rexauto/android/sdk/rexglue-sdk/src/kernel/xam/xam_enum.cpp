@@ -98,6 +98,14 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
     uint32_t item_count = 0;
     if (!buffer_ptr) {
       result = X_ERROR_INVALID_PARAMETER;
+    } else if (!GuestRangeWritable(buffer_ptr.guest_address(), buffer_size)) {
+      // (Hunt v1.4.6, caza ronda 13, A3-R13-06.) Re-validate
+      // inside the deferred lambda: the range was valid at capture,
+      // but the guest may have unmapped it while the enumeration
+      // was queued (100 ms deferred delay, kernel_state.cpp), and
+      // WriteItems writes the whole buffer below. Same re-check
+      // XamShowMessageBoxUI does for its result_ptr (R10-12).
+      result = X_ERROR_INVALID_PARAMETER;
     } else {
       result = e->WriteItems(buffer_ptr.guest_address(), buffer_ptr.as<uint8_t*>(), &item_count,
                              buffer_size);
