@@ -169,22 +169,24 @@ jobs:
     # were 360 > 350), so the 240-min phase-2 budget could never be
     # honoured in full. (V-A5-01 added the Python-deps timeout to the
     # count: it was untimed before, so the old sum missed it.)
-    # (A5-R7-11, ronda 7; aritmetica corregida A5-R8-05, ronda 8.) The
-    # old comment also assumed the steps WITHOUT a timeout (checkouts,
-    # injections, localize, pack, uploads, ...) fit in the 10 min left
-    # over -- an untested hypothesis. 26 of the 28 steps in this job now
-    # carry their own timeout-minutes, and their sum is 530, not the 525
-    # the R7-11 comment claimed: the six long steps sum to 350 (10 + 10 +
-    # 30 + 60 + 60 + 180), the 19 R7-11 steps sum to 175, and the 5-min
-    # "Overlay tracked ci_sdk.py" step (R7-03) was in neither list
-    # (350 + 175 + 5 = 530). Only "Validate inputs" and the actions/cache
-    # restore step have no timeout. Step timeouts are per-step ATTRIBUTION
-    # caps, NOT an additive budget: their sum (530) exceeds the job
-    # ceiling by design -- steps run sequentially and the job timeout
-    # (360) is still the hard ceiling that fires first if the run as a
-    # whole overruns. A step cap only fires when that single step hangs
-    # past its own cap, so the failure names the hanging step instead of
-    # dying anonymously at the job timeout.
+    # (A5-R7-11, ronda 7; aritmetica corregida A5-R8-05, ronda 8;
+    # actualizada A5-R14-01, ronda 14.) The old comment also assumed the
+    # steps WITHOUT a timeout (checkouts, injections, localize, pack,
+    # uploads, ...) fit in the 10 min left over -- an untested
+    # hypothesis. 27 of the 28 steps in this job now carry their own
+    # timeout-minutes, and their sum is 560, not the 530 the R8-05
+    # comment claimed: the six long steps sum to 350 (10 + 10 + 30 + 60
+    # + 60 + 180), the 19 R7-11 steps sum to 175, the 5-min "Overlay
+    # tracked ci_sdk.py" step (R7-03) was in neither list, and the
+    # 30-min cache restore step got its cap in ronda 11 (A5-R11-04)
+    # (350 + 175 + 5 + 30 = 560). Only "Validate inputs" has no timeout
+    # (a one-line regex that cannot hang). Step timeouts are per-step
+    # ATTRIBUTION caps, NOT an additive budget: their sum (560) exceeds
+    # the job ceiling by design -- steps run sequentially and the job
+    # timeout (360) is still the hard ceiling that fires first if the
+    # run as a whole overruns. A step cap only fires when that single
+    # step hangs past its own cap, so the failure names the hanging step
+    # instead of dying anonymously at the job timeout.
     timeout-minutes: 360
     outputs:
       title: ${{ steps.meta.outputs.title }}
@@ -900,6 +902,25 @@ jobs:
           Copy-Item -Recurse "$port\src" "$out\src"
           Get-ChildItem $port -File -Filter *.toml | Copy-Item -Destination $out
           Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+          # (Hunt v1.4.6, ronda 14, A5-R14-02.) The checks above prove the
+          # SOURCE inputs exist, not that the COPIES landed: Copy-Item
+          # errors are NON-terminating, so a failed copy (disk full,
+          # locked file) used to ship a port-src.zip missing generated/
+          # entries, src/ files or *.toml -- and job 2 ("Unpack port")
+          # only tests src/main.cpp + sources.cmake, so a partial
+          # generated/ would surface only at Gradle/CMake time, a job
+          # later, with a confusing error. Verify the copies, not just
+          # the sources. (*.toml is not a job-2 build input -- nothing
+          # in the app tree reads it -- but it is documented pack cargo
+          # and the source artifact must carry it.)
+          if (-not (Test-Path "$out\generated\default\sources.cmake")) { Write-Host "::error::pack copy failed: $out\generated\default\sources.cmake is missing after Copy-Item"; exit 1 }
+          if (-not (Test-Path "$out\src\main.cpp")) { Write-Host "::error::pack copy failed: $out\src\main.cpp is missing after Copy-Item"; exit 1 }
+          $genIn = @(Get-ChildItem "$port\generated" -Recurse -File).Count
+          $genOut = @(Get-ChildItem "$out\generated" -Recurse -File).Count
+          if ($genOut -ne $genIn) { Write-Host "::error::pack copy failed: $genOut of $genIn files under generated/ reached $out"; exit 1 }
+          $tomlIn = @(Get-ChildItem $port -File -Filter *.toml).Count
+          $tomlOut = @(Get-ChildItem $out -File -Filter *.toml).Count
+          if ($tomlOut -ne $tomlIn) { Write-Host "::error::pack copy failed: $tomlOut of $tomlIn *.toml files reached $out"; exit 1 }
           # sources.cmake is ${CMAKE_CURRENT_LIST_DIR}-relative -> relocatable as-is
           Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
           Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
