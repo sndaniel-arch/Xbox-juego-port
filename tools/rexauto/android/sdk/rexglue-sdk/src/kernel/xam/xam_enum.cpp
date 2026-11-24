@@ -126,6 +126,14 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
 
 u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *items_returned is written
+  // below with only a NULL check: validate the 4-byte range first.
+  // (The host-side uint32_t* inside xeXamEnumerate is &dummy, never
+  // a guest pointer, so it needs no check.)
+  if (items_returned &&
+      !GuestRangeWritable(items_returned.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   uint32_t dummy;
   auto result =
       xeXamEnumerate(handle, flags, buffer, buffer_length,
@@ -155,6 +163,13 @@ u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object
   // SUCCESS. Same order ObOpenObjectByPointer documents in
   // xboxkrnl_ob.cpp.
   if (!out_object_ptr.guest_address()) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *out_object_ptr is written
+  // below with only the NULL check above: validate the 4-byte range
+  // first, before RetainHandle (so a bad pointer does not leak the
+  // reference the R3-14 comment above guards).
+  if (!GuestRangeWritable(out_object_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
   e->RetainHandle();
