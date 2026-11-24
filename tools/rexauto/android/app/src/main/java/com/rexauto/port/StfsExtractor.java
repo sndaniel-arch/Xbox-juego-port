@@ -150,6 +150,19 @@ public final class StfsExtractor {
         }
 
         private ByteBuffer readAt(long off, int n) throws IOException {
+            // (Hunt v1.4.6 ronda 14, A4-R14-02.) Misma familia que R8-F3
+            // (Svod.read) y A4-R11-01 (short read): un headerSize corrupto
+            // con el bit 31 puesto (0x80000000) deja baseOff NEGATIVO
+            // (:130) y blockToOffset() devuelve un offset negativo; el
+            // ch.read() de abajo tira IllegalArgumentException
+            // ("Negative position", no chequeada), que el import solo
+            // reporta como error generico en vez del "paquete
+            // corrupto/truncado" legible. Verificado con JDK: read(-1)
+            // tira esa excepcion y baseOff(0x80000000) = -2147483648.
+            // Un offset valido nunca es negativo: fallar aqui, con
+            // IOException, en el unico punto por el que pasan todas las
+            // lecturas STFS (fileTable/nextBlock/extractAll).
+            if (off < 0) throw new IOException("STFS: negative read offset 0x" + Long.toHexString(off) + " (corrupt/truncated package?)");
             ByteBuffer b = ByteBuffer.allocate(n).order(ByteOrder.BIG_ENDIAN);
             while (b.hasRemaining()) { if (ch.read(b, off + b.position()) <= 0) break; }
             // (Hunt v1.4.6 ronda 11, A4-R11-01.) A short read used to be
