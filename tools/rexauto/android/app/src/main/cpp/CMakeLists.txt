@@ -93,6 +93,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   # Same directory-scope rule as above: set before add_subdirectory().
   get_filename_component(REX_CHECKOUT_ROOT "${REX_PROJECT_ROOT}/../.." ABSOLUTE)
   add_compile_options("-ffile-prefix-map=${REX_CHECKOUT_ROOT}=.")
+endif()
 
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 
