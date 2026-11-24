@@ -296,11 +296,47 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         return btManager.getConnectionState(mDevice, BluetoothProfile.GATT);
     }
 
+    // (Hunt v1.4.6 ronda 13, A4-R13-02.) Retire the current GATT before
+    // replacing it: disconnect() alone does NOT release the client
+    // interface -- every connectGatt() needs a matching close(), and the
+    // pool is ~30 for the whole phone (GATT_MAX_APPS 32, two used
+    // internally). The old code disconnected the old GATT and dropped the
+    // reference, leaking one clientIf per reconnect; after ~30 the stack
+    // refuses new connections with GATT 133, phone-wide, until Bluetooth
+    // restarts. Closing the old GATT also suppresses its disconnect
+    // callback, so the state reset that callback used to do (clear the
+    // registered/connected flags, drop the in-flight op) is done here:
+    // without it the new GATT would inherit a stale "registered" state
+    // and probeService() would skip re-registering it.
+    private void replaceGatt() {
+        BluetoothGatt old = mGatt;
+        mIsRegistered = false;
+        mIsConnected = false;
+        mDirectWritePending = false;
+        dropCurrentGattOperation();
+        if (old != null) {
+            old.disconnect();
+            old.close();
+        }
+        mGatt = connectGatt(false);
+    }
+
     void reconnect() {
 
         if (getConnectionState() != BluetoothProfile.STATE_CONNECTED) {
-            mGatt.disconnect();
-            mGatt = connectGatt();
+            // (Hunt v1.4.6 ronda 13, A4-R13-01.) connectGatt() can return
+            // null (AOSP: IBluetoothGatt null, or RemoteException): the
+            // constructor stores it unchecked, so a null first connect
+            // NPE'd on the mGatt.disconnect() below the next time this
+            // ran for the same device (ACL_CONNECTED after the service
+            // came back). Re-attempt the connect instead of disconnecting
+            // a null GATT; if it is still null there is nothing to
+            // disconnect and the next ACL_CONNECTED retries.
+            if (mGatt == null) {
+                mGatt = connectGatt();
+                return;
+            }
+            replaceGatt();
         }
 
     }
@@ -438,8 +474,10 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             Log.e(TAG, "Chromebook: Discovered services were empty; this almost certainly means the BtGatt.ContextMap bug has bitten us.");
             mIsConnected = false;
             mIsReconnecting = true;
-            mGatt.disconnect();
-            mGatt = connectGatt(false);
+            // (Hunt v1.4.6 ronda 13, A4-R13-02.) Same replaceGatt() as
+            // reconnect()/onServicesDiscovered: the old disconnect() +
+            // connectGatt() here abandoned the old GATT without close().
+            replaceGatt();
         }
 
         return false;
@@ -635,14 +673,26 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     @Override
     public void onServicesDiscovered(BluetoothGatt gatt, int status) {
         //Log.v(TAG, "onServicesDiscovered status=" + status);
+        // (Hunt v1.4.6 ronda 13, A4-R13-04.) GATT callbacks run on binder
+        // threads while shutdown() (main thread) nulls mManager: a callback
+        // dispatched before close() but running after it NPE'd below (see
+        // onCharacteristicRead/Write, onCharacteristicChanged,
+        // onDescriptorWrite for the same guard). The manager is only ever
+        // nulled by shutdown(), so a null manager means this device is
+        // dead; drop the callback.
+        if (mManager == null) {
+            return;
+        }
         if (status == 0) {
             mServiceDiscoveryAttempts = 0;
             if (gatt.getServices().size() == 0) {
                 Log.v(TAG, "onServicesDiscovered returned zero services; something has gone horribly wrong down in Android's Bluetooth stack.");
                 mIsReconnecting = true;
                 mIsConnected = false;
-                gatt.disconnect();
-                mGatt = connectGatt(false);
+                // (Hunt v1.4.6 ronda 13, A4-R13-02.) Same replaceGatt()
+                // as reconnect(): the old disconnect() + connectGatt()
+                // here abandoned the old GATT without close().
+                replaceGatt();
             } else {
                 if (getProductId() == TRITON_BLE_PID) {
                     // Android will not properly play well with Data Length Extensions without manually requesting a large MTU,
@@ -650,7 +700,12 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                     //
                     // 517 is basically a "magic number" as far as Android's bluetooth code is concerned, so do not change
                     // this value. It is functionally "please enable data length extensions" on some Android builds.
-                    mGatt.requestMtu(517);
+                    // (Hunt v1.4.6 ronda 13, A4-R13-04.) The callback's
+                    // own GATT, not the field: the field may already have
+                    // been replaced (or nulled by shutdown()) by the time
+                    // this runs, and the MTU request belongs to the GATT
+                    // that just discovered its services.
+                    gatt.requestMtu(517);
                 }
 
                 probeService(this);
@@ -685,8 +740,10 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                 mServiceDiscoveryAttempts = 0;
                 mIsReconnecting = true;
                 mIsConnected = false;
-                gatt.disconnect();
-                mGatt = connectGatt(false);
+                // (Hunt v1.4.6 ronda 13, A4-R13-02.) Same replaceGatt()
+                // as reconnect(): the old disconnect() + connectGatt()
+                // here abandoned the old GATT without close().
+                replaceGatt();
             }
         }
     }
@@ -694,6 +751,13 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     @Override
     public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
         //Log.v(TAG, "onCharacteristicRead status=" + status + " uuid=" + characteristic.getUuid());
+        // (Hunt v1.4.6 ronda 13, A4-R13-04.) Same shutdown race as
+        // onServicesDiscovered above: this callback runs on a binder
+        // thread, mManager is only nulled by shutdown(), and the
+        // dereference below NPEs if shutdown() already ran.
+        if (mManager == null) {
+            return;
+        }
 
         // (Hunt v1.4.6 ronda 9, A4-R9-04.) A callback with status != 0
         // means the op did NOT complete, and the value is undefined: do not
@@ -713,6 +777,13 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     @Override
     public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
         //Log.v(TAG, "onCharacteristicWrite status=" + status + " uuid=" + characteristic.getUuid());
+        // (Hunt v1.4.6 ronda 13, A4-R13-04.) Same shutdown race as
+        // onServicesDiscovered above: this callback runs on a binder
+        // thread, mManager is only nulled by shutdown(), and the
+        // dereferences below NPE if shutdown() already ran.
+        if (mManager == null) {
+            return;
+        }
 
         // (Hunt v1.4.6 ronda 9, A4-R9-04.) The D0G Valve-mode write issued
         // directly from onDescriptorWrite bypasses the op queue, but its
@@ -751,6 +822,13 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
     // Enable this for verbose logging of controller input reports
         //Log.v(TAG, "onCharacteristicChanged uuid=" + characteristic.getUuid() + " data=" + HexDump.dumpHexString(characteristic.getValue()));
+        // (Hunt v1.4.6 ronda 13, A4-R13-04.) Same shutdown race as
+        // onServicesDiscovered above: this callback runs on a binder
+        // thread, mManager is only nulled by shutdown(), and the
+        // dereference below NPEs if shutdown() already ran.
+        if (mManager == null) {
+            return;
+        }
 
         if (characteristic.getUuid().equals(getInputCharacteristic()) && !mFrozen) {
             mManager.HIDDeviceInputReport(getId(), characteristic.getValue());
@@ -766,6 +844,13 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
         BluetoothGattCharacteristic chr = descriptor.getCharacteristic();
         //Log.v(TAG, "onDescriptorWrite status=" + status + " uuid=" + chr.getUuid() + " descriptor=" + descriptor.getUuid());
+        // (Hunt v1.4.6 ronda 13, A4-R13-04.) Same shutdown race as
+        // onServicesDiscovered above: this callback runs on a binder
+        // thread, mManager is only nulled by shutdown(), and the
+        // dereference below NPEs if shutdown() already ran.
+        if (mManager == null) {
+            return;
+        }
 
         // (Hunt v1.4.6 ronda 9, A4-R9-04.) A callback with status != 0
         // means the op did NOT complete: do not register on it and do not
