@@ -160,10 +160,10 @@ REX_HOOK_RAW(__imp__DbgPrint) {
   }
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 1);
+  StackArgList args(ctx, base, 1, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   if (count > 0) {
     auto str = data.str();
     // Trim trailing whitespace
@@ -190,10 +190,10 @@ REX_HOOK_RAW(__imp__XamDbgPrint) {
   }
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 1);
+  StackArgList args(ctx, base, 1, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   if (count > 0) {
     auto str = data.str();
     while (!str.empty() && std::isspace(static_cast<unsigned char>(str.back()))) {
@@ -229,10 +229,10 @@ REX_HOOK_RAW(__imp__sprintf) {
   auto buffer = GuestPtr<u8*>(base, buffer_ptr);
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 2);
+  StackArgList args(ctx, base, 2, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   // (Hunt v1.4.6, ronda 12, A3-R12-25.) The formatted result (count
   // bytes plus NUL, or 1 byte on a format error) was memcpy'd into
   // the guest buffer with no validation: a wild buffer pointer
@@ -278,10 +278,10 @@ REX_HOOK_RAW(__imp___snprintf) {
   auto buffer = GuestPtr<u8*>(base, buffer_ptr);
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 3);
+  StackArgList args(ctx, base, 3, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   if (count < 0) {
     if (buffer_count > 0) {
       buffer[0] = '\0';
@@ -321,10 +321,10 @@ REX_HOOK_RAW(__imp__swprintf) {
   auto buffer = GuestPtr<u16*>(base, buffer_ptr);
   auto format = GuestPtr<const u16*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 2);
+  StackArgList args(ctx, base, 2, GuestRangeReadable);
   WideStringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, true);
+  int32_t count = format_core(base, data, args, true, GuestRangeReadable, GuestRangeWritable);
   // (Hunt v1.4.6, ronda 12, A3-R12-25.) The formatted result (count
   // u16 units plus NUL, or 1 unit on a format error) was written into
   // the guest buffer with no validation. Validate first.
@@ -370,10 +370,10 @@ REX_HOOK_RAW(__imp___snwprintf) {
   auto buffer = GuestPtr<u16*>(base, buffer_ptr);
   auto format = GuestPtr<const u16*>(base, format_ptr);
 
-  StackArgList args(ctx, base, 3);
+  StackArgList args(ctx, base, 3, GuestRangeReadable);
   WideStringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, true);
+  int32_t count = format_core(base, data, args, true, GuestRangeReadable, GuestRangeWritable);
   if (count < 0) {
     if (buffer_count > 0) {
       buffer[0] = '\0';
@@ -407,9 +407,9 @@ REX_HOOK_RAW(__imp__vsprintf) {
   }
 
   // (Hunt v1.4.6, ronda 12, A3-R12-24.) Bounded format pre-scan, as
-  // in sprintf above. (The va_list itself is A3-R12-26: ArrayArgList
-  // reads it through GuestPtr with no validation -- no bounded fix
-  // exists without threading Memory through format_core.)
+  // in sprintf above. (Hunt v1.4.6, ronda 14, A3-R14-03: the va_list
+  // itself is validated per slot now -- ArrayArgList takes the
+  // readable check and format_core aborts with -1 on failure.)
   if (!ReadGuestFormatString(format_ptr)) {
     ctx.r3.u64 = static_cast<uint64_t>(-1);
     return;
@@ -418,10 +418,10 @@ REX_HOOK_RAW(__imp__vsprintf) {
   auto buffer = GuestPtr<u8*>(base, buffer_ptr);
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  ArrayArgList args(base, arg_ptr);
+  ArrayArgList args(base, arg_ptr, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   // (Hunt v1.4.6, ronda 12, A3-R12-25.) Output-buffer validation,
   // as in sprintf above.
   uint64_t write_size = count <= 0 ? 1 : uint64_t(count) + 1;
@@ -450,8 +450,8 @@ REX_HOOK_RAW(__imp___vsnprintf) {
   }
 
   // (Hunt v1.4.6, ronda 12, A3-R12-24.) Bounded format pre-scan, as
-  // in sprintf above. (The va_list itself is A3-R12-26, see
-  // vsprintf.)
+  // in sprintf above. (Hunt v1.4.6, ronda 14, A3-R14-03: the va_list
+  // itself is validated per slot now, see vsprintf.)
   if (!ReadGuestFormatString(format_ptr)) {
     ctx.r3.u64 = static_cast<uint64_t>(-1);
     return;
@@ -466,10 +466,10 @@ REX_HOOK_RAW(__imp___vsnprintf) {
   auto buffer = GuestPtr<u8*>(base, buffer_ptr);
   auto format = GuestPtr<const u8*>(base, format_ptr);
 
-  ArrayArgList args(base, arg_ptr);
+  ArrayArgList args(base, arg_ptr, GuestRangeReadable);
   StringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, false);
+  int32_t count = format_core(base, data, args, false, GuestRangeReadable, GuestRangeWritable);
   if (count < 0) {
     if (buffer_count > 0) {
       buffer[0] = '\0';
@@ -500,8 +500,8 @@ REX_HOOK_RAW(__imp__vswprintf) {
   }
 
   // (Hunt v1.4.6, ronda 12, A3-R12-24.) Bounded wide-format
-  // pre-scan, as in swprintf above. (The va_list itself is A3-R12-26,
-  // see vsprintf.)
+  // pre-scan, as in swprintf above. (Hunt v1.4.6, ronda 14, A3-R14-03:
+  // the va_list itself is validated per slot now, see vsprintf.)
   if (!ReadGuestFormatWString(format_ptr)) {
     ctx.r3.u64 = static_cast<uint64_t>(-1);
     return;
@@ -510,10 +510,10 @@ REX_HOOK_RAW(__imp__vswprintf) {
   auto buffer = GuestPtr<u16*>(base, buffer_ptr);
   auto format = GuestPtr<const u16*>(base, format_ptr);
 
-  ArrayArgList args(base, arg_ptr);
+  ArrayArgList args(base, arg_ptr, GuestRangeReadable);
   WideStringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, true);
+  int32_t count = format_core(base, data, args, true, GuestRangeReadable, GuestRangeWritable);
   // (Hunt v1.4.6, ronda 12, A3-R12-25.) Output-buffer validation,
   // as in swprintf above.
   uint64_t write_size = count <= 0 ? 1 : uint64_t(count) + 1;
@@ -543,8 +543,8 @@ REX_HOOK_RAW(__imp___vsnwprintf) {
   }
 
   // (Hunt v1.4.6, ronda 12, A3-R12-24.) Bounded wide-format
-  // pre-scan, as in swprintf above. (The va_list itself is A3-R12-26,
-  // see vsprintf.)
+  // pre-scan, as in swprintf above. (Hunt v1.4.6, ronda 14, A3-R14-03:
+  // the va_list itself is validated per slot now, see vsprintf.)
   if (!ReadGuestFormatWString(format_ptr)) {
     ctx.r3.u64 = static_cast<uint64_t>(-1);
     return;
@@ -560,10 +560,10 @@ REX_HOOK_RAW(__imp___vsnwprintf) {
   auto buffer = GuestPtr<u16*>(base, buffer_ptr);
   auto format = GuestPtr<const u16*>(base, format_ptr);
 
-  ArrayArgList args(base, arg_ptr);
+  ArrayArgList args(base, arg_ptr, GuestRangeReadable);
   WideStringFormatData data(format);
 
-  int32_t count = format_core(base, data, args, true);
+  int32_t count = format_core(base, data, args, true, GuestRangeReadable, GuestRangeWritable);
   if (count < 0) {
     if (buffer_count > 0) {
       buffer[0] = '\0';
@@ -591,8 +591,8 @@ REX_HOOK_RAW(__imp___vscwprintf) {
   }
 
   // (Hunt v1.4.6, ronda 12, A3-R12-24.) Bounded wide-format
-  // pre-scan, as in swprintf above. (The va_list itself is A3-R12-26,
-  // see vsprintf.)
+  // pre-scan, as in swprintf above. (Hunt v1.4.6, ronda 14, A3-R14-03:
+  // the va_list itself is validated per slot now, see vsprintf.)
   if (!ReadGuestFormatWString(format_ptr)) {
     ctx.r3.u64 = static_cast<uint64_t>(-1);
     return;
@@ -600,10 +600,10 @@ REX_HOOK_RAW(__imp___vscwprintf) {
 
   auto format = GuestPtr<const u16*>(base, format_ptr);
 
-  ArrayArgList args(base, arg_ptr);
+  ArrayArgList args(base, arg_ptr, GuestRangeReadable);
   WideCountFormatData data(format);
 
-  int32_t count = format_core(base, data, args, true);
+  int32_t count = format_core(base, data, args, true, GuestRangeReadable, GuestRangeWritable);
   assert_true(count < 0 || data.count() == count);
   ctx.r3.u64 = count;
 }
