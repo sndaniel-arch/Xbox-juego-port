@@ -214,8 +214,14 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   // Round the base address down to the nearest page boundary.
   uint32_t adjusted_base = *base_addr_ptr - (*base_addr_ptr % page_size);
   // For some reason, some games pass in negative sizes.
+  // (Hunt v1.4.6, ronda 10, A3-R10-14.) Negating INT_MIN (region_size
+  // == 0x80000000) was UB; in practice it wrapped to INT_MIN and the
+  // allocation failed with NO_MEMORY, so this is behaviour-preserving:
+  // take the magnitude in unsigned arithmetic instead.
   uint32_t adjusted_size =
-      int32_t(*region_size_ptr) < 0 ? -int32_t(region_size_ptr.value()) : region_size_ptr.value();
+      int32_t(*region_size_ptr) < 0
+          ? static_cast<uint32_t>(0) - region_size_ptr.value()
+          : region_size_ptr.value();
   // Use 64KB allocation granularity when no base address is specified,
   // matching Xbox 360 behavior. With a base address, use the heap's page size.
   adjusted_size = rex::round_up(adjusted_size, adjusted_base ? page_size : 64 * 1024);
@@ -316,7 +322,10 @@ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_siz
   }
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(*base_addr_ptr);
-  if (heap->heap_type() != memory::HeapType::kGuestVirtual) {
+// (Hunt v1.4.6, ronda 10, A3-R10-01.) LookupHeap returns nullptr for 0x7F000000-0x80000000 and
+  // >= 0xFFD00000: the heap_type() deref below used to be a host null
+  // deref for a guest address in either gap (the :202 sibling checks).
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
     return X_STATUS_INVALID_PARAMETER;
   }
   // Adjust the base downwards to the nearest page boundary.
@@ -379,7 +388,9 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
   }
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_addr_value);
-  if (heap->heap_type() != memory::HeapType::kGuestVirtual) {
+// (Hunt v1.4.6, ronda 10, A3-R10-01.) See NtProtectVirtualMemory above: null heap is a guest
+  // address in a heap-map gap, not a virtual allocation.
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
     return X_STATUS_INVALID_PARAMETER;
   }
   bool result = false;
@@ -538,11 +549,22 @@ void MmFreePhysicalMemory_entry(u32 type, u32 base_address) {
   assert_true((base_address & 0x1F) == 0);
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
+// (Hunt v1.4.6, ronda 10, A3-R10-01.) This entry had no guard at all -- not even a heap-type
+  // check -- so a guest address in a heap-map gap null-derefed on
+  // Release(). Nothing owns such an address, so there is nothing to
+  // free (same no-op SystemHeapFree already does for gap addresses).
+  if (!heap) {
+    return;
+  }
   heap->Release(base_address);
 }
 
 u32 MmQueryAddressProtect_entry(u32 base_address) {
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
+// (Hunt v1.4.6, ronda 10, A3-R10-01.) See NtProtectVirtualMemory above.
+  if (!heap) {
+    return 0;
+  }
   uint32_t access;
   if (!heap->QueryProtect(base_address, &access)) {
     access = 0;
@@ -575,12 +597,38 @@ void MmSetAddressProtect_entry(mapped_void base_address, u32 region_size, u32 pr
 
 u32 MmQueryAllocationSize_entry(mapped_void base_address) {
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address.guest_address());
+// (Hunt v1.4.6, ronda 10, A3-R10-01.) See NtProtectVirtualMemory above.
+  if (!heap) {
+    return 0;
+  }
   uint32_t size;
   if (!heap->QuerySize(base_address.guest_address(), &size)) {
     size = 0;
   }
 
   return size;
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-04.) A guest address is only a
+// freeable system-heap allocation if it is the start of a live
+// (committed) region: BaseHeap::Release already rejects a
+// non-region-start, but it happily frees ANY region start, including
+// a live game allocation the guest merely guessed. QueryRegionInfo
+// reports allocation_base == the region start and state == 0 for a
+// free region, so both checks together reject interior pages, free
+// regions and gap addresses. This cannot prove ownership -- no live
+// allocation tracking exists -- so freeing another live region start
+// remains possible; see NOTES.md.
+static bool GuestSystemHeapRegionStart(uint32_t guest_address) {
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  if (!heap) {
+    return false;
+  }
+  rex::memory::HeapAllocationInfo info;
+  if (!heap->QueryRegionInfo(guest_address, &info)) {
+    return false;
+  }
+  return info.state != 0 && info.allocation_base == guest_address;
 }
 
 // https://code.google.com/p/vdash/source/browse/trunk/vdash/include/kernel.h
@@ -741,10 +789,33 @@ void ExFreePool_entry(mapped_void base_address) {
   uint32_t addr = base_address.guest_address();
   if ((addr & (4096 - 1)) == 0) {
     // Page-aligned: large allocation with no pool header.
+    // (Hunt v1.4.6, ronda 10, A3-R10-04.) The old code freed ANY
+    // page-aligned address in the system heap. Only a live region
+    // start may be freed; anything else is silently ignored, like
+    // SystemHeapFree already does for a gap address.
+    if (!GuestSystemHeapRegionStart(addr)) {
+      return;
+    }
     REX_KERNEL_MEMORY()->SystemHeapFree(addr);
   } else {
     // Small allocation: subtract pool header to get real alloc base.
-    REX_KERNEL_MEMORY()->SystemHeapFree(addr - sizeof(X_POOL_ALLOC_HEADER));
+    // (Hunt v1.4.6, ronda 10, A3-R10-04.) The allocation wrote the
+    // unk_2 == 170 magic into the header at alloc time and the free
+    // never checked it, so any address 8 bytes past a region start
+    // freed that region. Require the header to be readable, carry
+    // the magic, and sit at a live region start.
+    if (addr < sizeof(X_POOL_ALLOC_HEADER)) {
+      return;
+    }
+    uint32_t header_addr = addr - sizeof(X_POOL_ALLOC_HEADER);
+    if (!GuestRangeReadable(header_addr, sizeof(X_POOL_ALLOC_HEADER))) {
+      return;
+    }
+    auto header = REX_KERNEL_MEMORY()->TranslateVirtual<const X_POOL_ALLOC_HEADER*>(header_addr);
+    if (header->unk_2 != 170 || !GuestSystemHeapRegionStart(header_addr)) {
+      return;
+    }
+    REX_KERNEL_MEMORY()->SystemHeapFree(header_addr);
   }
 }
 
@@ -774,13 +845,22 @@ u32 MmCreateKernelStack_entry(u32 stack_size, u32 r4) {
   auto stack_size_aligned = (stack_size + 0xFFF) & 0xFFFFF000;
   uint32_t stack_alignment = (stack_size & 0xF000) ? 0x1000 : 0x10000;
 
-  uint32_t stack_address;
-  REX_KERNEL_STATE()
-      ->memory()
-      ->LookupHeap(0x70000000)
-      ->AllocRange(0x70000000, 0x7F000000, stack_size_aligned, stack_alignment,
-                   memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
-                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false, &stack_address);
+  uint32_t stack_address = 0;
+  auto* heap = REX_KERNEL_STATE()->memory()->LookupHeap(0x70000000);
+  // (Hunt v1.4.6, ronda 10, A3-R10-14.) AllocRange sets *out_address
+  // = 0 on entry and its return was ignored, so a failed allocation
+  // returned 0 + stack_size -- a bogus stack top reported as success
+  // and then used as a real kernel stack. Fail honestly instead.
+  // (The heap itself is the fixed 0x70000000 stack heap; a null heap
+  // here is the same failure.)
+  if (!heap ||
+      !heap->AllocRange(0x70000000, 0x7F000000, stack_size_aligned, stack_alignment,
+                        memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                        memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
+                        &stack_address) ||
+      !stack_address) {
+    return 0;
+  }
   return stack_address + stack_size;
 }
 
@@ -813,6 +893,13 @@ u32 NtAllocateEncryptedMemory_entry(u32 unk, u32 region_size, mapped_u32 base_ad
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-08.) The heap IS checked below
+  // (:853), but *base_addr_ptr is written with only the NULL check
+  // above: validate the 4-byte out-param range first.
+  if (!GuestRangeWritable(base_addr_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   if (!region_size) {
     return X_STATUS_INVALID_PARAMETER;
   }
@@ -840,6 +927,13 @@ u32 NtAllocateEncryptedMemory_entry(u32 unk, u32 region_size, mapped_u32 base_ad
 
 u32 NtFreeEncryptedMemory_entry(u32 region_type, mapped_u32 base_address_ptr) {
   if (!base_address_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-08.) *base_address_ptr is read
+  // below with only the NULL check above: validate the 4-byte range
+  // first (same class as NtAllocateEncryptedMemory just above).
+  if (!GuestRangeReadable(base_address_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
