@@ -1074,6 +1074,40 @@ jobs:
           # the stock glue by design, same as the SDK files above.
           cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java
+          # (Hunt v1.4.6, ronda 12, A5-R12-01.) android_sdk.sh re-stages
+          # the STOCK SDL3 Java glue over org/libsdl/app/ (cp *.java), so
+          # it clobbers not just SDLActivity.java but also the other five
+          # tracked SDL files -- and the re-overlay above restored ONLY
+          # SDLActivity. Every CI build since the R9 GATT fixes silently
+          # shipped the STOCK HIDDeviceBLESteamController (no GATT fixes
+          # A4-R9-03/04/05/06) and the STOCK HIDDeviceManager /
+          # SDLControllerManager / SDLSurface (no R11 fixes A4-R11-02/05/
+          # 06) and the STOCK SDLAudioManager (no R12 null-guard
+          # A4-R12-02), while the FULL script gates the same files by
+          # marker and fails loudly. Restore all five here, and grep each
+          # marker (the stock glue does not carry them): a cp restores
+          # the tracked file as-is, so only the marker proves the
+          # tracked file itself still carries its fix.
+          # (Parent amendment: SDLAudioManager.java becomes tracked in
+          # this same R12 batch, so it needs the same restore + gate --
+          # otherwise run #33 would ship it stock, the same ALTO bug
+          # one file short.)
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java
+          grep -q "Hunt v1.4.6 ronda 4, A4-R4-01" rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java || { echo "::error::SDLActivity.java lost the onDestroy fix (A4-R4-01) -- the tracked file no longer carries it"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 9, A4-R9-04" rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java || { echo "::error::HIDDeviceBLESteamController.java lost the GATT fixes (A4-R9-03/04/05/06) -- the tracked file no longer carries them"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 11, A4-R11-02" rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java || { echo "::error::HIDDeviceManager.java lost the USB-handler fix (A4-R11-02) -- the tracked file no longer carries it"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 11, A4-R11-05" rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java || { echo "::error::SDLControllerManager.java lost the pollInputDevices null-guard (A4-R11-05) -- the tracked file no longer carries it"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 11, A4-R11-06" rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java || { echo "::error::SDLSurface.java lost the enableSensor null-guard (A4-R11-06) -- the tracked file no longer carries it"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 12, A4-R12-02" rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java || { echo "::error::SDLAudioManager.java lost the getProductName null-guard (A4-R12-02) -- the tracked file no longer carries it"; exit 1; }
 
       - name: Guard tracked SDK files carry their patch hunks (M-5)
         timeout-minutes: 10
@@ -1123,7 +1157,13 @@ jobs:
           # from the tracked default.
           f="rexauto/android/sdk/rexglue-sdk/src/filesystem/devices/xbmovie_device.cpp"
           test -f "$f"
-          n="$(grep -c 'REXCVAR_DEFINE_BOOL(xbmovie_probe, false,' "$f")"
+          # (Hunt v1.4.6, ronda 12, A5-R12-03.) grep -c exits 1 on 0
+          # matches, and under set -euo pipefail that kills the step with
+          # a bare exit 1 before the [ "$n" != "1" ] check below can print
+          # its ::error:: -- the same pattern the FULL script guards with
+          # `|| true` (or an explicit -q check) everywhere. `|| true`
+          # inside the substitution lets n="0" through to the check.
+          n="$(grep -c 'REXCVAR_DEFINE_BOOL(xbmovie_probe, false,' "$f" || true)"
           if [ "$n" != "1" ]; then echo "::error::xbmovie_probe default pattern found $n times (want 1)"; exit 1; fi
           sed -i 's/REXCVAR_DEFINE_BOOL(xbmovie_probe, false,/REXCVAR_DEFINE_BOOL(xbmovie_probe, true,/' "$f"
           grep -n 'REXCVAR_DEFINE_BOOL(xbmovie_probe' "$f"
@@ -1388,7 +1428,13 @@ jobs:
           # one signer, the heart key: the flow does a single `apksigner
           # sign` with a single keystore, so a second signer can only be
           # a re-sign, never legitimate here.
-          _CERT_COUNT="$(grep -a -c "certificate SHA-256 digest" /tmp/verify.txt)"
+          # (Hunt v1.4.6, ronda 12, A5-R12-03.) grep -c exits 1 on 0
+          # matches: without `|| true`, a verify output with no digest
+          # line (e.g. an apksigner format change -- the J-4 worry) kills
+          # this step with a bare exit 1 under set -euo pipefail instead
+          # of reaching the "::error::APK has 0 signers" check below.
+          # The FULL script guards the same line with a prior -q check.
+          _CERT_COUNT="$(grep -a -c "certificate SHA-256 digest" /tmp/verify.txt || true)"
           if [ "$_CERT_COUNT" != "1" ]; then
             echo "::error::APK has $_CERT_COUNT signers (expected exactly 1, the heart key): a second signer indicates a re-sign."
             exit 1
@@ -1413,7 +1459,13 @@ jobs:
           # (aapt2 dies with 141 once grep exits, and pipefail fails the
           # step) -- same lesson as M-13b above (/tmp/apk.txt).
           "$AAPT2" dump badging "$APK" > /tmp/badging.txt || { echo "::error::aapt2 dump badging failed on $APK"; exit 1; }
-          _BADGING="$(grep -a -m1 '^package:' /tmp/badging.txt)" 
+          # (Hunt v1.4.6, ronda 12, A5-R12-03.) grep -m1 exits 1 on 0
+          # matches: without `|| true`, a badging output with no package:
+          # line kills this step with a bare exit 1 under set -euo pipefail
+          # instead of reaching the versionCode ::error:: below. The FULL
+          # script guards the same line with `|| { ...; exit 1; }`.
+          # (Trailing space on the old line removed here too.)
+          _BADGING="$(grep -a -m1 '^package:' /tmp/badging.txt || true)"
           ACTUAL_VERSION_CODE="$(echo "$_BADGING" | sed "s/.*versionCode='\([0-9]*\)'.*/\1/")"
           ACTUAL_VERSION_NAME="$(echo "$_BADGING" | sed "s/.*versionName='\([^']*\)'.*/\1/")"
           if [ "$ACTUAL_VERSION_CODE" != "${{ github.run_number }}" ]; then
