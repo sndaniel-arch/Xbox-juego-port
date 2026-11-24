@@ -34,8 +34,159 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// (Hunt v1.4.6, ronda 12, A3-R12-06.) This file had no range helper:
+// every entry below dereferenced its guest pointers with at most a
+// NULL check, and TranslateVirtual never validates or returns null,
+// so a wild pointer SIGSEGVd the host. Same heap validation as
+// A3-R4-07 (xam_app.cpp): reject a range that wraps past 4 GiB,
+// starts or ends outside any heap, or spans heaps of different kinds
+// (or two physical heaps); inside a single heap require the pages to
+// be accessible; across a heap boundary validate both ends (A3-R8-13);
+// a range spanning more than two heaps is rejected outright (A3-R9-10).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 12, A3-R12-06.) Bounded guest string reads,
+// the R10-03 pattern from crt/file.cpp: MappedPtr<char>::value() /
+// MappedPtr<char16_t>::value() build a string_view straight off the
+// host pointer -- a strlen to NUL with no cap -- so a guest string
+// with no NUL in its page ran the host scan into unmapped memory.
+// Read page by page (each chunk validated readable first), stop at
+// the first NUL, truncate at 4096 units if there is none. Returns
+// false on an invalid range. Callers pass a null guest address as
+// "empty" (the MappedPtr null convention); that case is handled by
+// the caller, not here.
+constexpr size_t kMaxGuestStringChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestStringChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
+static bool ReadGuestWString(uint32_t guest_address, std::u16string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestStringChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_units = (0x1000 - (address & 0xFFF)) / sizeof(char16_t);
+    size_t chunk = remaining < page_units ? remaining : page_units;
+    if (!chunk || !GuestRangeReadable(address, chunk * sizeof(char16_t))) {
+      return false;
+    }
+    const char16_t* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char16_t*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char16_t c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk * sizeof(char16_t));
+    remaining -= chunk;
+  }
+  return true;
+}
+
+// (Hunt v1.4.6, ronda 12, A3-R12-15.) An X_UNICODE_STRING guest
+// struct plus the bytes it points at: the 8-byte header first, then
+// length bytes at pointer. A NULL pointer or zero length means
+// "empty", which TranslateUnicodeString already tolerates.
+static bool GuestUnicodeStringReadable(uint32_t guest_address) {
+  if (!guest_address) {
+    return true;
+  }
+  if (!GuestRangeReadable(guest_address, sizeof(X_UNICODE_STRING))) {
+    return false;
+  }
+  auto* unicode = REX_KERNEL_MEMORY()->TranslateVirtual<const X_UNICODE_STRING*>(guest_address);
+  uint32_t length = unicode->length;
+  if (!length) {
+    return true;
+  }
+  uint32_t pointer = unicode->pointer;
+  if (!pointer) {
+    return false;
+  }
+  return GuestRangeReadable(pointer, length);
+}
+
 // https://msdn.microsoft.com/en-us/library/ff561778
 u32 RtlCompareMemory_entry(mapped_void source1, mapped_void source2, u32 length) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-06.) Both buffers were read
+  // length bytes with no validation at all: a wild pointer SIGSEGVd
+  // the host. Validate both ranges first; 0 is the honest "no bytes
+  // match" answer for an invalid range (same as the sibling below).
+  if (!GuestRangeReadable(source1.guest_address(), length) ||
+      !GuestRangeReadable(source2.guest_address(), length)) {
+    return 0;
+  }
   uint8_t* p1 = source1;
   uint8_t* p2 = source2;
 
@@ -57,6 +208,13 @@ u32 RtlCompareMemory_entry(mapped_void source1, mapped_void source2, u32 length)
 u32 RtlCompareMemoryUlong_entry(mapped_void source, u32 length, u32 pattern) {
   // Return 0 if source/length not aligned
   if (source.guest_address() % 4 || length % 4) {
+    return 0;
+  }
+
+  // (Hunt v1.4.6, ronda 12, A3-R12-07.) The buffer was read length
+  // bytes (as_array, no validation) below: a wild pointer SIGSEGVd
+  // the host. Validate the whole range first.
+  if (!GuestRangeReadable(source.guest_address(), length)) {
     return 0;
   }
 
@@ -82,6 +240,14 @@ void RtlFillMemoryUlong_entry(mapped_void destination, u32 length, u32 pattern) 
 
   // NOTE: length must be % 4, so we can work on uint32s.
   uint32_t count = length >> 2;
+
+  // (Hunt v1.4.6, ronda 12, A3-R12-08.) The destination was written
+  // count dwords with only the null check above: a wild non-null
+  // pointer SIGSEGVd the host. Validate the bytes actually written
+  // (count * 4 == length with the low 2 bits cleared) first.
+  if (!GuestRangeWritable(destination.guest_address(), count * sizeof(uint32_t))) {
+    return;
+  }
 
   uint32_t* p = destination.as<uint32_t*>();
   uint32_t swapped_pattern = rex::byte_swap(pattern);
@@ -109,36 +275,75 @@ u32 RtlLowerChar_entry(u32 in) {
 }
 
 u32 RtlCompareString_entry(mapped_string string_1, mapped_string string_2, u32 case_insensitive) {
-  int ret = case_insensitive ? rex::string::compare_case(string_1, string_2)
-                             : std::strcmp(string_1, string_2);
+  // (Hunt v1.4.6, ronda 12, A3-R12-09.) strcmp / compare_case scan
+  // both strings to NUL with no cap (MappedPtr<char>::value() class,
+  // R10-03): a guest string with no NUL in its page ran the host scan
+  // into unmapped memory. Read both bounded first; a null string
+  // stays empty, matching the MappedPtr null convention.
+  std::string str_1;
+  std::string str_2;
+  if ((string_1 && !ReadGuestCString(string_1.guest_address(), &str_1)) ||
+      (string_2 && !ReadGuestCString(string_2.guest_address(), &str_2))) {
+    return 0;
+  }
+  int ret = case_insensitive ? rex::string::compare_case(str_1.c_str(), str_2.c_str())
+                             : std::strcmp(str_1.c_str(), str_2.c_str());
 
   return ret;
 }
 
 u32 RtlCompareStringN_entry(mapped_string string_1, u32 string_1_len, mapped_string string_2,
                             u32 string_2_len, u32 case_insensitive) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-10.) The 0xFFFF paths called
+  // strlen() on the raw guest pointers -- an unbounded scan (R10-03
+  // class) -- and strncmp then read the raw pointers anyway, with
+  // len computed from the RAW lengths instead of len1/len2 (so a
+  // 0xFFFF length compared 0xFFFF bytes). Read both strings bounded
+  // first and compare the copies; a null string stays empty.
+  std::string str_1;
+  std::string str_2;
+  if ((string_1 && !ReadGuestCString(string_1.guest_address(), &str_1)) ||
+      (string_2 && !ReadGuestCString(string_2.guest_address(), &str_2))) {
+    return 0;
+  }
   uint32_t len1 = string_1_len;
   uint32_t len2 = string_2_len;
 
   if (string_1_len == 0xFFFF) {
-    len1 = uint32_t(std::strlen(string_1));
+    len1 = uint32_t(str_1.size());
   }
   if (string_2_len == 0xFFFF) {
-    len2 = uint32_t(std::strlen(string_2));
+    len2 = uint32_t(str_2.size());
   }
-  auto len = std::min(string_1_len, string_2_len);
+  auto len = std::min(len1, len2);
 
-  int ret = case_insensitive ? rex::string::compare_case_n(string_1, string_2, len)
-                             : std::strncmp(string_1, string_2, len);
+  int ret = case_insensitive ? rex::string::compare_case_n(str_1.c_str(), str_2.c_str(), len)
+                             : std::strncmp(str_1.c_str(), str_2.c_str(), len);
 
   return ret;
 }
 
 // https://msdn.microsoft.com/en-us/library/ff561918
 void RtlInitAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> destination, mapped_string source) {
-  REXKRNL_IMPORT_TRACE("RtlInitAnsiString", "str={}", source ? source.value() : "(null)");
+  // (Hunt v1.4.6, ronda 12, A3-R12-11.) destination was written (8
+  // bytes: length / maximum_length / pointer) with no check at all,
+  // and strlen(source) scanned the guest string to NUL with no cap
+  // (R10-03 class). Validate the struct writable first, then read the
+  // source bounded. The old IMPORT_TRACE line above also scanned
+  // source.value(); it now logs the bounded copy instead (the trace
+  // is log_noisy-gated and was not evaluated by default, but the
+  // scan was still latent in the line).
+  if (!destination ||
+      !GuestRangeWritable(destination.guest_address(), sizeof(X_ANSI_STRING))) {
+    return;
+  }
+  std::string source_str;
+  if (source && !ReadGuestCString(source.guest_address(), &source_str)) {
+    return;
+  }
+  REXKRNL_IMPORT_TRACE("RtlInitAnsiString", "str={}", source ? source_str : "(null)");
   if (source) {
-    uint16_t length = (uint16_t)strlen(source);
+    uint16_t length = (uint16_t)source_str.size();
     destination->length = length;
     destination->maximum_length = length + 1;
   } else {
@@ -150,6 +355,14 @@ void RtlInitAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> destination, mapped_string
 
 // https://msdn.microsoft.com/en-us/library/ff561899
 void RtlFreeAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> string) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-13.) string was dereferenced with
+  // no check at all (R10-13 class): a null or wild pointer SIGSEGVd
+  // the host on the pointer read and the 8-byte reset() write.
+  // Validate the struct writable first; the free itself stays the
+  // A3-R10-04 residue (no ownership check exists for SystemHeapFree).
+  if (!string || !GuestRangeWritable(string.guest_address(), sizeof(X_ANSI_STRING))) {
+    return;
+  }
   if (string->pointer) {
     REX_KERNEL_MEMORY()->SystemHeapFree(string->pointer);
   }
@@ -159,9 +372,22 @@ void RtlFreeAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> string) {
 
 // https://msdn.microsoft.com/en-us/library/ff561934
 void RtlInitUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> destination, mapped_wstring source) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-12.) destination was written (8
+  // bytes) with no check at all, and source.value().size() scanned
+  // the wide guest string to NUL with no cap (R10-03 class, wide
+  // variant). Validate the struct writable first, then read the
+  // source bounded.
+  if (!destination ||
+      !GuestRangeWritable(destination.guest_address(), sizeof(X_UNICODE_STRING))) {
+    return;
+  }
+  std::u16string source_str;
+  if (source && !ReadGuestWString(source.guest_address(), &source_str)) {
+    return;
+  }
   if (source) {
-    destination->length = (uint16_t)source.value().size() * 2;
-    destination->maximum_length = (uint16_t)(source.value().size() + 1) * 2;
+    destination->length = (uint16_t)source_str.size() * 2;
+    destination->maximum_length = (uint16_t)(source_str.size() + 1) * 2;
     destination->pointer = source.guest_address();
   } else {
     destination->reset();
@@ -170,6 +396,11 @@ void RtlInitUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> destination, mapped_
 
 // https://msdn.microsoft.com/en-us/library/ff561903
 void RtlFreeUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> string) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-13.) Same unvalidated deref as
+  // RtlFreeAnsiString above: validate the struct writable first.
+  if (!string || !GuestRangeWritable(string.guest_address(), sizeof(X_UNICODE_STRING))) {
+    return;
+  }
   if (string->pointer) {
     REX_KERNEL_MEMORY()->SystemHeapFree(string->pointer);
   }
@@ -178,13 +409,30 @@ void RtlFreeUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> string) {
 }
 
 void RtlCopyString_entry(ppc_ptr_t<X_ANSI_STRING> destination, ppc_ptr_t<X_ANSI_STRING> source) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-14.) Both structs were read with
+  // no check, and the memcpy copied length bytes between two
+  // TranslateVirtual pointers -- guest-controlled addresses and a
+  // guest-controlled length, no validation anywhere. Validate the
+  // destination struct writable and the source struct readable first,
+  // then both buffers for the bytes actually copied.
+  if (!destination ||
+      !GuestRangeWritable(destination.guest_address(), sizeof(X_ANSI_STRING))) {
+    return;
+  }
   if (!source) {
     destination->length = 0;
+    return;
+  }
+  if (!GuestRangeReadable(source.guest_address(), sizeof(X_ANSI_STRING))) {
     return;
   }
 
   auto length = std::min(destination->maximum_length, source->length);
   if (length > 0) {
+    if (!GuestRangeWritable(destination->pointer, length) ||
+        !GuestRangeReadable(source->pointer, length)) {
+      return;
+    }
     auto dst_buf = REX_KERNEL_MEMORY()->TranslateVirtual(destination->pointer);
     auto src_buf = REX_KERNEL_MEMORY()->TranslateVirtual(source->pointer);
     std::memcpy(dst_buf, src_buf, length);
@@ -194,13 +442,29 @@ void RtlCopyString_entry(ppc_ptr_t<X_ANSI_STRING> destination, ppc_ptr_t<X_ANSI_
 
 void RtlCopyUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> destination,
                                 ppc_ptr_t<X_UNICODE_STRING> source) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-14.) Same unvalidated struct
+  // reads and guest-controlled memcpy as RtlCopyString above, with
+  // the same length * 2 byte count as the original (preserved
+  // verbatim; see evidence section 5 for the double-count question).
+  // Validate both structs, then both buffers.
+  if (!destination ||
+      !GuestRangeWritable(destination.guest_address(), sizeof(X_UNICODE_STRING))) {
+    return;
+  }
   if (!source) {
     destination->length = 0;
+    return;
+  }
+  if (!GuestRangeReadable(source.guest_address(), sizeof(X_UNICODE_STRING))) {
     return;
   }
 
   auto length = std::min(destination->maximum_length, source->length);
   if (length > 0) {
+    if (!GuestRangeWritable(destination->pointer, length * 2) ||
+        !GuestRangeReadable(source->pointer, length * 2)) {
+      return;
+    }
     auto dst_buf = REX_KERNEL_MEMORY()->TranslateVirtual(destination->pointer);
     auto src_buf = REX_KERNEL_MEMORY()->TranslateVirtual(source->pointer);
     std::memcpy(dst_buf, src_buf, length * 2);
@@ -216,6 +480,21 @@ u32 RtlUnicodeStringToAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> destination_ptr,
   // _In_     PCUNICODE_STRING SourceString,
   // _In_     BOOLEAN AllocateDestinationString
 
+  // (Hunt v1.4.6, ronda 12, A3-R12-15.) destination_ptr was
+  // dereferenced with no check at all, TranslateUnicodeString read
+  // length bytes off source_ptr->pointer with no validation, and the
+  // non-alloc path computed buffer_capacity - 1 with no guard: a
+  // maximum_length of 0 underflowed to 0xFFFFFFFF and memcpy copied
+  // ~4 GiB. Validate both structs and the source bytes first; reject
+  // a zero-capacity destination (BUFFER_OVERFLOW, the existing
+  // failure value for this path) instead of underflowing; validate
+  // the destination buffer for the bytes actually written; and never
+  // memcpy into a failed alloc (SystemHeapAlloc returns 0).
+  if (!destination_ptr ||
+      !GuestRangeWritable(destination_ptr.guest_address(), sizeof(X_ANSI_STRING)) ||
+      !GuestUnicodeStringReadable(source_ptr.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   std::u16string unicode_str = util::TranslateUnicodeString(REX_KERNEL_MEMORY(), source_ptr);
   std::string ansi_str = rex::string::to_utf8(unicode_str);
   if (ansi_str.size() > 0xFFFF - 1) {
@@ -225,6 +504,9 @@ u32 RtlUnicodeStringToAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> destination_ptr,
   X_STATUS result = X_STATUS_SUCCESS;
   if (alloc_dest) {
     uint32_t buffer_ptr = REX_KERNEL_MEMORY()->SystemHeapAlloc(uint32_t(ansi_str.size() + 1));
+    if (!buffer_ptr) {
+      return X_STATUS_NO_MEMORY;
+    }
 
     memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(buffer_ptr), ansi_str.data(), ansi_str.size() + 1);
     destination_ptr->length = static_cast<uint16_t>(ansi_str.size());
@@ -232,6 +514,12 @@ u32 RtlUnicodeStringToAnsiString_entry(ppc_ptr_t<X_ANSI_STRING> destination_ptr,
     destination_ptr->pointer = static_cast<uint32_t>(buffer_ptr);
   } else {
     uint32_t buffer_capacity = destination_ptr->maximum_length;
+    if (buffer_capacity == 0) {
+      return X_STATUS_BUFFER_OVERFLOW;
+    }
+    if (!GuestRangeWritable(destination_ptr->pointer, buffer_capacity)) {
+      return X_STATUS_BUFFER_OVERFLOW;
+    }
     auto buffer_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(destination_ptr->pointer);
     if (buffer_capacity < ansi_str.size() + 1) {
       // Too large - we just write what we can.
@@ -251,6 +539,16 @@ u32 RtlMultiByteToUnicodeN_entry(mapped_u16 destination_ptr, u32 destination_len
                                  u32 source_len) {
   uint32_t copy_len = destination_len >> 1;
   copy_len = copy_len < source_len ? copy_len : source_len;
+
+  // (Hunt v1.4.6, ronda 12, A3-R12-16.) The element-wise copy below
+  // read/wrote copy_len entries with no validation of either buffer,
+  // and *written_ptr was written with only a non-zero check (R10-09
+  // class). Validate both buffers and the out-param first.
+  if (!GuestRangeWritable(destination_ptr.guest_address(), copy_len * sizeof(uint16_t)) ||
+      !GuestRangeReadable(source_ptr.guest_address(), copy_len) ||
+      (written_ptr && !GuestRangeWritable(written_ptr.guest_address(), sizeof(uint32_t)))) {
+    return 0;
+  }
 
   // TODO(benvanik): maybe use MultiByteToUnicode on Win32? would require
   // swapping.
@@ -272,6 +570,15 @@ u32 RtlUnicodeToMultiByteN_entry(ppc_ptr_t<uint8_t> destination_ptr, u32 destina
   uint32_t copy_len = source_len >> 1;
   copy_len = copy_len < destination_len ? copy_len : destination_len;
 
+  // (Hunt v1.4.6, ronda 12, A3-R12-16.) Same unvalidated buffers and
+  // out-param as RtlMultiByteToUnicodeN above (mirrored directions).
+  // Validate both buffers and the out-param first.
+  if (!GuestRangeWritable(destination_ptr.guest_address(), copy_len) ||
+      !GuestRangeReadable(source_ptr.guest_address(), copy_len * sizeof(uint16_t)) ||
+      (written_ptr && !GuestRangeWritable(written_ptr.guest_address(), sizeof(uint32_t)))) {
+    return 0;
+  }
+
   // TODO(benvanik): maybe use UnicodeToMultiByte on Win32?
   for (uint32_t i = 0; i < copy_len; i++) {
     uint16_t c = source_ptr[i];
@@ -290,6 +597,16 @@ u32 RtlImageNtHeader_entry(mapped_void module) {
     return 0;
   }
 
+  // (Hunt v1.4.6, ronda 12, A3-R12-17.) module was only null-checked:
+  // dos_lfanew is a guest-controlled offset, so &dos_header[lfanew]
+  // read an arbitrary guest address with no validation at all. Read
+  // the DOS header from a validated 0x40-byte range first, then
+  // validate the 4 NT-magic bytes at the guest-controlled offset
+  // (64-bit math: a negative or overflowing offset is rejected).
+  if (!GuestRangeReadable(module.guest_address(), 0x40)) {
+    return 0;
+  }
+
   // Little-endian! no swapping!
 
   auto dos_header = module.as<const uint8_t*>();
@@ -298,6 +615,14 @@ u32 RtlImageNtHeader_entry(mapped_void module) {
     return 0;
   }
   auto dos_lfanew = *reinterpret_cast<const int32_t*>(&dos_header[0x3C]);
+  if (dos_lfanew < 0) {
+    return 0;
+  }
+  uint64_t nt_header_address = uint64_t(module.guest_address()) + uint64_t(dos_lfanew);
+  if (nt_header_address > UINT32_MAX ||
+      !GuestRangeReadable(static_cast<uint32_t>(nt_header_address), sizeof(uint32_t))) {
+    return 0;
+  }
 
   auto nt_header = &dos_header[dos_lfanew];
   auto nt_magic = *reinterpret_cast<const uint32_t*>(&nt_header[0x00]);
@@ -308,8 +633,25 @@ u32 RtlImageNtHeader_entry(mapped_void module) {
 }
 
 u32 RtlImageXexHeaderField_entry(ppc_ptr_t<xex2_header> xex_header, u32 field_dword) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-18.) xex_header was dereferenced
+  // with no check at all, and GetOptHeader walks header->headers[i]
+  // for a guest-controlled header_count (8 bytes per entry): a wild
+  // pointer, or a huge count, read past the header into unmapped
+  // memory. Validate the 0x18-byte fixed prefix first, read the
+  // count, then validate the whole table (64-bit math).
+  if (!xex_header ||
+      !GuestRangeReadable(xex_header.guest_address(), offsetof(xex2_header, headers))) {
+    return 0;
+  }
   uint32_t field_value = 0;
   uint32_t field = field_dword;  // VS acts weird going from u32 -> enum
+
+  uint64_t header_bytes = uint64_t(offsetof(xex2_header, headers)) +
+                          uint64_t(xex_header->header_count) * sizeof(xex2_opt_header);
+  if (header_bytes > UINT32_MAX ||
+      !GuestRangeReadable(xex_header.guest_address(), static_cast<size_t>(header_bytes))) {
+    return 0;
+  }
 
   UserModule::GetOptHeader(REX_KERNEL_MEMORY(), xex_header, xex2_header_keys(field), &field_value);
 
@@ -354,6 +696,11 @@ void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr)
 }
 
 void RtlInitializeCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-19.) cs was written (28 bytes)
+  // with no check at all (R10-13 class). Validate it first.
+  if (!cs || !GuestRangeWritable(cs.guest_address(), sizeof(X_RTL_CRITICAL_SECTION))) {
+    return;
+  }
   REXKRNL_IMPORT_TRACE("RtlInitializeCriticalSection", "cs={:#x}", cs.guest_address());
   xeRtlInitializeCriticalSection(cs, cs.guest_address());
 }
@@ -379,11 +726,28 @@ X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs, 
 
 u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs,
                                                    u32 spin_count) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-19.) Same unvalidated 28-byte
+  // struct write as RtlInitializeCriticalSection above.
+  if (!cs || !GuestRangeWritable(cs.guest_address(), sizeof(X_RTL_CRITICAL_SECTION))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
+  // (Hunt v1.4.6, ronda 12, A3-R12-19.) cs was read/written (28
+  // bytes, on the hottest lock path in the game) with no check at
+  // all. Validate it first; the current thread is also null-checked
+  // (R3-08 precedent: GetCurrentThread is only an assert away from
+  // null on a non-kernel thread).
+  if (!cs || !GuestRangeWritable(cs.guest_address(), sizeof(X_RTL_CRITICAL_SECTION))) {
+    return;
+  }
+  auto* current_thread = XThread::GetCurrentThread();
+  if (!current_thread) {
+    return;
+  }
+  uint32_t cur_thread = current_thread->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
 
   if (cs->owning_thread == cur_thread) {
@@ -414,7 +778,16 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  uint32_t thread = XThread::GetCurrentThread()->guest_object();
+  // (Hunt v1.4.6, ronda 12, A3-R12-19.) Same unvalidated 28-byte
+  // struct access as RtlEnterCriticalSection above.
+  if (!cs || !GuestRangeWritable(cs.guest_address(), sizeof(X_RTL_CRITICAL_SECTION))) {
+    return 0;
+  }
+  auto* current_thread = XThread::GetCurrentThread();
+  if (!current_thread) {
+    return 0;
+  }
+  uint32_t thread = current_thread->guest_object();
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
     // Able to steal the lock right away.
@@ -433,7 +806,16 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+  // (Hunt v1.4.6, ronda 12, A3-R12-19.) Same unvalidated 28-byte
+  // struct access as RtlEnterCriticalSection above.
+  if (!cs || !GuestRangeWritable(cs.guest_address(), sizeof(X_RTL_CRITICAL_SECTION))) {
+    return;
+  }
+  auto* current_thread = XThread::GetCurrentThread();
+  if (!current_thread) {
+    return;
+  }
+  assert_true(cs->owning_thread == current_thread->guest_object());
 
   // Drop recursion count - if it isn't zero we still have the lock.
   assert_true(cs->recursion_count > 0);
@@ -466,6 +848,15 @@ static_assert_size(X_TIME_FIELDS, 16);
 
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtltimetotimefields
 void RtlTimeToTimeFields_entry(mapped_u64 time_ptr, ppc_ptr_t<X_TIME_FIELDS> time_fields_ptr) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-20.) Neither pointer was checked
+  // at all: time_ptr.value() read 8 bytes and the 16-byte
+  // X_TIME_FIELDS struct was written through a wild pointer (R10-13
+  // class). Validate both first.
+  if (!time_ptr || !time_fields_ptr ||
+      !GuestRangeReadable(time_ptr.guest_address(), sizeof(uint64_t)) ||
+      !GuestRangeWritable(time_fields_ptr.guest_address(), sizeof(X_TIME_FIELDS))) {
+    return;
+  }
   // Use host clock because we don't want scaling to be applied, just conversion
   using rex::chrono::WinSystemClock;
   auto tp = WinSystemClock::to_sys(WinSystemClock::from_file_time(time_ptr.value()));
@@ -488,6 +879,13 @@ u32 RtlTimeFieldsToTime_entry(ppc_ptr_t<X_TIME_FIELDS> time_fields_ptr, mapped_u
   // (Audit A3, ronda 6, R6-06, sweep.) Both pointers are dereferenced
   // below; a NULL one used to read/write guest address 0.
   if (!time_fields_ptr || !time_ptr) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 12, A3-R12-21.) The R6-06 sweep fixed only
+  // the NULL case: a wild non-null pointer still SIGSEGVd the host
+  // on the struct read / 8-byte write below (R10-09 class).
+  if (!GuestRangeReadable(time_fields_ptr.guest_address(), sizeof(X_TIME_FIELDS)) ||
+      !GuestRangeWritable(time_ptr.guest_address(), sizeof(uint64_t))) {
     return 0;
   }
 
@@ -557,6 +955,13 @@ static uint32_t crc32_table[256] = {
 
 u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
   if (!length) {
+    return seed;
+  }
+  // (Hunt v1.4.6, ronda 12, A3-R12-22.) buffer[i] was read length
+  // bytes with no validation at all: a wild pointer SIGSEGVd the
+  // host. Validate the whole range first; the seed is the honest
+  // answer for an invalid range (same as the empty-buffer path).
+  if (!GuestRangeReadable(buffer.guest_address(), length)) {
     return seed;
   }
   uint32_t hash = ~seed;
