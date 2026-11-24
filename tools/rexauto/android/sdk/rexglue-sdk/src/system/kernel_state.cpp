@@ -270,6 +270,14 @@ KernelState* KernelState::shared() {
 }
 
 uint32_t KernelState::title_id() const {
+  // (Hunt v1.4.6, ronda 11, A3-R11-10.) assert_not_null is a no-op in
+  // release builds, so a call before the executable module is set
+  // dereferenced a null module below. No title is loaded yet: 0 is
+  // the honest answer (the exec_info-missing path below already
+  // returns 0).
+  if (!executable_module_) {
+    return 0;
+  }
   assert_not_null(executable_module_);
 
   xex2_opt_execution_info* exec_info = 0;
@@ -287,6 +295,14 @@ util::XdbfGameData KernelState::title_xdbf() const {
 }
 
 util::XdbfGameData KernelState::module_xdbf(object_ref<UserModule> exec_module) const {
+  // (Hunt v1.4.6, ronda 11, A3-R11-10.) Same null-module guard as
+  // title_id() above: assert_not_null is a no-op in release, and
+  // title_xdbf() passes the executable module, which is null before
+  // a title is loaded. An invalid XdbfGameData is the existing
+  // failure value (see the return at the end of this function).
+  if (!exec_module) {
+    return util::XdbfGameData(nullptr, 0);
+  }
   assert_not_null(exec_module);
 
   uint32_t resource_data = 0;
@@ -745,6 +761,14 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
   auto name = rex::string::utf8_find_name_from_guest_path(raw_name);
   std::string path(raw_name);
   if (name == raw_name) {
+    // (Hunt v1.4.6, ronda 11, A3-R11-10.) Same null-module guard as
+    // title_id(): assert_not_null is a no-op in release, and a bare
+    // name resolves against the executable module's path. No module
+    // is loaded yet, so there is no base path to resolve against;
+    // nullptr is the existing failure value of this function.
+    if (!executable_module_) {
+      return nullptr;
+    }
     assert_not_null(executable_module_);
     path = rex::string::utf8_join_guest_paths(
         rex::string::utf8_find_base_guest_path(executable_module_->path()), name);
@@ -1282,10 +1306,21 @@ void KernelState::CompleteOverlappedDeferredEx(
   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
   // (Hunt v1.4.6, ronda 10, A3-R10-06.) The IO_PENDING / context
   // writes below are the same unvalidated 28-byte write as the
-  // immediate path. When the overlapped is invalid the writes are
-  // skipped but the completion is still queued: the callback itself
-  // (content creation, enumeration, ...) must still run, and the
+  // immediate path, so they run only on a valid overlapped; the
   // queued CompleteOverlappedEx re-validates before writing.
+  // (Hunt v1.4.6, ronda 11, A3-R11-05.) That R10 residue is fixed
+  // here: queueing the callback on an invalid overlapped ran the
+  // operation's side effects for a request the guest can never
+  // observe (no valid overlapped exists to complete into). A null
+  // overlapped (0) still queues: there is no overlapped to complete
+  // into, and the callback's work is the point. A non-null but
+  // invalid overlapped is corrupt guest input: do not queue the work
+  // at all. All callers pass a real overlapped or 0 (xam_content /
+  // xam_enum / xam_ui only call this on the overlapped branch), so
+  // no legitimate caller is affected.
+  if (overlapped_ptr && !GuestOverlappedWritable(memory(), overlapped_ptr)) {
+    return;
+  }
   if (overlapped_ptr && GuestOverlappedWritable(memory(), overlapped_ptr)) {
     auto ptr = memory()->TranslateVirtual(overlapped_ptr);
     XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
