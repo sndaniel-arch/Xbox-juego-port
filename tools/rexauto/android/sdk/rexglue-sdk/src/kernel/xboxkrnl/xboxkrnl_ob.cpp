@@ -127,6 +127,39 @@ static bool GuestAnsiStringReadable(uint32_t guest_address) {
   return GuestRangeReadable(pointer, length);
 }
 
+// (Hunt v1.4.6, ronda 11, A3-R11-04.) Bounded guest C-string read,
+// the R10-03 pattern from crt/file.cpp: MappedPtr<char>::value()
+// builds a string_view straight off the host pointer -- a strlen to
+// NUL with no cap -- so a guest name with no NUL in its page ran the
+// host scan into unmapped memory. Read page by page (each chunk
+// validated readable first), stop at the first NUL, truncate at 4096
+// chars if there is none. Returns false on an invalid range.
+constexpr size_t kMaxGuestNameChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestNameChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
 
 u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_type_ptr, u32 unk,
                              mapped_u32 handle_ptr) {
@@ -190,6 +223,15 @@ u32 ObOpenObjectByPointer_entry(mapped_void object_ptr, mapped_u32 out_handle_pt
   // out_handle_ptr used to write the handle to guest address 0, and
   // retaining first would have leaked the handle on that path.
   if (!out_handle_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 11, A3-R11-06.) *out_handle_ptr was written
+  // with only the null check above (R10-07 / R10-12 class): a wild
+  // non-null pointer SIGSEGVd the host on the 4-byte write below.
+  // Validate before RetainHandle, so an invalid out-pointer cannot
+  // leak the reference (R6-06 order, same as the sibling entries).
+  if (!GuestRangeWritable(out_handle_ptr.guest_address(), sizeof(uint32_t))) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -296,8 +338,21 @@ u32 ObReferenceObjectByHandle_entry(u32 handle, u32 object_type_ptr, mapped_u32 
 
 u32 ObReferenceObjectByName_entry(mapped_string name, u32 attributes, u32 object_type_ptr,
                                   mapped_void parse_context, mapped_u32 out_object_ptr) {
+  // (Hunt v1.4.6, ronda 11, A3-R11-04.) name.value() is an unbounded
+  // NUL scan (MappedPtr<char>::value() builds a string_view straight
+  // off the host pointer, R10-03 class): a guest name with no NUL in
+  // its page ran the host scan into unmapped memory. Read it bounded
+  // first. A guest address of 0 stays an empty lookup, matching the
+  // MappedPtr<char>::value() null convention and
+  // TranslateAnsiStringAddress(0) == "" (string_utils.h).
+  std::string name_str;
+  if (name.guest_address() != 0) {
+    if (!ReadGuestCString(name.guest_address(), &name_str)) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
+  }
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-  X_STATUS result = REX_KERNEL_OBJECTS()->GetObjectByName(name.value(), &handle);
+  X_STATUS result = REX_KERNEL_OBJECTS()->GetObjectByName(name_str, &handle);
   if (XSUCCEEDED(result)) {
     return ObReferenceObjectByHandle_entry(handle, object_type_ptr, out_object_ptr);
   }
