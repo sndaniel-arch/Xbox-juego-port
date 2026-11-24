@@ -124,7 +124,13 @@ public final class GameFiles {
             if (cnt < 0 || cnt > 4096) return null;
             for (int i = 0; i < cnt && 0x18 + i * 8 + 8 <= got; i++) {
                 int key = b.getInt(0x18 + i * 8), val = b.getInt(0x1C + i * 8);
-                if (key == 0x00040006 && val >= 0 && val + 0x10 <= got) {
+                if (key == 0x00040006 && val >= 0 && val <= got - 0x10) {
+                    // (Hunt v1.4.6 ronda 12, A4-R12-03.) val + 0x10 overflows
+                    // to a negative int when val is near Integer.MAX_VALUE,
+                    // so the old `val + 0x10 <= got` guard passed and the
+                    // getInt(val + 0x0C) below threw IndexOutOfBoundsException
+                    // (unchecked: only IOException is caught here) on a
+                    // crafted/corrupt XEX header. Same bound, overflow-free.
                     return String.format("%08X", b.getInt(val + 0x0C));
                 }
             }
