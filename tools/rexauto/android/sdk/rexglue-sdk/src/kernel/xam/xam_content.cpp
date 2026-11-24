@@ -105,6 +105,40 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, true);
 }
 
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded guest C-string read:
+// MappedPtr<char>::value() builds a string_view straight off the
+// host pointer -- a strlen to NUL with no cap -- so a guest root
+// name with no NUL in its page ran the host scan into unmapped
+// memory. Read page by page (each chunk validated readable first,
+// like the R6-05 ReadGuestU16String reader in xam_ui.cpp), stop at
+// the first NUL, truncate at 4096 chars if there is none. Returns
+// false on an invalid range.
+constexpr size_t kMaxGuestPathChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestPathChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
 
 u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL mask_ptr used to write the mask
@@ -241,6 +275,17 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                        mapped_void overlapped_ptr) {
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old code
+  // captured root_name.value() into the deferred lambda below as a
+  // string_view into guest memory -- an unbounded NUL scan, and a
+  // view that could dangle by the time the deferred completion runs.
+  // Copy it into an owned std::string up front; a null root stays
+  // empty, as before.
+  std::string root_name_str;
+  if (root_name && !ReadGuestCString(root_name.guest_address(), &root_name_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   // (Hunt v1.4.6, ronda 7, A3-R7-03.) content_data_ptr is read as
   // either a 0x134-byte XCONTENT_DATA or a 0x148-byte
   // XCONTENT_AGGREGATE_DATA, and the deferred lambda below writes the
@@ -282,7 +327,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
+  auto run = [content_manager, xuid, root_name = root_name_str, flags, content_data,
               disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
@@ -385,8 +430,16 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 u32 XamContentCreateEx_entry(u32 user_index, mapped_string root_name, mapped_void content_data_ptr,
                              u32 flags, mapped_u32 disposition_ptr, mapped_u32 license_mask_ptr,
                              u32 cache_size, u64 content_size, mapped_void overlapped_ptr) {
-  REXKRNL_INFO("XamContentCreateEx(user={}, root='{}', flags={:#X}, size={})",
-               user_index, root_name ? std::string(root_name) : std::string("(null)"),
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read for the log
+  // line: the old std::string(root_name) was another unbounded NUL
+  // scan. (xeXamContentCreate below re-reads the name bounded and
+  // rejects an invalid one; the log here never fails the call.)
+  std::string root_log = "(null)";
+  if (root_name) {
+    std::string bounded;
+    root_log = ReadGuestCString(root_name.guest_address(), &bounded) ? bounded : "(invalid)";
+  }
+  REXKRNL_INFO("XamContentCreateEx(user={}, root='{}', flags={:#X}, size={})", user_index, root_log,
                flags, content_size);
   return xeXamContentCreate(user_index, root_name, content_data_ptr, sizeof(XCONTENT_DATA), flags,
                             disposition_ptr, license_mask_ptr, cache_size, content_size,
@@ -427,7 +480,13 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+  // root_name.value() scanned for NUL with no cap.
+  std::string root_name_str;
+  if (root_name && !ReadGuestCString(root_name.guest_address(), &root_name_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name_str);
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
