@@ -107,6 +107,13 @@ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-09.) The 4-byte out-param had
+  // only the NULL check above (same R6-02 pattern as
+  // XAudioRegisterRenderDriverClient below): validate its range.
+  if (!GuestRangeWritable(config_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_E_INVALIDARG;
+  }
+
   *config_ptr = 0x00010001;
   return X_ERROR_SUCCESS;
 }
@@ -115,6 +122,12 @@ u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_
   // (Audit A3, ronda 6, R6-06.) A NULL out_ptr used to write 0 to
   // guest address 0.
   if (!out_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-09.) Same 4-byte out-param class
+  // as XAudioGetSpeakerConfig above.
+  if (!GuestRangeWritable(out_ptr.guest_address(), sizeof(uint32_t))) {
     return X_E_INVALIDARG;
   }
 
@@ -132,6 +145,12 @@ u32 XAudioGetVoiceCategoryVolume_entry(u32 unk, mapped_f32 out_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL out_ptr used to write 1.0f to
   // guest address 0.
   if (!out_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-09.) Same 4-byte out-param class
+  // as XAudioGetSpeakerConfig above.
+  if (!GuestRangeWritable(out_ptr.guest_address(), sizeof(uint32_t))) {
     return X_E_INVALIDARG;
   }
 
