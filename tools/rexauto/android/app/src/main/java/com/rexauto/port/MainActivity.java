@@ -9,6 +9,7 @@ import android.util.Log;
 import android.widget.Toast;
 
 import com.rexauto.port.gamepad.PadSettings;
+import com.rexauto.port.gamepad.PadSettingsDialog;
 import com.rexauto.port.gamepad.VirtualPadView;
 
 import org.libsdl.app.SDLActivity;
@@ -312,6 +313,17 @@ public class MainActivity extends SDLActivity {
         // dialog after an interruption.
         if (shouldResumeEmulation()) resumeEmulation();
         super.onStart();
+    }
+
+    /**
+     * (Hunt v1.4.6 ronda 11, A4-R11-04.) Eager release of the in-game dialog statics: PadSettingsDialog (the R10-02 residual), GraphicsDialog and LogsDialog all keep a static reference to this activity, and the framework does not fire OnDismissListener when the activity is destroyed with a dialog open — so without this hook the dead activity survived until the next gear tap observed the stale state. onDestroy is the hook: every dialog here belongs to this activity, and the dismiss listeners no-op once the statics are null. SetupActivity needs no hook: the crash guard/report dialogs it shows are untracked (no statics).
+     */
+    @Override
+    protected void onDestroy() {
+        PadSettingsDialog.clearStale();
+        GraphicsDialog.clearStale();
+        LogsDialog.clearStale();
+        super.onDestroy();
     }
 
     /**
