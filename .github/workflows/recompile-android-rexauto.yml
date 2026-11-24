@@ -231,6 +231,15 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ inputs.iso_url }}".Trim() -notmatch '^https?://') { Write-Host "::error::iso_url must start with http(s)://"; exit 1 }
+          # (Hunt v1.4.6, ronda 13, A5-R13-05.) heal_iters and
+          # iso_sha256 used to be validated only by failing late: a
+          # non-numeric heal_iters died in rexauto's argparse after the
+          # download + SDK install (~15 min in), and a mistyped
+          # iso_sha256 died in "Verify ISO SHA-256" after the whole
+          # download. Both fail loudly, but late -- validate here, in
+          # the first step, before any checkout or download.
+          if ("${{ inputs.heal_iters }}".Trim() -notmatch '^\d+$') { Write-Host "::error::heal_iters must be a non-negative integer"; exit 1 }
+          if (("${{ inputs.iso_sha256 }}".Trim() -ne '') -and ("${{ inputs.iso_sha256 }}".Trim() -notmatch '^[0-9a-fA-F]{64}$')) { Write-Host "::error::iso_sha256 must be 64 hex characters (SHA-256)"; exit 1 }
 
       - uses: actions/checkout@v7
         timeout-minutes: 10
@@ -504,7 +513,17 @@ jobs:
             if ($LASTEXITCODE -eq 0) { break }
             if ($attempt -ge 3) { Write-Host "::error::game input download failed after 3 attempts"; exit 1 }
             Write-Host "::warning::game input download attempt $attempt failed, wiping partial input and retrying in 30s..."
-            Remove-Item -Recurse -Force "${{ runner.temp }}\input" -ErrorAction SilentlyContinue
+            # (Hunt v1.4.6, ronda 13, A5-R13-12.) The old
+            # `-ErrorAction SilentlyContinue` swallowed a failed wipe:
+            # the retry then ran with a partial download still on disk,
+            # and gdown's existing-file behaviour is unverified (see the
+            # comment above), so a partial file could be mistaken for a
+            # complete one. Only skip the removal when there is nothing
+            # to remove; a failed removal fails loudly here instead.
+            if (Test-Path "${{ runner.temp }}\input") {
+              Remove-Item -Recurse -Force "${{ runner.temp }}\input"
+              if (Test-Path "${{ runner.temp }}\input") { Write-Host "::error::could not wipe the partial game input -- refusing to retry over a partial download"; exit 1 }
+            }
             Start-Sleep -Seconds 30
           }
 
@@ -866,6 +885,14 @@ jobs:
         run: |
           $port = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port"
           if (-not (Test-Path "$port\generated\default\sources.cmake")) { Write-Host "::error::no generated code -- codegen failed, see logs"; exit 1 }
+          # (Hunt v1.4.6, ronda 13, A5-R13-07.) Also prove src/ is
+          # there before zipping: Copy-Item errors are NON-terminating
+          # in pwsh, so a missing $port\src would NOT fail this step --
+          # the zip would ship without src/ and only job 2 ("Unpack
+          # port", test -f .../src/main.cpp) would catch it, a whole job
+          # later. This step runs with if: always(), so it must verify
+          # every input it zips, not just sources.cmake.
+          if (-not (Test-Path "$port\src\main.cpp")) { Write-Host "::error::no port src -- $port\src\main.cpp is missing, refusing to pack a port-src.zip without sources"; exit 1 }
           $out = "${{ runner.temp }}\port-src"
           New-Item -ItemType Directory -Force $out | Out-Null
           # generated/ + src/ + *.toml -- NOT the build tree
@@ -1002,8 +1029,16 @@ jobs:
           mkdir -p autoports/${{ env.REX_PROJECT }}/port
           unzip -q "${{ runner.temp }}/in/port-src.zip" -d autoports/${{ env.REX_PROJECT }}/port
           ls autoports/${{ env.REX_PROJECT }}/port
-          # (no `ls | head` here: with pipefail a SIGPIPE'd ls fails the step)
-          find autoports/${{ env.REX_PROJECT }}/port/generated/default -maxdepth 1 | sed -n '1,12p'
+          # (Hunt v1.4.6, ronda 13, A5-R13-06.) The old
+          # `find ... | sed -n '1,12p'` carried the same SIGPIPE hazard
+          # the step used to warn about for `ls | head`: once the
+          # listing exceeds the 64 KB pipe buffer, sed exits after 12
+          # lines, find dies with SIGPIPE (141) and pipefail fails the
+          # step -- a false red that grows more likely as the generated
+          # tree gains files. Same fix as M-13b: dump to a file first,
+          # then read the file.
+          find autoports/${{ env.REX_PROJECT }}/port/generated/default -maxdepth 1 > /tmp/port-files.txt
+          sed -n '1,12p' /tmp/port-files.txt
           test -f autoports/${{ env.REX_PROJECT }}/port/src/main.cpp
           sed -n '1,8p' autoports/${{ env.REX_PROJECT }}/port/generated/default/sources.cmake
 
@@ -1166,6 +1201,14 @@ jobs:
           n="$(grep -c 'REXCVAR_DEFINE_BOOL(xbmovie_probe, false,' "$f" || true)"
           if [ "$n" != "1" ]; then echo "::error::xbmovie_probe default pattern found $n times (want 1)"; exit 1; fi
           sed -i 's/REXCVAR_DEFINE_BOOL(xbmovie_probe, false,/REXCVAR_DEFINE_BOOL(xbmovie_probe, true,/' "$f"
+          # (Hunt v1.4.6, ronda 13, A5-R13-08.) The old `grep -n` below
+          # only PRINTED the line: it matches the false default too, so
+          # a sed that silently substituted nothing (GNU sed exits 0 on
+          # no match) passed the step with the probe still off. Assert
+          # the flipped value instead -- the pre-check above proves the
+          # false literal exists exactly once, so this can only fail if
+          # the flip itself did not happen.
+          grep -q 'REXCVAR_DEFINE_BOOL(xbmovie_probe, true,' "$f" || { echo "::error::xbmovie_probe flip failed: the default is not true in $f after sed"; exit 1; }
           grep -n 'REXCVAR_DEFINE_BOOL(xbmovie_probe' "$f"
           echo "xbmovie_probe default set to true for this run (input xbmovie_probe=true)"
 
@@ -1472,8 +1515,27 @@ jobs:
             echo "::error::APK versionCode is $ACTUAL_VERSION_CODE, expected github.run_number ${{ github.run_number }} -- the -PrexVersionCode property did not reach Gradle (see A5-R7-02); a wrong code would not install over previous builds."
             exit 1
           fi
+          # (Hunt v1.4.6, ronda 13, A5-R13-10.) versionCode was checked
+          # but versionName was only echoed: a lost -PrexVersionName
+          # property would ship a wrong versionName with every gate
+          # green. The FULL script checks both (A5-R7-02); check both
+          # here too.
+          if [ "$ACTUAL_VERSION_NAME" != "1.${{ github.run_number }}" ]; then
+            echo "::error::APK versionName is $ACTUAL_VERSION_NAME, expected 1.${{ github.run_number }} -- the -PrexVersionName property did not reach Gradle."
+            exit 1
+          fi
           echo "APK versionCode $ACTUAL_VERSION_CODE (== github.run_number) versionName $ACTUAL_VERSION_NAME OK"
           cp "$APK" "${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk"
+          # (Hunt v1.4.6, ronda 13, A5-R13-09.) The artifact uploaded
+          # below is this COPY, not $APK -- and nothing compared them:
+          # a cp that corrupted content while keeping the size would
+          # ship a bad artifact past every gate above (upload-artifact
+          # trusts the local bytes it reads). Mirror the FULL script's
+          # R10-03 check: compare SHA-256 of copy vs built APK.
+          if [ "$(sha256sum "$APK" | cut -d' ' -f1)" != "$(sha256sum "${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk" | cut -d' ' -f1)" ]; then
+            echo "::error::SHA-256 of the copied APK differs from the built APK (corrupt copy) -- refusing to upload it."
+            exit 1
+          fi
           SIZE=$(stat -c%s "$APK")
           {
             echo "### ✅ ${{ needs.recompile.outputs.title }} — Android Edition"
@@ -1501,17 +1563,23 @@ jobs:
         run: |
           # (Ronda 4, G-F3.) set -e: a failed rsync used to leave a partial
           # source-... artifact with exit 0. Only the optional port rsync
-          # below tolerates failure ([ -d ... ] && ...); the two cp's are
+          # below tolerates failure ([ -d ... ] && ...); the cp is
           # required -- the README written in this step tells the user to
           # build with ./android_sdk.sh, so a failed cp must fail the step
           # (A5-R4-07: the old `2>/dev/null || true` swallowed both).
+          # (Hunt v1.4.6, ronda 13, A5-R13-11.) The second cp that used
+          # to be here (`cp -r rexauto/android/patches "$OUT/android/"`)
+          # is gone: the rsync above already copies patches/ (it is not
+          # excluded), so the cp re-copied it INSIDE itself, producing a
+          # dead $OUT/android/patches/patches/ duplicate in every
+          # source artifact. android_sdk.sh still needs its own cp: it
+          # lives in rexauto/tools/, outside the rsync source.
           set -euo pipefail
           OUT="${{ runner.temp }}/source-${{ env.REX_PROJECT }}"
           mkdir -p "$OUT"
           rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' rexauto/android/ "$OUT/android/"
           [ -d "autoports/${{ env.REX_PROJECT }}/port" ] && rsync -a --exclude build "autoports/${{ env.REX_PROJECT }}/port/" "$OUT/port/"
           cp rexauto/tools/android_sdk.sh "$OUT/"
-          cp -r rexauto/android/patches "$OUT/android/"
           cat > "$OUT/README.txt" <<EOF2
           ${{ env.REX_PROJECT }} -- Android project sources
 
