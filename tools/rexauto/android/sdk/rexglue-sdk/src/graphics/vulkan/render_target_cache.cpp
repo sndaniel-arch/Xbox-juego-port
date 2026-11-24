@@ -3580,6 +3580,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             }
           }
         } break;
+        default:
+          // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest color
+          // format (a 4-bit value with no enumerator): fail the build
+          // instead of emitting a shader with id-0 operands or a silently
+          // unwritten output. The caller retries the transfer later.
+          assert_unhandled_case(source_color_format);
+          REXGPU_ERROR(
+              "VulkanRenderTargetCache: Refusing to build a transfer shader "
+              "with an undefined source color format {}",
+              uint32_t(source_color_format));
+          return VK_NULL_HANDLE;
       }
     } else {
       assert_true(source_depth_texture != spv::NoResult);
@@ -3604,6 +3615,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
                 builder, source_depth_float[i], depth_float24_round(), true, ext_inst_glsl_std_450);
           } break;
+          default:
+            // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest depth
+            // format: fail the build instead of emitting OpBitFieldInsert
+            // with an id-0 (NoResult) depth operand below. The caller
+            // retries the transfer later.
+            assert_unhandled_case(source_depth_format);
+            REXGPU_ERROR(
+                "VulkanRenderTargetCache: Refusing to build a transfer shader "
+                "with an undefined source depth format {}",
+                uint32_t(source_depth_format));
+            return VK_NULL_HANDLE;
         }
         // Merge depth and stencil.
         packed[i] = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, source_stencil[i],
@@ -3863,7 +3885,30 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             packed = builder.createUnaryOp(spv::OpBitcast, type_uint, packed);
           }
         } break;
+        default:
+          // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest color
+          // format (a 4-bit value with no enumerator): fail the build
+          // instead of emitting a shader with an unwritten output. The
+          // caller retries the transfer later.
+          assert_unhandled_case(source_color_format);
+          REXGPU_ERROR(
+              "VulkanRenderTargetCache: Refusing to build a transfer shader "
+              "with an undefined source color format {}",
+              uint32_t(source_color_format));
+          return VK_NULL_HANDLE;
       }
+    } else if (mode.output == TransferOutput::kStencilBit &&
+               source_stencil[0] != spv::NoResult) {
+      // (Hunt v1.4.6, ronda 10, A2-R10-01.) Depth source with stencil-bit
+      // output: no depth texture is created for this output (see above), so
+      // source_depth_float stays NoResult and the branch below is never
+      // taken — but the stencil texture IS created and loaded above. Use it
+      // directly as `packed` (stencil in 0:7, matching the layout comment
+      // above) so the stencil-bit kill below can discard samples whose bit
+      // is clear. Without this the shader never kills and every pass writes
+      // its bit over the whole rect (dest stencil becomes 0xFF), while D3D12
+      // discards on the loaded stencil value (R1.x).
+      packed = source_stencil[0];
     } else if (source_depth_float[0] != spv::NoResult) {
       if (mode.output == TransferOutput::kDepth && dest_depth_format == source_depth_format) {
         builder.createStore(source_depth_float[0], output_fragment_depth);
@@ -3884,6 +3929,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             packed = SpirvShaderTranslator::PreClampedDepthTo20e4(
                 builder, source_depth_float[0], depth_float24_round(), true, ext_inst_glsl_std_450);
           } break;
+          default:
+            // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest depth
+            // format: fail the build instead of emitting OpBitFieldInsert
+            // with an id-0 (NoResult) packed operand below. The caller
+            // retries the transfer later.
+            assert_unhandled_case(source_depth_format);
+            REXGPU_ERROR(
+                "VulkanRenderTargetCache: Refusing to build a transfer shader "
+                "with an undefined source depth format {}",
+                uint32_t(source_depth_format));
+            return VK_NULL_HANDLE;
         }
         if (mode.output == TransferOutput::kDepth) {
           packed_only_depth = true;
@@ -3990,7 +4046,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             } break;
             default:
               // A 64bpp format (handled separately) or an invalid one.
+              // (Hunt v1.4.6, ronda 10, A2-R10-03.) This switch is inside
+              // the non-64bpp path, so a 64bpp format cannot reach it — an
+              // undefined dest format is the only way here. Fail the build
+              // (as the source-format defaults above do) instead of emitting
+              // a shader whose declared color output is never written.
               assert_unhandled_case(dest_color_format);
+              REXGPU_ERROR(
+                  "VulkanRenderTargetCache: Refusing to build a transfer "
+                  "shader with an undefined destination color format {}",
+                  uint32_t(dest_color_format));
+              return VK_NULL_HANDLE;
           }
         }
       } break;
@@ -4180,13 +4246,19 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(spv::OpUMod, type_uint, host_depth_source_tile_index,
                                     host_depth_source_pitch_tiles);
             // Finally calculate the host depth source texture coordinates.
+            // (Hunt v1.4.6, ronda 10, A2-R10-02.) The tile size in the HOST
+            // depth source image depends on the HOST depth source's own MSAA,
+            // not the guest source's: use key.host_depth_source_msaa_samples
+            // here, like D3D12 does for the same computation. When the two
+            // MSAA classes differ, shifting by key.source_msaa_samples reads
+            // the wrong texel.
             spv::Id host_depth_source_pixel_x_int = builder.createUnaryOp(
                 spv::OpBitcast, type_int,
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
                                         builder.makeUintConstant(tile_width_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
+                                                                 uint32_t(key.host_depth_source_msaa_samples >=
                                                                           xenos::MsaaSamples::k4X)),
                                         host_depth_source_tile_index_x),
                     host_depth_source_tile_pixel_x));
@@ -4196,7 +4268,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
                                         builder.makeUintConstant(tile_height_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
+                                                                 uint32_t(key.host_depth_source_msaa_samples >=
                                                                           xenos::MsaaSamples::k2X)),
                                         host_depth_source_tile_index_y),
                     host_depth_source_tile_pixel_y));
@@ -4300,6 +4372,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 host_depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
                     builder, host_depth32, depth_float24_round(), true, ext_inst_glsl_std_450);
               } break;
+              default:
+                // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest depth
+                // format: fail the build instead of comparing against an
+                // id-0 (NoResult) host depth value below. The caller retries
+                // the transfer later.
+                assert_unhandled_case(dest_depth_format);
+                REXGPU_ERROR(
+                    "VulkanRenderTargetCache: Refusing to build a transfer "
+                    "shader with an undefined destination depth format {}",
+                    uint32_t(dest_depth_format));
+                return VK_NULL_HANDLE;
             }
             assert_true(host_depth24 != spv::NoResult);
             // Update the header block pointer after the conversion (to avoid
@@ -4342,6 +4425,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
               guest_depth32 = SpirvShaderTranslator::Depth20e4To32(builder, guest_depth24, 0, true,
                                                                    false, ext_inst_glsl_std_450);
             } break;
+            default:
+              // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest depth
+              // format: fail the build instead of storing an id-0
+              // (NoResult) fragment depth below. The caller retries the
+              // transfer later.
+              assert_unhandled_case(dest_depth_format);
+              REXGPU_ERROR(
+                  "VulkanRenderTargetCache: Refusing to build a transfer "
+                  "shader with an undefined destination depth format {}",
+                  uint32_t(dest_depth_format));
+              return VK_NULL_HANDLE;
           }
           assert_true(guest_depth32 != spv::NoResult);
           spv::Id fragment_depth32 = guest_depth32;
@@ -5971,6 +6065,17 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         packed[0] = SpirvShaderTranslator::PreClampedDepthTo20e4(
             builder, source_depth32, depth_float24_round(), true, ext_inst_glsl_std_450);
       } break;
+      default:
+        // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest depth format:
+        // fail the build instead of emitting OpBitFieldInsert with an id-0
+        // (NoResult) packed operand below. The caller retries the dump
+        // later.
+        assert_unhandled_case(key.GetDepthFormat());
+        REXGPU_ERROR(
+            "VulkanRenderTargetCache: Refusing to build a dump pipeline with "
+            "an undefined depth format {}",
+            uint32_t(key.GetDepthFormat()));
+        return VK_NULL_HANDLE;
     }
     packed[0] = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, source_stencil, packed[0],
                                      builder.makeUintConstant(8), builder.makeUintConstant(24));
@@ -6100,6 +6205,17 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
           }
         }
       } break;
+      default:
+        // (Hunt v1.4.6, ronda 10, A2-R10-03.) Undefined guest color format
+        // (a 4-bit value with no enumerator): fail the build instead of
+        // storing an id-0 (NoResult) packed value to EDRAM below. The
+        // caller retries the dump later.
+        assert_unhandled_case(key.GetColorFormat());
+        REXGPU_ERROR(
+            "VulkanRenderTargetCache: Refusing to build a dump pipeline with "
+            "an undefined color format {}",
+            uint32_t(key.GetColorFormat()));
+        return VK_NULL_HANDLE;
     }
   }
 
@@ -6168,6 +6284,14 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
   size_t copy_shader_index = size_t(key.copy_shader);
   if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
     pipeline = resolve_copy_pipelines_[copy_shader_index];
+  }
+  if (pipeline == VK_NULL_HANDLE) {
+    // (Hunt v1.4.6, ronda 10, A2-R10-04.) Do NOT cache a null pipeline: the
+    // same T-R5-04/T-R5-05 rule GetTransferShader and GetDumpPipeline follow
+    // (a transient creation failure must be retried, not recorded forever).
+    // The next call retries the lookup instead of returning the cached null
+    // forever.
+    return VK_NULL_HANDLE;
   }
   direct_resolve_pipelines_.emplace(key, pipeline);
   return pipeline;
