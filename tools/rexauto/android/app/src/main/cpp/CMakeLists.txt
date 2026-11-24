@@ -86,13 +86,31 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   # out of __FILE__: the release .so carried 162 "/home/hatch/workspace/
   # col-recomp/..." strings (log/assert __FILE__, no .debug_* sections).
   # -ffile-prefix-map (not -fdebug-prefix-map, which only remaps debug
-  # info) rewrites __FILE__ too. The mapped prefix is the checkout root,
-  # computed from REX_PROJECT_ROOT (tools/rexauto, handed over by Gradle)
-  # so it works on any builder machine, not just this one; __FILE__
-  # becomes a repo-relative path (e.g. tools/rexauto/android/sdk/...).
-  # Same directory-scope rule as above: set before add_subdirectory().
-  get_filename_component(REX_CHECKOUT_ROOT "${REX_PROJECT_ROOT}/../.." ABSOLUTE)
-  add_compile_options("-ffile-prefix-map=${REX_CHECKOUT_ROOT}=.")
+  # info) rewrites __FILE__ too.
+  # (Hunt v1.4.6, ronda 11, A5-R11-02.) The R10 map used the checkout
+  # root (REX_PROJECT_ROOT/../..), but that root is layout-dependent:
+  # in a FULL build REX_PROJECT_ROOT is <repo>/tools/rexauto, so the
+  # root is <repo> and __FILE__ becomes "tools/rexauto/...", while in
+  # CI REX_PROJECT_ROOT is $GITHUB_WORKSPACE/rexauto, so the computed
+  # root is /home/runner/work/Xbox-juego-port and the SAME file becomes
+  # "Xbox-juego-port/rexauto/..." -- both relative (no leak), but FULL
+  # and CI can never agree byte for byte (proven with a cmake sim of
+  # the computation in both layouts, R11 evidence). Map the two roots
+  # that are the same tree in both layouts instead: REX_PROJECT_ROOT
+  # (the app tree: app cpp, SDK and libadrenotools all live under it)
+  # and REX_PORT_DIR (the generated code, a sibling of rexauto in both
+  # layouts). The two maps never overlap, so their order does not
+  # matter -- overlapping -ffile-prefix-map entries ARE order
+  # sensitive (last match wins, verified with gcc), which is why this
+  # does NOT just add a second overlapping map. __FILE__ becomes
+  # "android/sdk/..." / "generated/default/..." identically in FULL
+  # and CI. Same directory-scope rule as above: set before
+  # add_subdirectory(). REX_PORT_DIR is empty for a direct cmake
+  # invocation without -D, so its map is guarded.
+  add_compile_options("-ffile-prefix-map=${REX_PROJECT_ROOT}=.")
+  if(NOT "${REX_PORT_DIR}" STREQUAL "")
+    add_compile_options("-ffile-prefix-map=${REX_PORT_DIR}=.")
+  endif()
 endif()
 
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
