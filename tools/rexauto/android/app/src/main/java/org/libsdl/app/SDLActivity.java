@@ -1588,15 +1588,16 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
 
     /** Result of current messagebox. Also used for blocking the calling thread. */
     protected final int[] messageboxSelection = new int[1];
+
     /**
      * Condition flag for the messagebox wait, always read and written under
-      * the messageboxSelection monitor (hunt v1.4.6 ronda 9, A4-R9-07). The
-       * R8 guard could notify() BEFORE the JNI caller reached wait() -- a
-        * lost wakeup that left the caller blocked forever. The flag remembers
-         * the wakeup: the caller waits in a while loop, and every notifier sets
-          * the flag before notifying, so an early notify is observed instead of
-           * lost. Reset at the start of every messageboxShowMessageBox call.
-            */
+     * the messageboxSelection monitor (hunt v1.4.6 ronda 9, A4-R9-07). The
+     * R8 guard could notify() BEFORE the JNI caller reached wait() -- a
+     * lost wakeup that left the caller blocked forever. The flag remembers
+     * the wakeup: the caller waits in a while loop, and every notifier sets
+     * the flag before notifying, so an early notify is observed instead of
+     * lost. Reset at the start of every messageboxShowMessageBox call.
+     */
     private boolean messageboxDone = false;
 
     /**
@@ -1619,6 +1620,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
             final int[] colors) {
 
         messageboxSelection[0] = -1;
+
         // (Hunt v1.4.6 ronda 9, A4-R9-07.) Reset the condition flag under
         // the same monitor before posting the dialog: the flag must be
         // false when the caller starts waiting, and any notify() from the
@@ -1655,12 +1657,12 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         });
 
         // block the calling thread
+
         // (Hunt v1.4.6 ronda 9, A4-R9-07.) Condition-variable wait: a bare
         // wait() loses a notify() that arrives first (the R8 guard's
         // notify could run before this wait). The while loop re-checks the
         // flag, so an early notify -- from the guard or the dismiss path --
         // wakes this thread immediately instead of hanging it.
-
         synchronized (messageboxSelection) {
             try {
                 while (!messageboxDone) {
@@ -1691,7 +1693,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         // (Ronda 9, A4-R9-07: el notify() va con messageboxDone = true
         // bajo el mismo monitor -- un notify() sin condicion se pierde si
         // el hilo UI lo ejecuta antes de que el llamador entre en wait(),
-        // y aqui no hay ningun otro notificador. La condicion lo recuerda).
+        // y aqui no hay ningun otro notificador. La condicion lo recuerda.)
         if (isFinishing() || isDestroyed()) {
             synchronized (messageboxSelection) {
                 messageboxDone = true;
