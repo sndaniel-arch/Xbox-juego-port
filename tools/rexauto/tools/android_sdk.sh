@@ -57,7 +57,8 @@ if [ -f "$SDK_DIR/.patches-applied" ]; then
   # pass. Deleted tracked files fail loudly (neither the patches nor the
   # repo overlay ever delete SDK files). Submodules must be initialized
   # AND at the indexed rev (`git submodule status` prefixes `-` for a
-  # missing/uninitialized one and `+` for a wrong rev); if
+  # missing/uninitialized one, `+` for a wrong rev and `U` for a merge
+  # conflict); if
   # thirdparty/sdl3 is gone the SDL glue copy below dies, but other
   # submodules would only fail later in CMake.
   # DELIBERATELY NOT checked here: a plain `git diff --quiet` / full
@@ -68,10 +69,15 @@ if [ -f "$SDK_DIR/.patches-applied" ]; then
   # cannot be told apart from an overlay edit in this script -- that
   # case stays covered by the CI cache key (which hashes this file +
   # the patches) and the M-5 guard in the workflow.
-  _sdk_deleted="$(git -C "$SDK_DIR" diff --name-only --diff-filter=D 2>/dev/null)"
+  # (A5-R9-04, ronda 9.) `diff HEAD` (not bare `diff`): a staged deletion
+  # (`git rm`) compares equal against the INDEX and used to pass; against
+  # HEAD it is listed. `--diff-filter=D` only ever lists deletions, so
+  # the 185 overlay-modified files (`M`, verified on the local tree) are
+  # unaffected. The submodule grep also takes `U` (merge conflict).
+  _sdk_deleted="$(git -C "$SDK_DIR" diff HEAD --name-only --diff-filter=D 2>/dev/null)"
   [ -z "$_sdk_deleted" ] || { echo "[android_sdk] ERROR: SDK tree at $SDK_DIR has deleted files (e.g. $(echo "$_sdk_deleted" | head -3 | tr '\n' ' ')) -- remove $SDK_DIR and re-run to rebuild from the pinned tag"; exit 1; }
   _sdk_sub_status="$(git -C "$SDK_DIR" submodule status 2>/dev/null)" || { echo "[android_sdk] ERROR: cannot list SDK submodules at $SDK_DIR (git submodule status failed) -- remove $SDK_DIR and re-run to re-clone and re-init submodules"; exit 1; }
-  _sdk_sub_bad="$(echo "$_sdk_sub_status" | grep -E '^[-+]' || true)"
+  _sdk_sub_bad="$(echo "$_sdk_sub_status" | grep -E '^[-+U]' || true)"
   [ -z "$_sdk_sub_bad" ] || { echo "[android_sdk] ERROR: SDK submodules missing or at the wrong rev at $SDK_DIR (e.g. $(echo "$_sdk_sub_bad" | head -3 | tr '\n' ' ')) -- remove $SDK_DIR and re-run to re-clone and re-init submodules"; exit 1; }
   echo "[android_sdk] SDK tree OK (re-validated): no deleted files, submodules initialized at the indexed revs"
 else
