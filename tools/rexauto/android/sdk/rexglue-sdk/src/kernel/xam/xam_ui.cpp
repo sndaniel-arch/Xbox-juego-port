@@ -108,6 +108,10 @@ static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, false);
 }
 
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 // (Hunt v1.4.6, caza ronda 6, A3-R6-05.) load_and_swap<std::u16string>
 // scans for NUL with no cap (include/rex/memory/utils.h:245-255), so a
 // guest string pointer near the end of the mapping with no NUL inside
