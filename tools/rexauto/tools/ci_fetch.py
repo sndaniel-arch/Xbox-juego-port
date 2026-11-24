@@ -62,7 +62,15 @@ def download(url, dest_dir):
     gid = _gdrive_id(url)
     if gid:
         log("Google Drive link -> gdown (id=%s)" % gid)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gdown"])
+        # (Hunt v1.4.6, ronda 11, A5-R11-03.) PIN gdown: the workflow
+        # pre-installs gdown==5.2.0 ("Python deps" step), so in CI this
+        # is a no-op -- but a bare `pip install gdown` installs the
+        # LATEST, and 6.x REMOVED the `fuzzy` kwarg this call relies on
+        # (runs #2/#3 died on exactly that TypeError). A standalone run
+        # of ci_fetch.py, or any future reorder of the workflow steps,
+        # would break the same way. 5.2.0 is the version verified
+        # against the real wheels (6.5.1 has no fuzzy, 5.2.0 has it).
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gdown==5.2.0"])
         import gdown  # noqa: E402
         out = gdown.download(id=gid, output=os.path.join(dest_dir, ""), quiet=False, fuzzy=True)
         if not out or not os.path.isfile(out):
