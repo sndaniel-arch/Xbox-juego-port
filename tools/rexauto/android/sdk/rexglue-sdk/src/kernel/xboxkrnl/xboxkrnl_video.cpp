@@ -262,6 +262,13 @@ void VdGetCurrentDisplayGamma_entry(mapped_u32 type_ptr, mapped_f32 power_ptr) {
   if (!type_ptr || !power_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 11, A3-R11-07.) Both out-params were written
+  // with only the null check above (R10-09 class): a wild non-null
+  // pointer SIGSEGVd the host on the 4-byte writes below.
+  if (!GuestRangeWritable(type_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(power_ptr.guest_address(), sizeof(float))) {
+    return;
+  }
 
   // 1 - sRGB.
   // 2 - TV (BT.709).
@@ -501,6 +508,16 @@ void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2)
 }
 
 void VdGetSystemCommandBuffer_entry(mapped_void p0_ptr, mapped_void p1_ptr) {
+  // (Hunt v1.4.6, ronda 11, A3-R11-08.) Zero() is null-safe, so this
+  // looked guarded -- but store_and_swap below is a plain memcpy
+  // (memory/utils.h) with no null check at all: a null or wild
+  // pointer SIGSEGVd the host (R10-13 class). Validate both buffers
+  // writable first: 0x94 bytes for p0 (the Zero plus the 4-byte
+  // store at offset 0), 4 bytes for p1.
+  if (!p0_ptr || !p1_ptr || !GuestRangeWritable(p0_ptr.guest_address(), 0x94) ||
+      !GuestRangeWritable(p1_ptr.guest_address(), sizeof(uint32_t))) {
+    return;
+  }
   p0_ptr.Zero(0x94);
   memory::store_and_swap<uint32_t>(p0_ptr, 0xBEEF0000);
   memory::store_and_swap<uint32_t>(p1_ptr, 0xBEEF0001);
@@ -530,6 +547,19 @@ u32 VdInitializeScalerCommandBuffer_entry(
                            // sources from.
     u32 dest_count         // Count in words.
 ) {
+  // (Hunt v1.4.6, ronda 11, A3-R11-03.) dest_ptr was written
+  // dest_count words with no validation of either: a wild pointer
+  // SIGSEGVd the host, and a huge count wrote past the buffer into
+  // adjacent host heap. Validate the whole dest_count*4-byte range
+  // writable first, with 64-bit math (R7-03 pattern): a product past
+  // UINT32_MAX cannot be a real guest buffer and is rejected.
+  // (vertical_filter_params / horizontal_filter_params / unk9 are
+  // never dereferenced in this function, so they need no check.)
+  uint64_t dest_bytes = uint64_t(dest_count) * sizeof(uint32_t);
+  if (dest_bytes > UINT32_MAX ||
+      !GuestRangeWritable(dest_ptr.guest_address(), static_cast<size_t>(dest_bytes))) {
+    return 0;
+  }
   // We could fake the commands here, but I'm not sure the game checks for
   // anything but success (non-zero ret).
   // For now, we just fill it with NOPs.
@@ -569,6 +599,14 @@ u32 VdIsHSIOTrainingSucceeded_entry() {
 u32 VdPersistDisplay_entry(u32 unk0, mapped_u32 unk1_ptr) {
   // unk1_ptr needs to be populated with a pointer passed to
   // MmFreePhysicalMemory(1, *unk1_ptr).
+  // (Hunt v1.4.6, ronda 11, A3-R11-09.) *unk1_ptr was written with
+  // only a null check (R10-09 class). Validate its 4 bytes first.
+  // (The ignored Alloc return below is NOT a defect: BaseHeap::Alloc
+  // sets *out_address = 0 on entry, so a failed alloc writes 0,
+  // not an uninitialized value.)
+  if (unk1_ptr && !GuestRangeWritable(unk1_ptr.guest_address(), sizeof(uint32_t))) {
+    return 1;
+  }
   if (unk1_ptr) {
     auto heap = REX_KERNEL_MEMORY()->LookupHeapByType(true, 16 * 1024);
     uint32_t unk1_value;
@@ -597,6 +635,27 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
   // All of these parameters are REQUIRED.
+  // (Hunt v1.4.6, ronda 11, A3-R11-02.) Every mapped parameter below
+  // was guarded only by assert() -- a no-op in release builds -- and
+  // then dereferenced: fetch_ptr is read (24 bytes) through
+  // copy_and_swap_32_unaligned, frontbuffer_ptr / texture_format_ptr /
+  // color_space_ptr / width / height are read (4 bytes each), and
+  // buffer_ptr is written (256 bytes). A wild pointer from the guest
+  // SIGSEGVd the host on every frame (this is the present path).
+  // Validate all of them up front; on failure drop the swap (void
+  // return) instead of crashing the host. unk2 / unk3 / unk4 are
+  // never dereferenced in this function and need no check.
+  if (!buffer_ptr || !fetch_ptr || !frontbuffer_ptr || !texture_format_ptr ||
+      !color_space_ptr || !width || !height ||
+      !GuestRangeWritable(buffer_ptr.guest_address(), 64 * sizeof(uint32_t)) ||
+      !GuestRangeReadable(fetch_ptr.guest_address(), 6 * sizeof(uint32_t)) ||
+      !GuestRangeReadable(frontbuffer_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeReadable(texture_format_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeReadable(color_space_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeReadable(width.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeReadable(height.guest_address(), sizeof(uint32_t))) {
+    return;
+  }
   assert(buffer_ptr);
   assert(fetch_ptr);
   assert(frontbuffer_ptr);
