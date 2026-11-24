@@ -122,6 +122,30 @@ static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, true);
 }
 
+// (Hunt v1.4.6, ronda 10, A3-R10-02.) An X_ANSI_STRING guest struct
+// plus the bytes it points at: the 8-byte header first, then length
+// bytes at pointer. Same helper as A3-R8-02 (xboxkrnl_ob.cpp). A NULL
+// pointer or zero length means "empty", which TranslateAnsiString*
+// already tolerates.
+static bool GuestAnsiStringReadable(uint32_t guest_address) {
+  if (!guest_address) {
+    return true;
+  }
+  if (!GuestRangeReadable(guest_address, sizeof(X_ANSI_STRING))) {
+    return false;
+  }
+  auto* ansi = REX_KERNEL_MEMORY()->TranslateVirtual<const X_ANSI_STRING*>(guest_address);
+  uint32_t length = ansi->length;
+  if (!length) {
+    return true;
+  }
+  uint32_t pointer = ansi->pointer;
+  if (!pointer) {
+    return false;
+  }
+  return GuestRangeReadable(pointer, length);
+}
+
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
   // TODO(gibbed): validate path components individually
   bool got_asterisk = false;
@@ -198,6 +222,20 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   // return SUCCESS, leaking the handle. Same guard R6-06 added to
   // NtOpenSymbolicLinkObject and IoCreateDevice.
   if (!handle_out) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-02.) The 12-byte
+  // X_OBJECT_ATTRIBUTES struct is read below (name_ptr,
+  // root_directory), the 8-byte iosb and the 4-byte handle_out are
+  // written at the end -- all with only NULL checks before. Validate
+  // every range, and the ANSI string the struct points at, before
+  // the first field read (R8-02 pattern).
+  if (!GuestRangeReadable(object_attrs.guest_address(), sizeof(X_OBJECT_ATTRIBUTES)) ||
+      !GuestRangeWritable(handle_out.guest_address(), sizeof(uint32_t)) ||
+      (io_status_block &&
+       !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK))) ||
+      !GuestAnsiStringReadable(object_attrs->name_ptr)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -348,6 +386,15 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
 u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) byte_offset_ptr (8 B) is read
+  // on the very next line and the iosb (8 B) is written on every exit
+  // below, both with only a NULL check. Validate both ranges first.
+  if ((byte_offset_ptr &&
+       !GuestRangeReadable(byte_offset_ptr.guest_address(), sizeof(uint64_t))) ||
+      (io_status_block &&
+       !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
   REXKRNL_IMPORT_TRACE(
@@ -494,6 +541,16 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
 u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                             mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                             mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) Same class as NtReadFile
+  // above: byte_offset_ptr is read (8 B) and the iosb written (8 B)
+  // with only NULL checks. (The segment array itself is validated
+  // inside XFile::ReadScatter, A3-R10-10.)
+  if ((byte_offset_ptr &&
+       !GuestRangeReadable(byte_offset_ptr.guest_address(), sizeof(uint64_t))) ||
+      (io_status_block &&
+       !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   bool signal_event = false;
@@ -594,6 +651,15 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
 u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
                       u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) Same class as NtReadFile
+  // above: byte_offset_ptr is read (8 B) and the iosb written (8 B)
+  // with only NULL checks.
+  if ((byte_offset_ptr &&
+       !GuestRangeReadable(byte_offset_ptr.guest_address(), sizeof(uint64_t))) ||
+      (io_status_block &&
+       !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   // Grab event to signal.
@@ -678,6 +744,12 @@ u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) out_handle is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(out_handle.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   auto completion = new XIOCompletion(REX_KERNEL_STATE());
   *out_handle = completion->handle();
 
@@ -704,6 +776,19 @@ u32 NtSetIoCompletion_entry(u32 handle, u32 key_context, u32 apc_context, u32 co
 // Dequeues a packet from the completion port.
 u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 apc_context,
                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 timeout) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) *timeout is read (8 B) and
+  // key_context / apc_context (4 B each) and the iosb (8 B) are
+  // written below, all with only NULL checks. Validate every range
+  // first; a NULL out-param stays allowed, as before.
+  if ((timeout && !GuestRangeReadable(timeout.guest_address(), sizeof(uint64_t))) ||
+      (key_context &&
+       !GuestRangeWritable(key_context.guest_address(), sizeof(uint32_t))) ||
+      (apc_context &&
+       !GuestRangeWritable(apc_context.guest_address(), sizeof(uint32_t))) ||
+      (io_status_block &&
+       !GuestRangeWritable(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK)))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   X_STATUS status = X_STATUS_SUCCESS;
   // uint32_t info = 0;
 
@@ -744,6 +829,17 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
   // so dereferencing either out-pointer below used to SIGSEGV the host.
   // Same guard NtCreateFile already has for object_attrs.
   if (!obj_attribs || !file_info) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-02.) Same class as NtCreateFile
+  // above, plus the 56-byte X_FILE_NETWORK_OPEN_INFORMATION written
+  // at the end: validate the attributes struct, the ANSI string it
+  // points at, and the info struct before any deref.
+  if (!GuestRangeReadable(obj_attribs.guest_address(), sizeof(X_OBJECT_ATTRIBUTES)) ||
+      !GuestRangeWritable(file_info.guest_address(),
+                          sizeof(X_FILE_NETWORK_OPEN_INFORMATION)) ||
+      !GuestAnsiStringReadable(obj_attribs->name_ptr)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -884,6 +980,12 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) The iosb is written below
+  // with only a NULL check: validate the 8-byte range first.
+  if (io_status_block_ptr &&
+      !GuestRangeWritable(io_status_block_ptr.guest_address(), sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // (Hunt v1.4.6, A2-R4-19.) This used to return SUCCESS without ever
   // looking at the handle or flushing anything -- including for an
   // invalid handle. Validate the handle and flush for real (HostPath
@@ -914,6 +1016,15 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
   // (Audit A3, ronda 6, R6-06.) assert_not_null is a no-op in Release;
   // a NULL handle_out used to write the handle to guest address 0.
   if (!handle_out) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-02.) Same class as NtCreateFile:
+  // the attributes struct is read and handle_out written with only
+  // NULL checks. Validate both ranges and the name string first.
+  if (!GuestRangeReadable(object_attrs.guest_address(), sizeof(X_OBJECT_ATTRIBUTES)) ||
+      !GuestRangeWritable(handle_out.guest_address(), sizeof(uint32_t)) ||
+      !GuestAnsiStringReadable(object_attrs->name_ptr)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
@@ -1005,6 +1116,25 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
                                 u32 io_status_block, u32 io_control_code, mapped_void input_buffer,
                                 u32 input_buffer_len, mapped_void output_buffer,
                                 u32 output_buffer_len) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-05.) complete_io below translates
+  // the raw u32 io_status_block with TranslateVirtual and writes the
+  // 8-byte iosb on EVERY exit path, including the error paths -- but
+  // TranslateVirtual NEVER returns nullptr, so the `if
+  // (io_status_block)` / `if (iosb)` checks inside it are vacuous
+  // and a wild value writes to an arbitrary host address. Validate
+  // the iosb (8 B) up front, before complete_io can ever run; when
+  // the iosb itself is invalid there is nowhere to complete into,
+  // so return the error directly. The disk branches also store 8/16
+  // bytes to output_buffer with only a NULL check, so validate that
+  // range too whenever an output length was given.
+  if (io_status_block && !GuestRangeWritable(io_status_block, sizeof(X_IO_STATUS_BLOCK))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (output_buffer_len &&
+      (!output_buffer ||
+       !GuestRangeWritable(output_buffer.guest_address(), output_buffer_len))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   // Called by XMountUtilityDrive cache-mounting code
   // (checks if the returned values look valid, values below seem to pass the
   // checks)
@@ -1150,6 +1280,12 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) *out_struct is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(out_struct.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   // Called from XMountUtilityDrive XAM-task code
   // That code tries writing things to a pointer at out_struct+0x18
   // We'll alloc some scratch space for it so it doesn't cause any exceptions
@@ -1205,6 +1341,12 @@ u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_obje
   // writing the out-params: callers believed the request ran and read
   // output that was never produced. Fail honestly, and zero the byte
   // count so a caller that ignores the status does not read a stale length.
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) *returned_length is written
+  // with only the NULL check: validate the 4-byte range first.
+  if (returned_length &&
+      !GuestRangeWritable(returned_length.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (returned_length) {
     *returned_length = 0;
   }
@@ -1216,6 +1358,11 @@ u32 StfsCreateDevice_entry(mapped_void device_object, u32 flags, mapped_u32 out_
   // (Audit A3, ronda 6, R6-05.) Was SUCCESS without creating the device
   // or writing *out_device (the write was commented out): callers used
   // an uninitialized device pointer. Write NULL and fail honestly.
+  // (Hunt v1.4.6, ronda 10, A3-R10-07.) *out_device is written with
+  // only the NULL check: validate the 4-byte range first.
+  if (out_device && !GuestRangeWritable(out_device.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (out_device) {
     *out_device = 0;
   }
