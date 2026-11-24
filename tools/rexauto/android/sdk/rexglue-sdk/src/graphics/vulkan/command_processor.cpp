@@ -329,6 +329,10 @@ void main() {
 
 const char* GetSwapApplyGammaTablePixelRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(set = 0, binding = 0) uniform textureBuffer xe_apply_gamma_ramp;
 layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;
 
@@ -348,6 +352,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlPixelRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(set = 0, binding = 0) uniform utextureBuffer xe_apply_gamma_ramp;
 layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;
 
@@ -374,6 +382,10 @@ void main() {
 
 const char* GetSwapApplyGammaTableComputeRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -402,6 +414,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlComputeRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -435,6 +451,10 @@ void main() {
 
 const char* GetSwapApplyGammaTableFxaaLumaComputeRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -464,6 +484,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlFxaaLumaComputeRbSwapSource() {
   return R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : enable
+// (Hunt v1.4.6 ronda 12, A2-R12-01.) texelFetch() on the samplerless texture2D
+// swap source needs this extension; without it glslang rejects the shader
+// with "required extension not requested: GL_EXT_samplerless_texture_functions".
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
