@@ -207,6 +207,12 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) The name buffer (up to 16
+  // bytes, the count copy_truncating writes) had only the NULL check
+  // above: validate the range first.
+  if (!GuestRangeWritable(buffer.guest_address(), std::min(buffer_len, uint32_t(16)))) {
+    return X_E_INVALIDARG;
+  }
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -226,6 +232,14 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) The gamertag buffer (up to
+  // 16 UTF-16 code units = 32 bytes) had only the NULL / length
+  // checks above: validate the range first.
+  if (!GuestRangeWritable(buffer.guest_address(),
+                          static_cast<size_t>(std::min(buffer_len, uint32_t(16))) *
+                              sizeof(char16_t))) {
+    return X_E_INVALIDARG;
+  }
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   auto user_name = rex::string::to_utf16(user_profile->name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -585,6 +599,12 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *out_value is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(out_value.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   // checking all users?
   if (user_index != 0xFF) {
     if (user_index >= 4) {
@@ -608,6 +628,12 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) Same 4-byte out-param class
+  // as CheckPrivilege above.
+  if (!GuestRangeWritable(out_flags.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   if (user_index) {
     return X_ERROR_NO_SUCH_USER;
   }
@@ -622,6 +648,14 @@ u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u3
   // (Audit A3, ronda 6, R6-06.) NULL out params used to write to
   // guest address 0.
   if (!out_unk2 || !out_unk3) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) Both out-params are written
+  // below with only the NULL checks above: validate both 4-byte
+  // ranges first.
+  if (!GuestRangeWritable(out_unk2.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(out_unk3.guest_address(), sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -641,6 +675,13 @@ u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk
   // (Audit A3, ronda 6, R6-06.) A NULL out_unk5 used to write 1 to
   // guest address 0.
   if (!out_unk5) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) The old code wrote *out_unk5
+  // = 1 here, before any validation at all. The range is validated
+  // first now; the write itself is unchanged.
+  if (!GuestRangeWritable(out_unk5.guest_address(), sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -670,6 +711,13 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
 
 u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
                                  u32 overlapped_ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *out_value is written below
+  // (even on failure paths, with 0) with only a NULL check: validate
+  // the 4-byte range first. A NULL out_value stays allowed here --
+  // the overlapped path below is the alternative.
+  if (out_value && !GuestRangeWritable(out_value.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
   uint32_t are_friends = 0;
   X_RESULT result;
 
@@ -862,13 +910,31 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) Both out-params are written
+  // below with only the NULL checks above: validate both 4-byte
+  // ranges first.
+  if (!GuestRangeWritable(buffer_size_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   size_t entry_size = sizeof(X_ACHIEVEMENT_DETAILS);
   if (flags & 7) {
     entry_size += X_ACHIEVEMENT_DETAILS::kStringBufferSize;
   }
 
   if (buffer_size_ptr) {
-    *buffer_size_ptr = static_cast<uint32_t>(entry_size) * count;
+    // (Hunt v1.4.6, ronda 10, A3-R10-12.) The multiplication used
+    // to wrap in u32 for huge counts: compute it in 64 bits (R7-03
+    // pattern, as XamContentCreateEnumerator does) and reject a
+    // total that does not fit the u32 out-param. Mostly benign in
+    // practice -- WriteItems truncates per R4-03 -- but the
+    // out-param itself must never carry a wrapped size.
+    const uint64_t total_size = static_cast<uint64_t>(entry_size) * count;
+    if (total_size > UINT32_MAX) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    *buffer_size_ptr = static_cast<uint32_t>(total_size);
   }
 
   auto e = object_ref<XStaticAchievementEnumerator>(
@@ -943,6 +1009,15 @@ u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) All three out-params are
+  // written below with only the NULL checks above: validate all
+  // three 4-byte ranges first.
+  if (!GuestRangeWritable(out1_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(out2_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(out3_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   *out1_ptr = 0xC0DE0001;
   *out2_ptr = 0xC0DE0002;
   *out3_ptr = 0xC0DE0003;
@@ -991,6 +1066,12 @@ u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *handle_ptr is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(handle_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   *handle_ptr = 0xCAFEDEAD;
   return X_ERROR_SUCCESS;
 }
@@ -999,6 +1080,12 @@ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
   // (Audit A3, ronda 6, R6-06.) A NULL obj_ptr used to write the
   // placeholder object pointer to guest address 0.
   if (!obj_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *obj_ptr is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(obj_ptr.guest_address(), sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
