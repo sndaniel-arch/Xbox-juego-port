@@ -110,13 +110,11 @@ static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool wri
          range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
-static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
-  return GuestRangeAccessible(guest_address, length, false);
-}
-
-static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
-  return GuestRangeAccessible(guest_address, length, true);
-}
+// (Hunt v1.4.6, ronda 10, A3-R10-11.) The GuestRangeReadable /
+// GuestRangeWritable wrappers above were dead (definition only, no
+// callers -- this file validates through GuestPtrReadable /
+// GuestPtrWritable, which call GuestRangeAccessible directly), so
+// they are removed. No behaviour change; -Wunused-function hygiene.
 
 // (Hunt v1.4.6, ronda 7, A3-R7-01.) The XeKeys*/XeCryptRc4 entries
 // below call each other with MappedPtr::from_host() pointers into
