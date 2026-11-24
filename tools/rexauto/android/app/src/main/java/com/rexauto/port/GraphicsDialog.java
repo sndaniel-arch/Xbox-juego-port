@@ -46,20 +46,35 @@ public final class GraphicsDialog {
     // stack over each other by design (restart follows graphics OK); each
     // is only guarded against a duplicate of itself.
     private static AlertDialog sDialog;
-    private static Activity sDialogActivity;
+    // (Hunt v1.4.6 ronda 11, A4-R11-03.) Same leak as PadSettingsDialog
+    // (R10-02): these were static strong Activity references, and the
+    // dismiss listener does not fire when the activity is destroyed
+    // with the dialog open, so the dead activity stayed alive until
+    // the next open. Held weakly now, and dropped when observed stale
+    // (see the show() entries below); MainActivity.onDestroy() also
+    // clears them eagerly (A4-R11-04, clearStale()).
+    private static WeakReference<Activity> sDialogActivity;
     private static AlertDialog sDriverDialog;
-    private static Activity sDriverActivity;
+    private static WeakReference<Activity> sDriverActivity;
     private static AlertDialog sRestartDialog;
-    private static Activity sRestartActivity;
+    private static WeakReference<Activity> sRestartActivity;
 
-    private static boolean isShowing(AlertDialog dialog, Activity activity) {
+    private static boolean isShowing(AlertDialog dialog, WeakReference<Activity> activityRef) {
+        Activity activity = activityRef == null ? null : activityRef.get();
         return dialog != null && dialog.isShowing()
                 && activity != null && !activity.isFinishing() && !activity.isDestroyed();
     }
 
+    /** (Hunt v1.4.6 ronda 11, A4-R11-04.) Eager release of the dialog statics, called from MainActivity.onDestroy(): drops the (possibly dead) activity references at destroy time instead of waiting for the next open to observe them stale (the R10-02 residual). Safe to call any time: the dialogs belong to the dying activity and their dismiss listeners no-op once the statics are null. */
+    public static void clearStale() {
+        sDialog = null; sDialogActivity = null;
+        sDriverDialog = null; sDriverActivity = null;
+        sRestartDialog = null; sRestartActivity = null;
+    }
+
     private static void trackGraphicsDialog(Activity activity, AlertDialog dialog) {
         sDialog = dialog;
-        sDialogActivity = activity;
+        sDialogActivity = new WeakReference<>(activity);
         dialog.setOnDismissListener(d -> {
             if (sDialog == dialog) { sDialog = null; sDialogActivity = null; }
         });
@@ -67,7 +82,7 @@ public final class GraphicsDialog {
 
     private static void trackDriverDialog(Activity activity, AlertDialog dialog) {
         sDriverDialog = dialog;
-        sDriverActivity = activity;
+        sDriverActivity = new WeakReference<>(activity);
         dialog.setOnDismissListener(d -> {
             if (sDriverDialog == dialog) { sDriverDialog = null; sDriverActivity = null; }
         });
@@ -75,7 +90,7 @@ public final class GraphicsDialog {
 
     private static void trackRestartDialog(Activity activity, AlertDialog dialog) {
         sRestartDialog = dialog;
-        sRestartActivity = activity;
+        sRestartActivity = new WeakReference<>(activity);
         dialog.setOnDismissListener(d -> {
             if (sRestartDialog == dialog) { sRestartDialog = null; sRestartActivity = null; }
         });
@@ -84,6 +99,12 @@ public final class GraphicsDialog {
     public static void show(Activity activity) {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
         if (isShowing(sDialog, sDialogActivity)) return;
+        // (Hunt v1.4.6 ronda 11, A4-R11-03.) Drop the stale statics when
+        // observed (same as PadSettingsDialog.isShowing()): a dismiss
+        // listener never fires on destroy-without-dismiss, so a
+        // non-null sDialog here is a dead activity retained via the
+        // dialog's context.
+        if (sDialog != null) { sDialog = null; sDialogActivity = null; }
         // (Caza ronda 6, A4-R6-07.) Sin este guard, un show() sobre una
         // activity terminada/destruida tira WindowManager$BadTokenException;
         // mismo guard que showRestartDialog ya usa.
@@ -270,6 +291,7 @@ public final class GraphicsDialog {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) A double-tap on OK ran the
         // handler twice and stacked two restart offers.
         if (isShowing(sRestartDialog, sRestartActivity)) return;
+        if (sRestartDialog != null) { sRestartDialog = null; sRestartActivity = null; }
         AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setMessage(R.string.gfx_restart_required)
                 .setPositiveButton(R.string.gfx_restart_now, (d, w) -> restartGame(activity))
@@ -312,6 +334,7 @@ public final class GraphicsDialog {
     public static void showDriverDialog(Activity activity) {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Refuse a duplicate while one is up.
         if (isShowing(sDriverDialog, sDriverActivity)) return;
+        if (sDriverDialog != null) { sDriverDialog = null; sDriverActivity = null; }
         // (Caza ronda 6, A4-R6-07.) Igual que en show(): no mostrar nada
         // sobre una activity terminada/destruida (BadTokenException).
         if (activity.isFinishing() || activity.isDestroyed()) return;
