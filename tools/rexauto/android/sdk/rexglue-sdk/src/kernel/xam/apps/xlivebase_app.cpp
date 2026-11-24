@@ -86,10 +86,10 @@ static bool GuestRangeAccessible(rex::memory::Memory* memory, uint32_t guest_add
          range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
 }
 
-static bool GuestRangeReadable(rex::memory::Memory* memory, uint32_t guest_address,
-                               size_t length) {
-  return GuestRangeAccessible(memory, guest_address, length, false);
-}
+// (Hunt v1.4.6, ronda 10, A3-R10-11.) The GuestRangeReadable wrapper
+// above was dead (definition only, no callers -- every call site in
+// this file uses GuestRangeWritable), so it is removed. No behaviour
+// change; -Wunused-function hygiene.
 
 static bool GuestRangeWritable(rex::memory::Memory* memory, uint32_t guest_address,
                                size_t length) {
