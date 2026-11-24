@@ -592,10 +592,18 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             mServiceDiscoveryAttempts = 0;
             // Run directly, without GattOperation
             if (!isRegistered()) {
+                // (Hunt v1.4.6 ronda 12, A4-R12-01.) Capture the GATT this
+                // callback arrived for: the old code read the mGatt field
+                // when the Runnable ran, so a reconnect in between sent
+                // discoverServices() to the NEW (not yet connected) GATT,
+                // and a shutdown() in between NPE'd on the nulled field.
+                // The R9-05 discovery-retry Runnable already captures its
+                // GATT the same way (retryGatt).
+                final BluetoothGatt connectedGatt = g;
                 mHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        mGatt.discoverServices();
+                        connectedGatt.discoverServices();
                     }
                 });
             }
@@ -974,7 +982,24 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         mIsRegistered = false;
         mIsConnected = false;
         mDirectWritePending = false;
-        mOperations.clear();
+        // (Hunt v1.4.6 ronda 12, A4-R12-01.) Cancel the Handler work posted
+        // by onConnectionStateChange (discoverServices) and by
+        // executeNextGattOperation (the op executor): both dereference
+        // mGatt when they run — discoverServices() on the field, the
+        // executor through op.run() -> getCharacteristic() -> mGatt.getService()
+        // — and both still fire after this method nulls it, NPEing on the
+        // main thread when the disconnect/destroy lands before the looper
+        // runs them. The Handler is private to this instance, so dropping
+        // all its pending work is safe (the discovery-retry Runnable
+        // already guards itself with retryGatt == mGatt and needs
+        // nothing). Drop the in-flight op under the same lock the queue
+        // uses everywhere else — shutdown() used to clear() the queue
+        // without it, racing the synchronized queue methods.
+        mHandler.removeCallbacksAndMessages(null);
+        synchronized (mOperations) {
+            mCurrentOperation = null;
+            mOperations.clear();
+        }
     }
 
 }
