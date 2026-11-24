@@ -228,6 +228,18 @@ public final class GpuDriver {
         if (dirs == null) return out;
         for (File d : dirs) {
             if (d.getName().equals("tmp")) continue;
+            // (Hunt v1.4.6 ronda 14, A4-R14-03.) "<slug>.old" es el backup
+            // del reemplazo (importZip :397-:406): si el proceso muere
+            // entre el rename a .old y el deleteTree final, el backup
+            // queda en disco con un meta.json valido y installed() lo
+            // lista como un driver mas ("driver.old") en el selector
+            // (GraphicsSettings:124, GraphicsDialog:368). Solo el
+            // siguiente import DEL MISMO slug lo limpia (:398), asi que
+            // el fantasma persiste hasta entonces. El backup NO se
+            // borra aqui: si el proceso murio antes del rename del
+            // nuevo driver, .old guarda la unica copia del driver
+            // viejo. Solo se salta en el listado.
+            if (d.getName().endsWith(".old")) continue;
             Info i = readMeta(d);
             if (i != null) out.add(i);
         }
