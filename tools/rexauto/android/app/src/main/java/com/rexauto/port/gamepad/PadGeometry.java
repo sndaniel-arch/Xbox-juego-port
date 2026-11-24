@@ -75,6 +75,10 @@ public final class PadGeometry {
     private static final float DPAD_Y = 0.53f;          // uA, from bottom (preferred)
     private static final float STICK_X_WIDE = 0.545f;   // uA
     private static final float STICK_X_NARROW = 0.44f;  // uA
+    /** Half-gap (uA) kept between a clamped stick's visual edge and the
+    *  viewport midline (ronda 9, A4-R9-01): 0.002uA stays below the
+    *  0.00375uA slack at aspect 0.95, so the clamp is a no-op there. */
+    private static final float STICK_MIDLINE_GAP = 0.002f;
     private static final float ABXY_SPREAD = 0.145f;    // uS, center-to-center
     private static final float TOPROW_Y = 0.265f;       // uA, Start (narrow)
     /**
@@ -161,9 +165,13 @@ public final class PadGeometry {
         final float sCap = Math.min(scale, SCALE_MAX_WIDE);
         final boolean wide = cw >= (WIDE_BASE + WIDE_PER_SCALE * sCap) * uA;
         float sEff = wide ? sCap : Math.min(scale, SCALE_MAX_NARROW);
-        // Aspect-ratio fit cap: on near-square viewports the left/right
-        // clusters would collide no matter what, so the pad shrinks instead
-        // (0.94 = stick spread + radii + gap; 1.05 = bumper row spread).
+        // Aspect-ratio fit cap: on near-square viewports the controls
+        // shrink instead of overflowing (0.94 = stick spread + radii +
+        // gap; 1.05 = bumper row spread). Shrinking alone cannot separate
+        // the two sticks -- their centers anchor to uA, so at aspect 0.88
+        // they coincide at any scale; the stick clamp in build() below
+        // moves the centers, and this cap only bounds the sizes.
+        // (Hunt v1.4.6 ronda 9, A4-R9-01).
         final float aspect = cw / ch;
         final float sFit = Math.min((aspect - 0.94f) / 0.25f, (aspect - 0.06f) / 1.05f);
         sEff = Math.max(0.25f, Math.min(sEff, sFit));
@@ -185,14 +193,26 @@ public final class PadGeometry {
                 R_GEAR * uS, 0f, 0f, HIT_GEAR * R_GEAR * uS);
 
         // --- Analog sticks (reach-anchored horizontally, bottom-anchored) -----
+        // (Hunt v1.4.6 ronda 9, A4-R9-01). The stick centers used to anchor
+        // to uA (= content height) only: at aspect 0.88 the two centers
+        // coincided, and below it they crossed, whatever the scale cap did
+        // (sFit shrinks sizes, never moves centers). Clamp each center to
+        // its own half of the viewport, keeping at least STICK_MIDLINE_GAP
+        // between the visual edge and the midline, so the two circles can
+        // never overlap or leave the screen. The clamp is computed in uA
+        // units so the no-op path returns exactly stickX: at aspect >= 0.95
+        // the slack is >= 0.00375uA, larger than the gap, and the layout is
+        // exactly as before (verified by sweep over 3780 configs).
         final float stickX = wide ? STICK_X_WIDE : STICK_X_NARROW;
         final float stickBottom = wide ? 0.035f : 0.055f;
         final float stickCy = bottom - (R_STICK + stickBottom) * uS;
+        final float stickXEff = Math.min(stickX,
+                (cw / 2f - R_STICK * uS) / uA - STICK_MIDLINE_GAP);
         out[ID_STICK_L] = new Control(ID_STICK_L, TYPE_STICK,
-                left + stickX * uA, stickCy,
+                left + stickXEff * uA, stickCy,
                 R_STICK * uS, 0f, 0f, HIT_STICK * R_STICK * uS);
         out[ID_STICK_R] = new Control(ID_STICK_R, TYPE_STICK,
-                right - stickX * uA, stickCy,
+                right - stickXEff * uA, stickCy,
                 R_STICK * uS, 0f, 0f, HIT_STICK * R_STICK * uS);
 
         // --- Face cluster (Xbox layout minus Y: B right, A bottom, X left) -----
@@ -200,8 +220,15 @@ public final class PadGeometry {
         // (exploration, combat or menus), so the cluster is a 3-button
         // triangle now. A = jump/fly/dash + confirm, X = interact, B = back.
         // The cluster sits higher on wide screens (the right stick drops to
-        // 0.965*bottom there) and lower on narrow ones, keeping >=0.04u
-        // separation from the stick in both regimes.
+        // 0.965*bottom there) and lower on narrow ones. Measured minimum
+        // visual clearance to the right stick over the swept band
+        // (aspect 0.50-3.00, scale 0.75-1.20): 0.012uS in narrow
+        // (A vs right stick, aspect 1.19, scale 1.0) and 0.018uS in wide
+        // (X vs right stick, aspect 1.82, scale 1.2) -- the old comment's
+        // ">=0.04u in both regimes" was ~3x the real margin (ronda 9,
+        // A4-R9-02). No overlap anywhere in the band; the margin is a
+        // measured fact, not a guaranteed bound, so do not move the
+        // cluster on the strength of it.
         final float abxyCx = right - 0.25f * uS;
         final float abxyCy = bottom - (wide ? 0.37f : 0.42f) * uS;
         final float spread = ABXY_SPREAD * uS;
@@ -215,8 +242,11 @@ public final class PadGeometry {
                 rBtn, 0f, 0f, hitBtn);
 
         // --- D-pad (upper left; clamped into its feasible vertical band) ------
+        // The effective stick anchor goes to the band: once the clamp moves
+        // the left stick, the band must measure from where the stick really
+        // is, not from its unclamped anchor (ronda 9, A4-R9-01).
         final float dpadCy = dpadBandCenter(wide, left, bottom, uA, uS,
-                stickX, stickCy);
+                stickXEff, stickCy);
         out[ID_DPAD] = new Control(ID_DPAD, TYPE_DPAD,
                 left + DPAD_X * uA, dpadCy,
                 R_DPAD * uS, 0f, 0f, HIT_DPAD * R_DPAD * uS);
@@ -252,7 +282,12 @@ public final class PadGeometry {
         final float need = dpadR + stickR + 0.02f * uA;
         float maxCy = stickCy;
         if (dx < need) {
-            final float dyMin = (float) Math.sqrt(need * need - dx * dx);
+            // (Ronda 9, A4-R9-01.) With the stick clamp the anchor can now
+            // sit left of the d-pad (|dx| > need below aspect ~0.46), where
+            // the horizontal gap alone already clears the stick; clamp the
+            // radicand at 0 so the sqrt cannot go NaN, and the band falls
+            // back to stickCy, which is the geometrically correct limit.
+            final float dyMin = (float) Math.sqrt(Math.max(0f, need * need - dx * dx));
             maxCy = stickCy - dyMin;
         }
         final float preferred = bottom - 0.53f * uA;
