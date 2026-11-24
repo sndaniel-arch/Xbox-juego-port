@@ -20,6 +20,7 @@ import com.rexauto.port.LogsDialog;
 import com.rexauto.port.R;
 
 import java.io.File;
+import java.lang.ref.WeakReference;
 
 /**
  * In-game settings for the virtual gamepad: size, opacity, haptics and a
@@ -39,13 +40,38 @@ final class PadSettingsDialog {
     // is gone, or which is no longer showing, is dropped and the dialog can
     // open again.
     private static AlertDialog sDialog;
-    private static Activity sDialogActivity;
+    // (Hunt v1.4.6, ronda 10, A4-R10-02.) Was a static strong Activity
+    // reference: when the activity was destroyed with the dialog open
+    // (OnDismissListener does not fire then), the dead MainActivity —
+    // view hierarchy, SDL surface, virtual pad — stayed alive until
+    // the next gear tap. Held weakly now, same pattern SetupActivity
+    // already uses for its import threads. Note the weak reference
+    // alone is not the whole fix: sDialog itself holds the activity
+    // as the dialog's context, so isShowing() below also drops both
+    // statics when it observes a stale state.
+    private static WeakReference<Activity> sDialogActivity;
 
     /** True when this dialog is currently up in a live activity. */
     static boolean isShowing() {
-        return sDialog != null && sDialog.isShowing()
-                && sDialogActivity != null
-                && !sDialogActivity.isFinishing() && !sDialogActivity.isDestroyed();
+        Activity activity = sDialogActivity == null ? null : sDialogActivity.get();
+        boolean showing = sDialog != null && sDialog.isShowing()
+                && activity != null
+                && !activity.isFinishing() && !activity.isDestroyed();
+        if (!showing) {
+            // (Hunt v1.4.6, ronda 10, A4-R10-02.) Drop the stale statics
+            // instead of only returning false: sDialog holds the dead
+            // activity via the dialog's context, so returning false
+            // alone left it retained until the next show() overwrote the
+            // fields. Clearing both here releases it the next time
+            // anyone observes the state — show() and
+            // VirtualPadView.openSettingsDialog() both call isShowing()
+            // before opening, so the next gear tap heals it. No eager
+            // clear is possible from this class: it has no lifecycle
+            // callback for the activity's destruction (see NOTES.md).
+            sDialog = null;
+            sDialogActivity = null;
+        }
+        return showing;
     }
 
     /** One labeled percent slider bound to a clamped settings value. */
@@ -310,7 +336,7 @@ final class PadSettingsDialog {
         // isShowing() guard; clear it on dismiss (the == check keeps a
         // newer dialog from being cleared by an older one's dismiss).
         sDialog = dialog;
-        sDialogActivity = activity;
+        sDialogActivity = new WeakReference<>(activity);
         dialog.setOnDismissListener(d -> {
             if (sDialog == dialog) {
                 sDialog = null;
