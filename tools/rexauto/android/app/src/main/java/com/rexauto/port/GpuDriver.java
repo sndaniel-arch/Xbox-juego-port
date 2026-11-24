@@ -327,6 +327,13 @@ public final class GpuDriver {
                 if (name.isEmpty() || name.startsWith(".")) continue;
                 if (!(name.endsWith(".so") || name.equals("meta.json"))) continue;
                 File out = new File(tmp, name);
+                // (Hunt v1.4.6 ronda 11, A4-R11-08.) Entries are flattened
+                // to basenames above, so two entries in different folders
+                // with the same basename silently overwrote each other —
+                // the meta.json of one pack with the .so of another, the
+                // same mix-up R9-A1 fixed between two picks. Refuse a zip
+                // that carries the same output name twice.
+                if (out.exists()) throw new IOException("driver zip has duplicate file " + name);
                 try (OutputStream os = new FileOutputStream(out)) {
                     byte[] buf = new byte[1 << 16];
                     int n;
@@ -376,8 +383,27 @@ public final class GpuDriver {
             slug.equals("driver.txt") || slug.equals("driver.txt.tmp") ||
             slug.startsWith("import_")) slug = "driver";
         File dest = new File(root(), slug);
-        if (dest.exists()) deleteTree(dest);
-        if (!tmp.renameTo(dest)) { deleteTree(tmp); throw new IOException("rename " + tmp + " -> " + dest); }
+        // (Hunt v1.4.6 ronda 11, A4-R11-07.) The old code deleted the
+        // installed driver first and then renamed tmp over it, ignoring
+        // deleteTree()'s result: if the delete failed (or only partly
+        // succeeded) the rename failed because dest still existed, and
+        // BOTH copies were gone — the old driver deleted, the new one
+        // deleted with tmp in the failure branch. Same backup-rename
+        // shape as SetupActivity.promoteStagedImport(): move the old
+        // driver aside first, restore it if the rename fails, delete
+        // the backup only once the new driver is in place. A leftover
+        // "<slug>.old" (process died mid-replace) is cleared by the
+        // next import of the same slug.
+        File backup = new File(root(), slug + ".old");
+        deleteTree(backup);
+        boolean hadDest = dest.exists();
+        if (hadDest && !dest.renameTo(backup)) { deleteTree(tmp); throw new IOException("could not replace installed driver " + slug); }
+        if (!tmp.renameTo(dest)) {
+            if (hadDest && backup.exists()) backup.renameTo(dest);
+            deleteTree(tmp);
+            throw new IOException("rename " + tmp + " -> " + dest);
+        }
+        deleteTree(backup);
         // dlopen() needs the files to be non-writable by others; files dir is private already,
         // but make sure the .so is readable + executable for the loader.
         // (Ronda 5, auditor F — R5-F3.) File.listFiles() devuelve null ante
