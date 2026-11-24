@@ -68,7 +68,31 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-march=armv8.2-a+fp16+dotprod -mtune=cortex-a76)
   endif()
   add_link_options(-Wl,-O2 -Wl,--gc-sections -Wl,--icf=all -Wl,--as-needed -Wl,-z,now)
-endif()
+  # (Hunt v1.4.6, ronda 10, A5-R10-01.) 16 KB page-size alignment: NDK r27
+  # (pinned in app/build.gradle.kts:35) aligns PT_LOAD to 4 KB by default,
+  # so on a 16 KB-page device the dynamic loader rejects every .so built
+  # here. NDK r28+ aligns to 16 KB by default, but the NDK is pinned in
+  # TWO places (build.gradle.kts + the workflow's sdkmanager install) and
+  # r28 changes defaults beyond page size, so the surgical fix is the
+  # official r27-and-lower linker flags (developer.android.com/guide/
+  # practices/page-sizes). These are directory link options, set BEFORE
+  # the add_subdirectory() calls below, so they reach every native target
+  # in this tree: rexruntime + rexgpu-xenos (rexglue-sdk), libadrenotools
+  # + the 4 hook libs (libadrenotools), and libmain. The prebuilt
+  # libc++_shared.so already has p_align 0x4000 and needs nothing.
+  # Verified by the FULL script + CI "Verify APK" 16 KB gates (readelf).
+  add_link_options(-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384)
+  # (Hunt v1.4.6, ronda 10, A5-R10-08.) Remap the absolute checkout path
+  # out of __FILE__: the release .so carried 162 "/home/hatch/workspace/
+  # col-recomp/..." strings (log/assert __FILE__, no .debug_* sections).
+  # -ffile-prefix-map (not -fdebug-prefix-map, which only remaps debug
+  # info) rewrites __FILE__ too. The mapped prefix is the checkout root,
+  # computed from REX_PROJECT_ROOT (tools/rexauto, handed over by Gradle)
+  # so it works on any builder machine, not just this one; __FILE__
+  # becomes a repo-relative path (e.g. tools/rexauto/android/sdk/...).
+  # Same directory-scope rule as above: set before add_subdirectory().
+  get_filename_component(REX_CHECKOUT_ROOT "${REX_PROJECT_ROOT}/../.." ABSOLUTE)
+  add_compile_options("-ffile-prefix-map=${REX_CHECKOUT_ROOT}=.")
 
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 
