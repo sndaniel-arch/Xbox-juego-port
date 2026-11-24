@@ -4867,11 +4867,20 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
     const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
     uint32_t bits_per_pixel = format_info->bits_per_pixel;
-    if (bits_per_pixel != 8 && bits_per_pixel != 16 && bits_per_pixel != 32 &&
-        bits_per_pixel != 64) {
+        // (Hunt v1.4.6 ronda 13, A2-R13-01.) The downscale shader below reads
+  // the scaled resolve buffer as linear 32x32 tiles
+  // (resolve_downscale.cs.glsl: tile bytes = 1024 * pixel_size, pixels
+  // row-major within the tile). That matches the guest tiled layout only
+  // for 32/64-bit formats: a 32x32 tile is contiguous and linear there
+  // (span 0x1000 / 0x2000). For 8-bit the tile's bytes are interleaved
+  // over a 0xA00 span and for 16-bit over a 0xC00
+  // (GetTiledAddressUpperBound2D in pipeline/texture/util.cpp), so the
+  // shader would read scrambled pixels for those formats. Bail out like
+  // the other unsupported cases in this function (the readback just
+  // isn't updated this frame) instead of downscaling garbage.
+  if (bits_per_pixel != 32 && bits_per_pixel != 64) {
       return true;
     }
-
     uint32_t pixel_size_log2;
     if (!rex::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2)) {
       return true;
@@ -4879,6 +4888,15 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint32_t tile_size_1x = 32 * 32 * (uint32_t(1) << pixel_size_log2);
     uint32_t tile_count = written_length / tile_size_1x;
     if (!tile_count) {
+      return true;
+    }
+    // (Hunt v1.4.6 ronda 13, A2-R13-01, defense in depth.) The shader only
+    // writes tile_count full tiles, but the copy back to the guest below
+    // copies the full written_length; a partial-tile tail would be stale
+    // bytes from a previous downscale (or uninitialized device-local
+    // memory) presented to the guest as resolved data. Refuse a
+    // non-multiple length the same way as the other bail-outs above.
+    if (written_length % tile_size_1x) {
       return true;
     }
 
