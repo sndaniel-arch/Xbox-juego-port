@@ -99,11 +99,17 @@ def download(url, dest_dir):
                         last = pct // 10
                         log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
         log("saved %s (%.1f MB)" % (path, got / 1e6))
-    if got < 1024:
-        head = open(path, "rb").read(512)
-        if b"<html" in head.lower() or b"<!doctype" in head.lower():
-            raise SystemExit("the link returned an HTML page, not a file -- use a DIRECT "
-                             "download link (or a Google Drive / Dropbox share link)")
+    # (A5-R9-03, ronda 9.) Sniff ALWAYS, not just for tiny downloads: the
+    # old `if got < 1024` guard let a typical >1 KiB HTML error page
+    # (Drive quota, Dropbox 404) through as the game input, failing late
+    # and confusingly in extract.py. Reading 512 B is cheap at any size,
+    # and no legitimate input starts with `<html` / `<!doctype`
+    # (XEX `XEX2`, ISO system area + `CD001` at 0x8001, STFS `CON `/`LIVE`/
+    # `PIRS`, zip `PK` -- see extract.py:874,946 and XEX_MAGIC above).
+    head = open(path, "rb").read(512)
+    if b"<html" in head.lower() or b"<!doctype" in head.lower():
+        raise SystemExit("the link returned an HTML page, not a file -- use a DIRECT "
+                         "download link (or a Google Drive / Dropbox share link)")
     return path
 
 
