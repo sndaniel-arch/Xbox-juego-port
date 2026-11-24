@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <string>
+
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -22,6 +24,102 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+// (Hunt v1.4.6, ronda 12, A3-R12-01.) This file had no range helper:
+// every entry below only NULL-checked its guest pointers, and
+// TranslateVirtual never validates or returns null, so a wild
+// pointer SIGSEGVd the host. Same heap validation as A3-R4-07
+// (xam_app.cpp): reject a range that wraps past 4 GiB, starts or
+// ends outside any heap, or spans heaps of different kinds (or
+// two physical heaps); inside a single heap require the pages to
+// be accessible; across a heap boundary validate both ends
+// (A3-R8-13); a range spanning more than two heaps is rejected
+// outright (A3-R9-10).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 12, A3-R12-01.) Bounded guest C-string read,
+// the R10-03 pattern from crt/file.cpp: MappedPtr<char>::value()
+// builds a string_view straight off the host pointer -- a strlen to
+// NUL with no cap -- so a guest name with no NUL in its page ran the
+// host scan into unmapped memory. Read page by page (each chunk
+// validated readable first), stop at the first NUL, truncate at 4096
+// chars if there is none. Returns false on an invalid range.
+// Callers pass a null guest address as "empty" (the MappedPtr<char>
+// null convention); that case is handled by the caller, not here.
+constexpr size_t kMaxGuestNameChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestNameChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
 
 u32 XexCheckExecutablePrivilege_entry(u32 privilege) {
   REXKRNL_IMPORT_TRACE("XexCheckExecutablePrivilege", "priv={}", (uint32_t)privilege);
@@ -49,13 +147,29 @@ u32 XexGetModuleHandle_entry(mapped_string module_name, mapped_u32 hmodule_ptr) 
   if (!hmodule_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 12, A3-R12-01.) *hmodule_ptr was written
+  // with only the null check above (R10-09 class): a wild non-null
+  // pointer SIGSEGVd the host on the 4-byte writes below.
+  if (!GuestRangeWritable(hmodule_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
   object_ref<XModule> module;
 
+  // (Hunt v1.4.6, ronda 12, A3-R12-01.) module_name.value() is an
+  // unbounded NUL scan (MappedPtr<char>::value() builds a string_view
+  // straight off the host pointer, R10-03 class): a guest name with
+  // no NUL in its page ran the host scan into unmapped memory. Read
+  // it bounded first. A null name still means the executable module
+  // (GetModule("") does the same), matching the old branch.
+  std::string module_name_str;
   if (!module_name) {
     module = REX_KERNEL_STATE()->GetExecutableModule();
   } else {
-    module = REX_KERNEL_STATE()->GetModule(module_name.value());
+    if (!ReadGuestCString(module_name.guest_address(), &module_name_str)) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    module = REX_KERNEL_STATE()->GetModule(module_name_str);
   }
 
   if (!module) {
@@ -76,6 +190,13 @@ u32 XexGetModuleSection_entry(mapped_void hmodule, mapped_string name, mapped_u3
   if (!data_ptr || !size_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 12, A3-R12-02.) *data_ptr / *size_ptr were
+  // written with only the null check above (R10-09 class): a wild
+  // non-null pointer SIGSEGVd the host on the 4-byte writes below.
+  if (!GuestRangeWritable(data_ptr.guest_address(), sizeof(uint32_t)) ||
+      !GuestRangeWritable(size_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   X_STATUS result = X_STATUS_SUCCESS;
 
@@ -83,7 +204,14 @@ u32 XexGetModuleSection_entry(mapped_void hmodule, mapped_string name, mapped_u3
   if (module) {
     uint32_t section_data = 0;
     uint32_t section_size = 0;
-    result = module->GetSection(name.value(), &section_data, &section_size);
+    // (Hunt v1.4.6, ronda 12, A3-R12-02.) name.value() is an
+    // unbounded NUL scan (R10-03 class, see A3-R12-01): read it
+    // bounded first. A null name stays an empty lookup, as before.
+    std::string name_str;
+    if (name && !ReadGuestCString(name.guest_address(), &name_str)) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
+    result = module->GetSection(name_str, &section_data, &section_size);
     if (XSUCCEEDED(result)) {
       *data_ptr = section_data;
       *size_ptr = section_size;
@@ -102,6 +230,22 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
   if (!hmodule_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 12, A3-R12-03.) *hmodule_ptr was written
+  // with only the null check above (R10-09 class): a wild non-null
+  // pointer SIGSEGVd the host on the 4-byte write below.
+  if (!GuestRangeWritable(hmodule_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 12, A3-R12-03.) module_name.value() is an
+  // unbounded NUL scan (R10-03 class, see A3-R12-01), called twice
+  // below (GetModule and LoadUserModule). Read it bounded once and
+  // reuse it. A null name stays an empty lookup, as before.
+  std::string module_name_str;
+  if (module_name &&
+      !ReadGuestCString(module_name.guest_address(), &module_name_str)) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
 
   X_STATUS result = X_STATUS_NO_SUCH_FILE;
 
@@ -112,7 +256,7 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
     // The fresh-load path can't share this lock: LoadUserModule runs
     // DllMain ATTACH outside the global lock by design.
     auto lock = rex::thread::global_critical_region::AcquireDirect();
-    auto module = REX_KERNEL_STATE()->GetModule(module_name.value());
+    auto module = REX_KERNEL_STATE()->GetModule(module_name_str);
     if (module) {
       hmodule = module->hmodule_ptr();
       auto ldr_data = REX_KERNEL_MEMORY()->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(hmodule);
@@ -122,7 +266,7 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
   }
 
   if (!hmodule) {
-    auto user_module = REX_KERNEL_STATE()->LoadUserModule(module_name.value());
+    auto user_module = REX_KERNEL_STATE()->LoadUserModule(module_name_str);
     if (user_module) {
       // Released by the last XexUnloadImage call.
       auto user_module_raw = user_module.release();
@@ -173,6 +317,12 @@ u32 XexGetProcedureAddress_entry(mapped_void hmodule, u32 ordinal, mapped_u32 ou
   if (!out_function_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 12, A3-R12-04.) *out_function_ptr was written
+  // with only the null check above (R10-09 class): a wild non-null
+  // pointer SIGSEGVd the host on the 4-byte writes below.
+  if (!GuestRangeWritable(out_function_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // May be entry point?
   assert_not_zero(ordinal);
@@ -184,7 +334,16 @@ u32 XexGetProcedureAddress_entry(mapped_void hmodule, u32 ordinal, mapped_u32 ou
   }
 
   bool is_string_name = (ordinal & 0xFFFF0000) != 0;
-  auto string_name = reinterpret_cast<const char*>(REX_KERNEL_MEMORY()->TranslateVirtual(ordinal));
+  // (Hunt v1.4.6, ronda 12, A3-R12-04.) When is_string_name, ordinal
+  // is a guest address, and GetProcAddressByName(std::string_view)
+  // builds the view from the raw pointer with strlen -- an unbounded
+  // scan off a wild pointer (R10-03 class). TranslateVirtual never
+  // validates, so the scan ran before any lookup. Read the name
+  // bounded first; an invalid range fails the lookup.
+  std::string string_name;
+  if (is_string_name && !ReadGuestCString(ordinal, &string_name)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   X_STATUS result = X_STATUS_INVALID_HANDLE;
 
@@ -224,6 +383,13 @@ u32 XexGetProcedureAddress_entry(mapped_void hmodule, u32 ordinal, mapped_u32 ou
 
 void ExRegisterTitleTerminateNotification_entry(ppc_ptr_t<X_EX_TITLE_TERMINATE_REGISTRATION> reg,
                                                 u32 create) {
+  // (Hunt v1.4.6, ronda 12, A3-R12-05.) reg is dereferenced below
+  // with no check at all (R10-13 class): a null or wild pointer
+  // SIGSEGVd the host on the 16-byte struct read. Validate it first.
+  if (!reg || !GuestRangeReadable(reg.guest_address(),
+                                 sizeof(X_EX_TITLE_TERMINATE_REGISTRATION))) {
+    return;
+  }
   if (create) {
     // Adding.
     REX_KERNEL_STATE()->RegisterTitleTerminateNotification(reg->notification_routine,
