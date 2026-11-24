@@ -86,7 +86,11 @@ public final class IsoExtractor {
                             // SectorSource que tragaba el truncado en silencio.
                             if (dst.hasRemaining()) throw new IOException("short read at sector " + sector + " (truncated ISO?)");
                         }
-                        @Override public void close() { try { ch.close(); pfd.close(); } catch (IOException ignored) { } }
+                        // (Hunt v1.4.6 ronda 11, A4-R11-09.) The two closes
+                        // were sequential inside one try: if ch.close()
+                        // threw, pfd.close() never ran and the fd leaked
+                        // on every ISO close. Close each in its own try.
+                        @Override public void close() { try { ch.close(); } catch (IOException ignored) { } try { pfd.close(); } catch (IOException ignored) { } }
                     });
                 }
             }
@@ -100,8 +104,12 @@ public final class IsoExtractor {
             try { pfd.close(); } catch (IOException ignored) { }
             throw e;
         }
-        ch.close();
-        pfd.close();
+        // (Hunt v1.4.6 ronda 11, A4-R11-09.) Sequential closes: if
+        // ch.close() threw, pfd.close() never ran and the fd leaked on
+        // every not-an-ISO probe. Close each in its own try, like the
+        // catch block above does.
+        try { ch.close(); } catch (IOException ignored) { }
+        try { pfd.close(); } catch (IOException ignored) { }
         return null;
     }
 
