@@ -534,8 +534,18 @@ public class HIDDeviceManager {
             return false;
         }
 
+        // (Hunt v1.4.6 ronda 14, A4-R14-01.) getName() se cachea UNA vez:
+        // AOSP BluetoothDevice.getName() consulta el servicio en CADA
+        // llamada y devuelve null si el servicio esta null/muerto (BT
+        // apagado, stack caido) o si el nombre aun no se recupero -- el
+        // null-check de arriba no protege las dos llamadas de la linea
+        // del return: entre una y otra el servicio puede morir y el
+        // .equals() tira NPE en el hilo principal (onReceive del
+        // broadcast ACL_CONNECTED). Con el nombre en una local, un
+        // null entre medias es imposible por construccion.
+        String name = bluetoothDevice.getName();
         // If the device has no local name, we really don't want to try an equality check against it.
-        if (bluetoothDevice.getName() == null) {
+        if (name == null) {
             return false;
         }
 
@@ -545,7 +555,7 @@ public class HIDDeviceManager {
         }
 
         // Match on the name either the original Steam Controller or the new second-generation one advertise with.
-        return bluetoothDevice.getName().equals("SteamController") || bluetoothDevice.getName().startsWith("Steam Ctrl");
+        return name.equals("SteamController") || name.startsWith("Steam Ctrl");
     }
 
     private void close() {
