@@ -3072,8 +3072,9 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
 
   // Separate different barriers for overlapping buffer ranges into different
   // pipeline barrier commands.
-  for (const VkBufferMemoryBarrier& other_buffer_memory_barrier :
-       pending_barriers_buffer_memory_barriers_) {
+  for (size_t i = 0; i < pending_barriers_buffer_memory_barriers_.size(); ++i) {
+    const VkBufferMemoryBarrier& other_buffer_memory_barrier =
+        pending_barriers_buffer_memory_barriers_[i];
     if (other_buffer_memory_barrier.buffer != buffer ||
         (size != VK_WHOLE_SIZE && offset + size <= other_buffer_memory_barrier.offset) ||
         (other_buffer_memory_barrier.size != VK_WHOLE_SIZE &&
@@ -3086,9 +3087,22 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
         other_buffer_memory_barrier.srcQueueFamilyIndex == src_queue_family_index &&
         other_buffer_memory_barrier.dstQueueFamilyIndex == dst_queue_family_index) {
       // The barrier is already pending.
-      current_pending_barrier_.src_stage_mask |= src_stage_mask;
-      current_pending_barrier_.dst_stage_mask |= dst_stage_mask;
-      return true;
+      // (Hunt v1.4.6, ronda 10, A1-R10-04.) Only deduplicate against a
+      // barrier in the group still being built (at or after
+      // current_pending_barrier_.buffer_memory_barriers_offset). A barrier
+      // in an already sealed group was emitted before the work this push
+      // must order, so OR-ing its stages into the current group would leave
+      // the new dependency unsynchronized (the extra stages would only
+      // over-synchronize the other group). Fall through and enqueue a fresh
+      // copy in the current group instead; keep scanning so a later
+      // overlapping, different barrier in the current group still forces a
+      // split first.
+      if (i >= current_pending_barrier_.buffer_memory_barriers_offset) {
+        current_pending_barrier_.src_stage_mask |= src_stage_mask;
+        current_pending_barrier_.dst_stage_mask |= dst_stage_mask;
+        return true;
+      }
+      continue;
     }
     SplitPendingBarrier();
     break;
@@ -3123,8 +3137,9 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
 
   // Separate different barriers for overlapping image subresource ranges into
   // different pipeline barrier commands.
-  for (const VkImageMemoryBarrier& other_image_memory_barrier :
-       pending_barriers_image_memory_barriers_) {
+  for (size_t i = 0; i < pending_barriers_image_memory_barriers_.size(); ++i) {
+    const VkImageMemoryBarrier& other_image_memory_barrier =
+        pending_barriers_image_memory_barriers_[i];
     if (other_image_memory_barrier.image != image ||
         !(other_image_memory_barrier.subresourceRange.aspectMask & subresource_range.aspectMask) ||
         (subresource_range.levelCount != VK_REMAINING_MIP_LEVELS &&
@@ -3157,9 +3172,19 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
         other_image_memory_barrier.srcQueueFamilyIndex == src_queue_family_index &&
         other_image_memory_barrier.dstQueueFamilyIndex == dst_queue_family_index) {
       // The barrier is already pending.
-      current_pending_barrier_.src_stage_mask |= src_stage_mask;
-      current_pending_barrier_.dst_stage_mask |= dst_stage_mask;
-      return true;
+      // (Hunt v1.4.6, ronda 10, A1-R10-04.) Only deduplicate against a
+      // barrier in the group still being built (at or after
+      // current_pending_barrier_.image_memory_barriers_offset); a barrier
+      // in an already sealed group was emitted before the work this push
+      // must order, so OR-ing its stages into the current group would leave
+      // the new dependency unsynchronized. Fall through and enqueue a fresh
+      // copy in the current group instead (see PushBufferMemoryBarrier).
+      if (i >= current_pending_barrier_.image_memory_barriers_offset) {
+        current_pending_barrier_.src_stage_mask |= src_stage_mask;
+        current_pending_barrier_.dst_stage_mask |= dst_stage_mask;
+        return true;
+      }
+      continue;
     }
     SplitPendingBarrier();
     break;
@@ -4588,8 +4613,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  const uint64_t readback_key =
-      MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+  // (Hunt v1.4.6, ronda 10, A1-R10-05.) Key covers the full split of the
+  // ranges, not just the first base + total: distinct splits must not share
+  // one readback entry.
+  const uint64_t readback_key = MakeMemexportReadbackKey(memexport_ranges_, total_size);
   ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
   readback.last_used_frame = frame_current_;
 
@@ -4789,6 +4816,12 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     readback.memories[index] = new_memory;
     readback.mapped_data[index] = new_mapping;
     readback.sizes[index] = size;
+    // (Hunt v1.4.6, ronda 10, A1-R10-02.) A reallocated slot holds no
+    // completed write yet; clear the tracking, like the memexport
+    // ensure_readback_slot does, so the delayed-sync guard below cannot
+    // mistake a stale submission/size for a ready previous slot.
+    readback.submission_written[index] = 0;
+    readback.written_size[index] = 0;
     return true;
   };
 
@@ -5002,11 +5035,24 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
+  // (Hunt v1.4.6, ronda 10, A1-R10-02.) Record the write, like the memexport
+  // fast path does (:4667-4668): without submission_written/written_size the
+  // delayed-sync read below has nothing to check, and the previous slot
+  // could be read while its copy was still in flight (or still sitting in
+  // the open submission's deferred stream, unsent).
+  readback.submission_written[write_index] = GetCurrentSubmission();
+  readback.written_size[write_index] = written_length;
+
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
+    // (Hunt v1.4.6, ronda 10, A1-R10-02.) Poll (no blocking wait) so
+    // submission_completed_ is current before the guard below judges the
+    // previous slot -- the memexport fast path calls this the same way
+    // before its previous-slot check.
+    CheckSubmissionFenceAndDeviceLoss(0);
   } else if (!AwaitAllQueueOperationsCompletion()) {
     return true;
   }
@@ -5014,7 +5060,14 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   bool is_cache_miss = false;
   if (use_delayed_sync && (readback.buffers[read_index] == VK_NULL_HANDLE ||
                            written_length > readback.sizes[read_index] ||
-                           readback.mapped_data[read_index] == nullptr)) {
+                           written_length > readback.written_size[read_index] ||
+                           readback.mapped_data[read_index] == nullptr ||
+                           !readback.submission_written[read_index] ||
+                           readback.submission_written[read_index] > submission_completed_)) {
+    // (Hunt v1.4.6, ronda 10, A1-R10-02.) The previous slot is only usable
+    // if its copy actually completed: same guard as the memexport fast path
+    // (:4670-4676). Otherwise fall back to the current slot after a full
+    // await, instead of memcpying stale or not-yet-written bytes.
     is_cache_miss = true;
     read_index = write_index;
     if (!AwaitAllQueueOperationsCompletion()) {
@@ -5024,7 +5077,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
-      written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
+      written_length <= readback.sizes[read_index] &&
+      written_length <= readback.written_size[read_index] &&
+      readback.mapped_data[read_index] != nullptr) {
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -5064,8 +5119,28 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
   const VkDevice device = vulkan_device->device();
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     ReadbackBuffer& readback = it->second;
-    bool evict =
-        buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
+    // (Hunt v1.4.6, ronda 10, A1-R10-03.) The over-capacity branch used to
+    // evict ANY entry, including one whose copy is still in flight: still
+    // sitting in the open submission's deferred stream, or submitted with
+    // its fence not yet signaled (up to kMaxFramesInFlight frames behind).
+    // Destroying its buffer/memory then is a GPU use-after-free. The age
+    // branch is safe as-is (60 frames >> the in-flight window: a write
+    // from that long ago has completed), but the capacity branch must skip
+    // entries with a write submission that has not completed yet -- the
+    // same `<= submission_completed_` test the deferred destroy_* queues
+    // use in CheckSubmissionFenceAndDeviceLoss. Chosen over deferring the
+    // buffers into those queues because it needs no new machinery (there
+    // is no destroy queue for the host unmap, which must stay paired with
+    // the destroy) and the skipped entries become evictable a few frames
+    // later, once their submission completes (or the 60-frame age rule
+    // evicts them); the cap is a pressure valve, not a hard bound. If
+    // every entry is hot, nothing shrinks this frame and the map grows
+    // transiently past 256 -- bounded by the age rule.
+    bool over_capacity = buffer_map.size() > kMaxReadbackBuffers;
+    bool still_in_flight = readback.submission_written[0] > submission_completed_ ||
+                            readback.submission_written[1] > submission_completed_;
+    bool evict = readback.last_used_frame < eviction_frame_floor ||
+                 (over_capacity && !still_in_flight);
     if (!evict) {
       ++it;
       continue;
