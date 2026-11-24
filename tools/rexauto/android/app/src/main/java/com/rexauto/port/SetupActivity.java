@@ -891,7 +891,25 @@ public class SetupActivity extends Activity {
             tmp.delete();
             throw new java.io.IOException("write game_root.txt");
         }
-        new GraphicsSettings(appCtx).write(appCtx);
+        try {
+            new GraphicsSettings(appCtx).write(appCtx);
+        } catch (Exception e) {
+            // (Hunt v1.4.6, ronda 10, A4-R10-03.) Mirror launchGame()
+            // below: the game is already installed at this point
+            // (game_root.txt renamed above, title verified), so a
+            // settings-write failure must not throw into the import
+            // worker's catch, which would report the import as failed
+            // and invite a pointless ~7 GB re-import. Log it, warn on
+            // the UI thread (finish() runs on the import worker, so the
+            // Toast is posted to the main looper), and carry on to the
+            // launch post. launchGame() re-writes the settings and
+            // warns again if it still fails.
+            Log.w("SetupActivity", "finish: settings write failed; game already installed, launching anyway", e);
+            final String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+            new Handler(Looper.getMainLooper()).post(() -> Toast.makeText(appCtx,
+                    appCtx.getString(R.string.err_settings_write, msg),
+                    Toast.LENGTH_LONG).show());
+        }
         new Handler(Looper.getMainLooper()).post(() -> {
             // (Ronda 9, auditor F - R9-F1.) finish() corre en el hilo de
             // import y el runnable llega por el main looper: si el usuario
