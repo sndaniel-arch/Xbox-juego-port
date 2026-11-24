@@ -443,10 +443,15 @@ void RtlCopyString_entry(ppc_ptr_t<X_ANSI_STRING> destination, ppc_ptr_t<X_ANSI_
 void RtlCopyUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> destination,
                                 ppc_ptr_t<X_UNICODE_STRING> source) {
   // (Hunt v1.4.6, ronda 12, A3-R12-14.) Same unvalidated struct
-  // reads and guest-controlled memcpy as RtlCopyString above, with
-  // the same length * 2 byte count as the original (preserved
-  // verbatim; see evidence section 5 for the double-count question).
+  // reads and guest-controlled memcpy as RtlCopyString above.
   // Validate both structs, then both buffers.
+  // (Hunt v1.4.6, caza ronda 13, A3-R13-04.) The byte count was
+  // length * 2: wrong. UNICODE_STRING Length/MaximumLength are in
+  // BYTES (MS Learn _UNICODE_STRING; Wine RtlCopyUnicodeString
+  // copies min(src->Length, dst->MaximumLength) bytes, no * 2),
+  // and this file's own RtlInitUnicodeString sets length =
+  // u16-count * 2. The * 2 copied length bytes past the end of
+  // both strings on every call. Copy length bytes.
   if (!destination ||
       !GuestRangeWritable(destination.guest_address(), sizeof(X_UNICODE_STRING))) {
     return;
@@ -461,13 +466,13 @@ void RtlCopyUnicodeString_entry(ppc_ptr_t<X_UNICODE_STRING> destination,
 
   auto length = std::min(destination->maximum_length, source->length);
   if (length > 0) {
-    if (!GuestRangeWritable(destination->pointer, length * 2) ||
-        !GuestRangeReadable(source->pointer, length * 2)) {
+    if (!GuestRangeWritable(destination->pointer, length) ||
+        !GuestRangeReadable(source->pointer, length)) {
       return;
     }
     auto dst_buf = REX_KERNEL_MEMORY()->TranslateVirtual(destination->pointer);
     auto src_buf = REX_KERNEL_MEMORY()->TranslateVirtual(source->pointer);
-    std::memcpy(dst_buf, src_buf, length * 2);
+    std::memcpy(dst_buf, src_buf, length);
   }
   destination->length = length;
 }
