@@ -113,6 +113,72 @@ void ResetLastValidFrontBuffer() {
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical = end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  // (Hunt v1.4.6, ronda 8, A3-R8-13.) The range straddles a heap
+  // boundary -- legitimate allocations never do (each allocation
+  // lives in a single heap) -- and the old code returned true here
+  // without checking anything, so a buffer whose first page is
+  // uncommitted or NoAccess sailed through every GuestRange* check.
+  // Validate both ends instead: the tail of the start heap and the
+  // head of the end heap, with the same read/write rule as above.
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) A range spanning more than
+  // two heaps is rejected outright below: the middle heap would
+  // otherwise go unchecked, and no legitimate range spans even
+  // one boundary (see the R8-13 comment above).
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  // (Hunt v1.4.6, ronda 9, A3-R9-10.) The heap right after the start
+  // heap must be the end heap: anything else means the range spans
+  // three or more heaps (or a gap in the heap map) and the middle heap
+  // would go unchecked. Reject outright instead of validating only
+  // the two ends.
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, false);
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 // (Audit run #16, A-6.) Three Vd* stubs return a VALUE, not NTSTATUS, so a
 // bare REX_STUB lies worse than 0: it leaves r3 = the first argument (a guest
 // pointer, 0x82...), which reads as TRUE for a BOOL query. The return
@@ -252,6 +318,13 @@ struct X_DISPLAY_INFO {
 static_assert_size(X_DISPLAY_INFO, 0x58);
 
 void VdGetCurrentDisplayInformation_entry(ppc_ptr_t<X_DISPLAY_INFO> display_info) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-13.) Zero() is null-safe, so this
+  // entry *looked* guarded -- but every field write below derefs
+  // unconditionally. Validate the whole 0x58-byte struct first.
+  if (!display_info ||
+      !GuestRangeWritable(display_info.guest_address(), sizeof(X_DISPLAY_INFO))) {
+    return;
+  }
   X_VIDEO_MODE mode;
   VdQueryVideoMode(&mode);
   display_info.Zero();
@@ -309,6 +382,16 @@ void VdQueryVideoMode(X_VIDEO_MODE* video_mode) {
 }
 
 void VdQueryVideoMode_entry(ppc_ptr_t<X_VIDEO_MODE> video_mode) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-13.) VdQueryVideoMode writes the
+  // 48-byte X_VIDEO_MODE through this pointer with no check at all.
+  // The host-pointer overload is also called with stack addresses by
+  // the graphics code, so the validation belongs here, at the guest
+  // entry point -- and in XGetVideoMode (xam_video.cpp), which calls
+  // the host overload directly with a guest pointer.
+  if (!video_mode ||
+      !GuestRangeWritable(video_mode.guest_address(), sizeof(X_VIDEO_MODE))) {
+    return;
+  }
   VdQueryVideoMode(video_mode);
 }
 
