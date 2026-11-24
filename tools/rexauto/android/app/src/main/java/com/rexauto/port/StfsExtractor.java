@@ -152,6 +152,15 @@ public final class StfsExtractor {
         private ByteBuffer readAt(long off, int n) throws IOException {
             ByteBuffer b = ByteBuffer.allocate(n).order(ByteOrder.BIG_ENDIAN);
             while (b.hasRemaining()) { if (ch.read(b, off + b.position()) <= 0) break; }
+            // (Hunt v1.4.6 ronda 11, A4-R11-01.) A short read used to be
+            // swallowed here: nextBlock() read it as END and fileTable()
+            // broke out of the block, so a truncated STFS lost table/hash
+            // entries in silence and the import could succeed with files
+            // missing (the title check only reads the default.xex
+            // header). Same convention as the ISO/GoD paths (R7-F3 /
+            // R8-F3) and the data reads in extractAll() below: a short
+            // read is a truncated package, fail with the real reason.
+            if (b.hasRemaining()) throw new IOException("STFS: short read at offset 0x" + Long.toHexString(off) + " (truncated package?)");
             b.flip();
             return b;
         }
