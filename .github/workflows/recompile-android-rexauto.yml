@@ -1307,6 +1307,29 @@ jobs:
           for _lib in libadrenotools.so libmain_hook.so libhook_impl.so libfile_redirect_hook.so libgsl_alloc_hook.so; do
             grep -q "lib/arm64-v8a/$_lib" /tmp/apk.txt || { echo "::error::$_lib not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
           done
+          # (Hunt v1.4.6, ronda 10, A5-R10-01.) 16 KB page-size gate: on a
+          # 16 KB-page device the dynamic loader rejects any .so whose
+          # PT_LOAD p_align != 0x4000, and the app does not start at all.
+          # The fix lives in app/src/main/cpp/CMakeLists.txt (linker flags
+          # -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 for
+          # NDK r27); this gate verifies it in every CI APK. Do NOT
+          # replace this with `zipalign -c -P 16`: the 9 .so are DEFLATED
+          # (useLegacyPackaging=true) and compressed entries are exempt
+          # from that check, so it passes vacuously on exactly what it
+          # should catch. The ELF alignment is what matters, measured
+          # here with readelf -lW over every extracted .so (the last
+          # column of each LOAD line is p_align; it must be 0x4000 in
+          # ALL of them, and there must be at least one PT_LOAD).
+          # readelf is part of binutils, preinstalled on the runner; if
+          # it ever goes missing, fail loudly instead of passing empty.
+          command -v readelf >/dev/null || { echo "::error::readelf not found (binutils): cannot verify 16 KB ELF alignment of the .so files"; exit 1; }
+          _SO_DIR="$(mktemp -d)"
+          unzip -o -q "$APK" 'lib/arm64-v8a/*.so' -d "$_SO_DIR" || { echo "::error::could not extract the .so files from $APK to verify 16 KB alignment"; rm -rf "$_SO_DIR"; exit 1; }
+          for _so in "$_SO_DIR"/lib/arm64-v8a/*.so; do
+            readelf -lW "$_so" | awk '/LOAD/ {n++; if ($NF != "0x4000") bad=1} END {exit (n==0 || bad) ? 1 : 0}' || { echo "::error::$(basename "$_so") does not have all PT_LOAD segments with p_align 0x4000 (16 KB): on a 16 KB-page device the dynamic loader rejects it and the app will not start (check with: readelf -lW lib/arm64-v8a/*.so)"; rm -rf "$_SO_DIR"; exit 1; }
+          done
+          echo "16 KB alignment OK: all .so files have PT_LOAD p_align 0x4000"
+          rm -rf "$_SO_DIR"
           # Hunt 2, P2-5: el verify es el ultimo control antes de subir el
           # artefacto y debe validar la firma (que la APK se pueda instalar).
           # Con pipefail (arriba) un verify fallido mata el paso.
@@ -1333,7 +1356,21 @@ jobs:
           # (A5-R7-09, ronda 7.) grep -m1 instead of `| head -1`: under
           # pipefail a SIGPIPE'd grep fails the step (the FULL script
           # already fixed the same pattern with grep -m1).
-          ACTUAL_CERT_SHA256="$(grep -a -m1 "certificate SHA-256 digest" /tmp/verify.txt | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
+          # (Hunt v1.4.6, ronda 10, A5-R10-04 — corrección del coordinador.)
+          # The -m1 above only verified the FIRST signer: an APK with a
+          # second signer (re-signed with another key) passed this gate
+          # green, the same hole the FULL script's R10-04 fix closes.
+          # This grep reads a FILE (/tmp/verify.txt), not a pipe, so there
+          # is no SIGPIPE concern in counting all matches. Require exactly
+          # one signer, the heart key: the flow does a single `apksigner
+          # sign` with a single keystore, so a second signer can only be
+          # a re-sign, never legitimate here.
+          _CERT_COUNT="$(grep -a -c "certificate SHA-256 digest" /tmp/verify.txt)"
+          if [ "$_CERT_COUNT" != "1" ]; then
+            echo "::error::APK has $_CERT_COUNT signers (expected exactly 1, the heart key): a second signer indicates a re-sign."
+            exit 1
+          fi
+          ACTUAL_CERT_SHA256="$(grep -a "certificate SHA-256 digest" /tmp/verify.txt | sed 's/.*digest: *//; s/[^0-9a-fA-F]//g' | tr 'A-F' 'a-f')"
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
             echo "::error::APK signed with an unexpected certificate (SHA-256 $ACTUAL_CERT_SHA256, expected heart key $EXPECTED_CERT_SHA256). It would NOT install over previous builds -- check CI_KEYSTORE_BASE64."
             exit 1
