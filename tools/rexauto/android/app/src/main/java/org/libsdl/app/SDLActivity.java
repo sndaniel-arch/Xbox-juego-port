@@ -771,13 +771,21 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                 if (singleFileUri == null) {
                     /* Use Intent.getClipData to get multiple choices */
                     ClipData clipData = data.getClipData();
-                    assert clipData != null;
+                    // (Hunt v1.4.6, ronda 10, A4-R10-04.) Diverges from
+                    // upstream SDL3: upstream asserts clipData != null,
+                    // but assert is stripped in release builds, so a
+                    // picker result with non-null data but null getData()
+                    // AND null getClipData() NPEd at getItemCount().
+                    // Treat that as "nothing picked", like a cancel.
+                    if (clipData == null) {
+                        filelist = new String[0];
+                    } else {
+                        filelist = new String[clipData.getItemCount()];
 
-                    filelist = new String[clipData.getItemCount()];
-
-                    for (int i = 0; i < filelist.length; i++) {
-                        String uri = clipData.getItemAt(i).getUri().toString();
-                        filelist[i] = uri;
+                        for (int i = 0; i < filelist.length; i++) {
+                            String uri = clipData.getItemAt(i).getUri().toString();
+                            filelist[i] = uri;
+                        }
                     }
                 } else {
                     /* Only one file is selected. */
@@ -1632,7 +1640,19 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
 
         // sanity checks
 
-        if ((buttonFlags.length != buttonIds.length) && (buttonIds.length != buttonTexts.length)) {
+        // (Hunt v1.4.6, ronda 10, A4-R10-04.) Diverges from upstream
+        // SDL3: upstream uses && here, so the guard only fires when
+        // BOTH pairs differ; with exactly one pair differing the loop
+        // in messageboxCreateAndShow indexes buttonIds[i] /
+        // buttonFlags[i] out of range (ArrayIndexOutOfBoundsException
+        // on the UI thread). || fires when ANY pair differs. The null
+        // checks are local too — upstream would NPE at .length on a
+        // null array. No caller reaches this from the game today (no
+        // SDL_ShowMessageBox caller; XamShowMessageBoxUI is an ImGui
+        // stub); this is defence in depth.
+        if (buttonFlags == null || buttonIds == null || buttonTexts == null
+                || (buttonFlags.length != buttonIds.length)
+                || (buttonIds.length != buttonTexts.length)) {
             return -1; // implementation broken
         }
 
