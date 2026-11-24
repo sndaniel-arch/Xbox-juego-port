@@ -76,8 +76,8 @@ public final class PadGeometry {
     private static final float STICK_X_WIDE = 0.545f;   // uA
     private static final float STICK_X_NARROW = 0.44f;  // uA
     /** Half-gap (uA) kept between a clamped stick's visual edge and the
-    *  viewport midline (ronda 9, A4-R9-01): 0.002uA stays below the
-    *  0.00375uA slack at aspect 0.95, so the clamp is a no-op there. */
+     *  viewport midline (ronda 9, A4-R9-01): 0.002uA stays below the
+     *  0.00375uA slack at aspect 0.95, so the clamp is a no-op there. */
     private static final float STICK_MIDLINE_GAP = 0.002f;
     private static final float ABXY_SPREAD = 0.145f;    // uS, center-to-center
     private static final float TOPROW_Y = 0.265f;       // uA, Start (narrow)
@@ -171,7 +171,7 @@ public final class PadGeometry {
         // the two sticks -- their centers anchor to uA, so at aspect 0.88
         // they coincide at any scale; the stick clamp in build() below
         // moves the centers, and this cap only bounds the sizes.
-        // (Hunt v1.4.6 ronda 9, A4-R9-01).
+        // (Hunt v1.4.6 ronda 9, A4-R9-01.)
         final float aspect = cw / ch;
         final float sFit = Math.min((aspect - 0.94f) / 0.25f, (aspect - 0.06f) / 1.05f);
         sEff = Math.max(0.25f, Math.min(sEff, sFit));
@@ -193,7 +193,7 @@ public final class PadGeometry {
                 R_GEAR * uS, 0f, 0f, HIT_GEAR * R_GEAR * uS);
 
         // --- Analog sticks (reach-anchored horizontally, bottom-anchored) -----
-        // (Hunt v1.4.6 ronda 9, A4-R9-01). The stick centers used to anchor
+        // (Hunt v1.4.6 ronda 9, A4-R9-01.) The stick centers used to anchor
         // to uA (= content height) only: at aspect 0.88 the two centers
         // coincided, and below it they crossed, whatever the scale cap did
         // (sFit shrinks sizes, never moves centers). Clamp each center to
