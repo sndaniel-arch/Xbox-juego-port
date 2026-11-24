@@ -368,6 +368,13 @@ jobs:
 
       - uses: actions/cache@v6
         id: sdk-cache
+        # (Hunt v1.4.6, ronda 11, A5-R11-04.) This was one of only two
+        # steps in job 1 without a timeout (the other is "Validate
+        # inputs", a one-line regex that cannot hang); every cache step
+        # in job 2 carries one (30/60). A hung cache restore here used
+        # to burn the whole 360-min job budget instead of failing fast
+        # with the step named.
+        timeout-minutes: 30
         with:
           path: rexauto/rexglue
           key: rexglue-sdk-${{ env.REXGLUE_BUNDLE_SHA256 }}-${{ hashFiles('rexauto/rexauto.py') }}-${{ steps.sdk.outputs.url }}
@@ -759,6 +766,15 @@ jobs:
             $hits = @(Select-String -Path $fns -Pattern ('^\s*"' + [regex]::Escape($a) + '"\s*=\s*\{\}\s*$'))
             if ($hits.Count -ne 1) { Write-Host "::error::functions entry '$a' found $($hits.Count) times (want exactly 1)"; exit 1 }
           }
+          # (Hunt v1.4.6, ronda 11, A5-R11-05.) The comment above says
+          # the file must end with exactly 99 entries, but the loop only
+          # proves each seeded address appears once -- extra entries
+          # authored by the init stage (or left by a previous state)
+          # would survive silently. Count the total: in a fresh runner
+          # init creates this file empty and this step runs before
+          # phase 2, so runheal cannot have added anything yet.
+          $total = @(Select-String -Path $fns -Pattern '^\s*"0x[0-9A-Fa-f]+"\s*=\s*\{\}\s*$').Count
+          if ($total -ne 99) { Write-Host "::error::functions.toml has $total entries (want exactly 99 seeded) -- the init stage authored extra entries or a seed is missing"; exit 1 }
           Write-Host "functions.toml updated: $($addrs.Count) phone-reported + audit functions seeded into $fns"
 
       - name: Recompile (codegen + static heal + build check)
@@ -1279,9 +1295,16 @@ jobs:
           set -euo pipefail
           APK=rexauto/android/app/build/outputs/apk/release/app-release.apk
           unzip -l "$APK" > /tmp/apk.txt
-          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk.txt || { echo "::error::libmain.so missing"; exit 1; }
-          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk.txt || { echo "::error::GPU plugin missing"; exit 1; }
-          grep -q "assets/xbox360_titles.json" /tmp/apk.txt || { echo "::error::title DB missing"; exit 1; }
+          # (Hunt v1.4.6, ronda 11, A5-R11-01.) All four greps below are
+          # anchored with $: the patterns used to be unanchored, so a
+          # stray "libmain.so.bak" / "librexgpu-xenos.so.bak" entry (or a
+          # ".bak" adrenotools lib) matched and the gate stayed green
+          # while the real .so was missing -- the same hole A5-R10-05
+          # closed in the FULL script only. unzip -l puts the filename
+          # at the end of the line, so $ is the right anchor.
+          grep -q "lib/arm64-v8a/libmain.so$" /tmp/apk.txt || { echo "::error::libmain.so missing"; exit 1; }
+          grep -Eq "lib/arm64-v8a/librexgpu-xenos\.so$" /tmp/apk.txt || { echo "::error::GPU plugin missing"; exit 1; }
+          grep -q "assets/xbox360_titles.json$" /tmp/apk.txt || { echo "::error::title DB missing"; exit 1; }
           # (Ronda 4, auditor E — R4-E2.) Hard fail, not a warning: without
           # libadrenotools the loader compiles to a no-op (the app
           # CMakeLists only warns when the checkout is missing) and the
@@ -1305,7 +1328,7 @@ jobs:
           # libfile_redirect_hook.so + libgsl_alloc_hook.so, and the driver
           # loader needs libhook_impl.so at runtime (hook_android_dlopen_ext).
           for _lib in libadrenotools.so libmain_hook.so libhook_impl.so libfile_redirect_hook.so libgsl_alloc_hook.so; do
-            grep -q "lib/arm64-v8a/$_lib" /tmp/apk.txt || { echo "::error::$_lib not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
+            grep -q "lib/arm64-v8a/$_lib$" /tmp/apk.txt || { echo "::error::$_lib not packaged - custom GPU drivers will be unavailable (check the 'ReXGlue SDK' step: android_sdk.sh clones libadrenotools into rexauto/android/sdk/libadrenotools)"; exit 1; }
           done
           # (Hunt v1.4.6, ronda 10, A5-R10-01.) 16 KB page-size gate: on a
           # 16 KB-page device the dynamic loader rejects any .so whose
