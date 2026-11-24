@@ -83,7 +83,21 @@ def download(url, dest_dir):
             url += ("&" if "?" in url else "?") + "dl=1"
     if "mega.nz" in url or "mega.co.nz" in url:
         log("MEGA link -> megatools not available on the runner; trying mega.py")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mega.py"])
+        # (Hunt v1.4.6, ronda 12, A5-R12-02.) PIN mega.py: the latest
+        # release is 1.0.8 (2020-06-25, unmaintained) and the API this
+        # call relies on -- Mega().login() (anonymous, no args) +
+        # download_url(url, dest_path) -- is verified against the real
+        # 1.0.8 wheel (it also parses both the V1 `/#!id!key` and the V2
+        # `/file/id#key` URL shapes). An unpinned install takes whatever
+        # PyPI serves next; a future release could drop or rename the
+        # API the same way gdown 6.x dropped `fuzzy` (runs #2/#3). The
+        # pin changes nothing today (1.0.8 is what unpinned installs),
+        # it only freezes it. Its pathlib==1.0.1 dependency is inert on
+        # Python 3.12: pip puts it in site-packages, which comes AFTER
+        # the stdlib in sys.path, so `import pathlib` still resolves to
+        # the stdlib (verified: `from mega import Mega` imports cleanly
+        # with the pinned install in site-packages position).
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mega.py==1.0.8"])
         from mega import Mega  # noqa: E402
         out = Mega().login().download_url(url, dest_dir)
         return str(out)
