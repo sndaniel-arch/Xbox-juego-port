@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <string>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
@@ -119,6 +120,62 @@ static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
 
 static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded guest C-string read:
+// MappedPtr<char>::value() builds a string_view straight off the
+// host pointer -- a strlen to NUL with no cap -- so a guest address
+// string with no NUL in its page ran the host scan into unmapped
+// memory. Read page by page (each chunk validated readable first,
+// like the R6-05 ReadGuestU16String reader in xam_ui.cpp), stop at
+// the first NUL, truncate at 4096 chars if there is none. Returns
+// false on an invalid range.
+constexpr size_t kMaxGuestPathChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestPathChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-04.) A guest address is only a
+// freeable system-heap allocation if it is the start of a live
+// (committed) region: BaseHeap::Release already rejects a
+// non-region-start, but it happily frees ANY region start, including
+// a live game allocation the guest merely guessed. QueryRegionInfo
+// reports allocation_base == the region start and state == 0 for a
+// free region, so both checks together reject interior pages, free
+// regions and gap addresses. This cannot prove ownership -- no live
+// allocation tracking exists -- so freeing another live region start
+// remains possible; see NOTES.md.
+static bool GuestSystemHeapRegionStart(uint32_t guest_address) {
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  if (!heap) {
+    return false;
+  }
+  rex::memory::HeapAllocationInfo info;
+  if (!heap->QueryRegionInfo(guest_address, &info)) {
+    return false;
+  }
+  return info.state != 0 && info.allocation_base == guest_address;
 }
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
@@ -300,6 +357,21 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
       // (same class as R6-06); a NULL out-param used to touch guest
       // address 0.
       if (!buffer_size || !buffer_ptr) {
+        return 0x2726;  // WSAEINVAL
+      }
+      // (Hunt v1.4.6, ronda 10, A3-R10-12.) *buffer_size is read and
+      // written and buffer_ptr is memcpied below, all with only the
+      // NULL checks above: validate the 4-byte size range first, and
+      // the 13-byte destination range before the memcpy runs (the
+      // memcpy only runs when *buffer_size >= sizeof, so the buffer
+      // check is gated on that -- a smaller size only writes
+      // *buffer_size and returns WSAEMSGSIZE).
+      if (!GuestRangeReadable(buffer_size.guest_address(), sizeof(uint32_t)) ||
+          !GuestRangeWritable(buffer_size.guest_address(), sizeof(uint32_t))) {
+        return 0x2726;  // WSAEINVAL
+      }
+      if (*buffer_size >= sizeof(XNetStartupParams) &&
+          !GuestRangeWritable(buffer_ptr.guest_address(), sizeof(XNetStartupParams))) {
         return 0x2726;  // WSAEINVAL
       }
       if (*buffer_size < sizeof(XNetStartupParams)) {
@@ -756,6 +828,11 @@ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
   // TODO(gibbed): actually implement this
   uint32_t result = 0;
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *pdns is written below with
+  // only the NULL check: validate the 4-byte range first.
+  if (pdns && !GuestRangeWritable(pdns.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
     // (Hunt v1.4.6, ronda 4, A3-R4-22.) SystemHeapAlloc returns 0 on
@@ -788,6 +865,12 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
   if (!dns) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 10, A3-R10-04.) Same class as XamFree: the
+  // old code freed any guest-supplied address in the system heap.
+  // Only a live region start may be freed.
+  if (!GuestSystemHeapRegionStart(dns.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   REX_KERNEL_MEMORY()->SystemHeapFree(dns.guest_address());
   return 0;
 }
@@ -795,6 +878,11 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
 u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
   // Set pqos as some games will try accessing it despite non-successful result
   uint32_t result = 0;
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *pqos is written below with
+  // only the NULL check: validate the 4-byte range first.
+  if (pqos && !GuestRangeWritable(pqos.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (pqos) {
     auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
     // (Hunt v1.4.6, ronda 4, A3-R4-22.) See XNetDnsLookup above: a
@@ -824,6 +912,11 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   if (!qos) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 10, A3-R10-04.) Same class as
+  // XNetDnsRelease above: only a live region start may be freed.
+  if (!GuestSystemHeapRegionStart(qos.guest_address())) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   REX_KERNEL_MEMORY()->SystemHeapFree(qos.guest_address());
   return 0;
 }
@@ -838,11 +931,18 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
     return -1;
   }
 
-  uint32_t addr = inet_addr(addr_ptr);
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old code
+  // called addr_ptr.value() TWICE (two unbounded NUL scans). Read
+  // once, bounded, and reuse the result.
+  std::string addr_str;
+  if (!ReadGuestCString(addr_ptr.guest_address(), &addr_str)) {
+    return -1;
+  }
+  uint32_t addr = inet_addr(addr_str.c_str());
   // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-inet_addr#return-value
   // Based on console research it seems like x360 uses old version of inet_addr
   // In case of empty string it return 0 instead of -1
-  if (addr == -1 && !addr_ptr.value().length()) {
+  if (addr == -1 && addr_str.empty()) {
     return 0;
   }
 
