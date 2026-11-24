@@ -321,12 +321,23 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     } else {
       uint32_t array_high_address = segments_guest_address + array_bytes - 1;
       rex::memory::BaseHeap* array_start_heap = memory()->LookupHeap(segments_guest_address);
-      const rex::memory::BaseHeap* array_end_heap = memory()->LookupHeap(array_high_address);
+      rex::memory::BaseHeap* array_end_heap = memory()->LookupHeap(array_high_address);
       if (!array_start_heap || !array_end_heap ||
           (array_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
               (array_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
           (array_start_heap->heap_type() == memory::HeapType::kGuestPhysical &&
            array_start_heap != array_end_heap)) {
+        result = X_STATUS_ACCESS_VIOLATION;
+      } else if (!GuestBufferRangeAccessible(memory(), array_start_heap, array_end_heap,
+                                             segments_guest_address, array_high_address,
+                                             false)) {
+        // (Hunt v1.4.6, ronda 10, A3-R10-10.) Residue of A3-R9-11:
+        // the heap-membership check above never called
+        // QueryRangeAccess, so a segment array in uncommitted /
+        // NoAccess virtual pages passed and the *segments deref
+        // SIGSEGVd. Same GuestBufferRangeAccessible check ReadInternal
+        // and Write already use (R9-11). (segment_count * 4u cannot
+        // overflow -- max ~0x400004 -- verified, not a defect.)
         result = X_STATUS_ACCESS_VIOLATION;
       }
     }
