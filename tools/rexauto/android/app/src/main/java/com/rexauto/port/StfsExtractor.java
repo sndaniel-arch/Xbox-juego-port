@@ -367,6 +367,20 @@ public final class StfsExtractor {
             int count = (dst.remaining() + 0x7FF) / 0x800;
             int i = 0;
             while (i < count && dst.hasRemaining()) {
+                // (Hunt v1.4.6 ronda 13, A4-R13-03.) Residual hole in the
+                // R8-F3 guard below: it only rejects a mapping whose
+                // fragment or offset came out NEGATIVE, but Java % and /
+                // truncate toward zero, so a sector 1-4 below the first
+                // data block (1-26 in the single-file layout, whose
+                // +0xB000 base lifts the offset) still maps to fragment 0
+                // at a small POSITIVE offset -- the header area, read as
+                // if it were file data. Verified by a JDK run of the
+                // literal mapping (tb=-4..-1 -> addr 0x0..0x1800 in
+                // xsf/egdf, tb=-26..-1 in single). A valid sector never
+                // lies below the first data block (tb >= 0 by
+                // construction), so reject it here, before the mapping.
+                if (sector + i < startDataBlock * 2 - (egdf ? 2 : 0))
+                    throw new IOException("GoD: sector " + (sector + i) + " is below the first data block (truncated/corrupt?)");
                 long[] fa = blockToOffset(sector + i);
                 int run = 1;
                 while (i + run < count) {
