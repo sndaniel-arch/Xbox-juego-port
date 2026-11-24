@@ -100,7 +100,15 @@ def download(url, dest_dir):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mega.py==1.0.8"])
         from mega import Mega  # noqa: E402
         out = Mega().login().download_url(url, dest_dir)
-        return str(out)
+        # (Hunt v1.4.6, ronda 13, A5-R13-03.) The gdown branch above
+        # verifies the download exists before returning it; this branch
+        # returned whatever download_url() gave back unchecked. Mirror
+        # the gdown check: a path to a missing file must fail here,
+        # not three steps later in rexauto.
+        out = str(out)
+        if not out or not os.path.isfile(out):
+            raise SystemExit("mega.py could not fetch the file -- is the link valid and public?")
+        return out
     log("GET " + url)
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=120) as resp:
@@ -120,6 +128,16 @@ def download(url, dest_dir):
                     if pct // 10 != last:
                         last = pct // 10
                         log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
+        # (Hunt v1.4.6, ronda 13, A5-R13-02.) A truncated download used
+        # to pass silently: urllib's read() returns b'' on a clean
+        # close without raising IncompleteRead (verified with a local
+        # probe: server advertises Content-Length 100000, sends 50000,
+        # closes -- the loop ends with got=50000, no exception), so a
+        # half-downloaded game reached rexauto and failed late in
+        # extract.py with a confusing error. When the server sent a
+        # Content-Length, the byte count must match it exactly.
+        if total and got != total:
+            raise SystemExit("download truncated: got %d of %d bytes from %s -- retry the run" % (got, total, url))
         log("saved %s (%.1f MB)" % (path, got / 1e6))
     # (A5-R9-03, ronda 9.) Sniff ALWAYS, not just for tiny downloads: the
     # old `if got < 1024` guard let a typical >1 KiB HTML error page
@@ -221,6 +239,13 @@ def main():
     if not url:
         raise SystemExit("empty URL")
     got = download(url, os.path.join(dest, "dl"))
+    # (Hunt v1.4.6, ronda 13, A5-R13-04.) No fetch branch verified
+    # the download is non-empty: a 0-byte file (empty Drive export,
+    # truncated MEGA/gdown result) sailed past the HTML sniff (an
+    # empty head has no <html) into unpack/pick_container and failed
+    # late in rexauto. Fail here, on every branch, before hashing.
+    if not os.path.isfile(got) or os.path.getsize(got) == 0:
+        raise SystemExit("downloaded file is missing or empty: %s" % got)
     # (A-1.) Hash the downloaded FILE before unpacking: pick_container()
     # returns a DIRECTORY for .xex/.zip/STFS inputs, and the workflow cannot
     # hash a directory -- that is why iso_sha256 was never verified for the
