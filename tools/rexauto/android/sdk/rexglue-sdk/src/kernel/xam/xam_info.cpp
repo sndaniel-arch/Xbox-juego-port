@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <string>
+
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -107,6 +109,97 @@ static bool GuestRangeReadable(uint32_t guest_address, size_t length) {
 
 static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
   return GuestRangeAccessible(guest_address, length, true);
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded guest C-string read:
+// MappedPtr<char>::value() builds a string_view straight off the
+// host pointer -- a strlen to NUL with no cap -- so a guest launch
+// path with no NUL in its page ran the host scan into unmapped
+// memory. Read page by page (each chunk validated readable first,
+// like the R6-05 ReadGuestU16String reader in xam_ui.cpp), stop at
+// the first NUL, truncate at 4096 chars if there is none. Returns
+// false on an invalid range.
+constexpr size_t kMaxGuestPathChars = 4096;
+
+static bool ReadGuestCString(uint32_t guest_address, std::string* out) {
+  out->clear();
+  size_t remaining = kMaxGuestPathChars;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_bytes = 0x1000 - (address & 0xFFF);
+    size_t chunk = remaining < page_bytes ? remaining : page_bytes;
+    if (!GuestRangeReadable(address, chunk)) {
+      return false;
+    }
+    const char* host_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(address);
+    for (size_t i = 0; i < chunk; ++i) {
+      char c = host_ptr[i];
+      if (!c) {
+        return true;
+      }
+      out->push_back(c);
+    }
+    address += static_cast<uint32_t>(chunk);
+    remaining -= chunk;
+  }
+  return true;
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded guest UTF-16 read
+// (same reader as R6-05 in xam_ui.cpp, copied here): the resource
+// locator entries below scanned container/resource/filename for
+// NUL with no cap. 4096 code-unit cap, validated one page at a
+// time; returns false on an invalid range.
+constexpr size_t kMaxGuestUiStringCodeUnits = 4096;
+
+static bool ReadGuestU16String(uint32_t guest_address, std::u16string* out) {
+  out->clear();
+  if ((guest_address & 1) != 0) {
+    return false;
+  }
+  size_t remaining = kMaxGuestUiStringCodeUnits;
+  uint32_t address = guest_address;
+  while (remaining > 0) {
+    size_t page_units = (0x1000 - (address & 0xFFF)) / sizeof(uint16_t);
+    size_t chunk_units = remaining < page_units ? remaining : page_units;
+    if (!GuestRangeReadable(address, chunk_units * sizeof(uint16_t))) {
+      return false;
+    }
+    const uint16_t* host_ptr =
+        REX_KERNEL_MEMORY()->TranslateVirtual<const uint16_t*>(address);
+    for (size_t i = 0; i < chunk_units; ++i) {
+      uint16_t c = rex::memory::load_and_swap<uint16_t>(host_ptr + i);
+      if (!c) {
+        return true;
+      }
+      out->push_back(static_cast<wchar_t>(c));
+    }
+    address += static_cast<uint32_t>(chunk_units * sizeof(uint16_t));
+    remaining -= chunk_units;
+  }
+  return true;
+}
+
+// (Hunt v1.4.6, ronda 10, A3-R10-04.) A guest address is only a
+// freeable system-heap allocation if it is the start of a live
+// (committed) region: BaseHeap::Release already rejects a
+// non-region-start, but it happily frees ANY region start, including
+// a live game allocation the guest merely guessed. QueryRegionInfo
+// reports allocation_base == the region start and state == 0 for a
+// free region, so both checks together reject interior pages, free
+// regions and gap addresses. This cannot prove ownership -- no live
+// allocation tracking exists -- so freeing another live region start
+// remains possible; see NOTES.md.
+static bool GuestSystemHeapRegionStart(uint32_t guest_address) {
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  if (!heap) {
+    return false;
+  }
+  rex::memory::HeapAllocationInfo info;
+  if (!heap->QueryRegionInfo(guest_address, &info)) {
+    return false;
+  }
+  return info.state != 0 && info.allocation_base == guest_address;
 }
 
 u32 XamFeatureEnabled_entry(u32 unk) {
@@ -237,8 +330,18 @@ u32 keXamBuildResourceLocator(uint64_t module, std::u16string_view container,
 
 u32 XamBuildResourceLocator_entry(u64 module, mapped_wstring container, mapped_wstring resource,
                                   mapped_void buffer_ptr, u32 buffer_count) {
-  return keXamBuildResourceLocator(module, container.value(), resource.value(), buffer_ptr,
-                                   buffer_count);
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded reads: the old
+  // container.value() / resource.value() scanned for NUL with no
+  // cap. A null string stays empty, as before.
+  std::u16string container_str;
+  if (container && !ReadGuestU16String(container.guest_address(), &container_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  std::u16string resource_str;
+  if (resource && !ReadGuestU16String(resource.guest_address(), &resource_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return keXamBuildResourceLocator(module, container_str, resource_str, buffer_ptr, buffer_count);
 }
 
 u32 XamBuildGamercardResourceLocator_entry(mapped_wstring filename, mapped_void buffer_ptr,
@@ -251,13 +354,25 @@ u32 XamBuildGamercardResourceLocator_entry(mapped_wstring filename, mapped_void 
   // If you're running an app that'll need them, make sure to extract xam.xex
   // resources with xextool ("xextool -d . xam.xex") and add a .xzp extension.
 
-  return keXamBuildResourceLocator(0, u"gamercrd", filename.value(), buffer_ptr, buffer_count);
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read, as
+  // XamBuildResourceLocator above.
+  std::u16string filename_str;
+  if (filename && !ReadGuestU16String(filename.guest_address(), &filename_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return keXamBuildResourceLocator(0, u"gamercrd", filename_str, buffer_ptr, buffer_count);
 }
 
 u32 XamBuildSharedSystemResourceLocator_entry(mapped_wstring filename, mapped_void buffer_ptr,
                                               u32 buffer_count) {
   // see notes inside XamBuildGamercardResourceLocator above
-  return keXamBuildResourceLocator(0, u"shrdres", filename.value(), buffer_ptr, buffer_count);
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read, as
+  // XamBuildResourceLocator above.
+  std::u16string filename_str;
+  if (filename && !ReadGuestU16String(filename.guest_address(), &filename_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return keXamBuildResourceLocator(0, u"shrdres", filename_str, buffer_ptr, buffer_count);
 }
 
 u32 XamBuildLegacySystemResourceLocator_entry(mapped_wstring filename, mapped_void buffer_ptr,
@@ -267,7 +382,13 @@ u32 XamBuildLegacySystemResourceLocator_entry(mapped_wstring filename, mapped_vo
 
 u32 XamBuildXamResourceLocator_entry(mapped_wstring filename, mapped_void buffer_ptr,
                                      u32 buffer_count) {
-  return keXamBuildResourceLocator(0, u"xam", filename.value(), buffer_ptr, buffer_count);
+  // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read, as
+  // XamBuildResourceLocator above.
+  std::u16string filename_str;
+  if (filename && !ReadGuestU16String(filename.guest_address(), &filename_str)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return keXamBuildResourceLocator(0, u"xam", filename_str, buffer_ptr, buffer_count);
 }
 
 u32 XamGetSystemVersion_entry() {
@@ -334,8 +455,19 @@ u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *info_ptr is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(info_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   auto module = REX_KERNEL_STATE()->GetExecutableModule();
-  assert_not_null(module);
+  // (Hunt v1.4.6, ronda 10, A3-R10-15.) GetExecutableModule() can
+  // return nullptr; the old code only had assert_not_null (a no-op
+  // in Release) before module->GetOptHeader below.
+  if (!module) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   uint32_t guest_hdr_ptr;
   X_STATUS result = module->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &guest_hdr_ptr);
@@ -370,6 +502,12 @@ u32 XamLoaderSetLaunchData_entry(mapped_void data, u32 size) {
 
 u32 XamLoaderGetLaunchDataSize_entry(mapped_u32 size_ptr) {
   if (!size_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *size_ptr is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(size_ptr.guest_address(), sizeof(uint32_t))) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -411,15 +549,25 @@ void XamLoaderLaunchTitle_entry(mapped_string raw_name_ptr, u32 flags) {
 
   // Translate the launch path to a full path.
   if (raw_name_ptr) {
-    auto path = raw_name_ptr.value();
+    // (Hunt v1.4.6, ronda 10, A3-R10-03.) Bounded read: the old
+    // raw_name_ptr.value() scanned for NUL with no cap.
+    std::string path;
+    if (!ReadGuestCString(raw_name_ptr.guest_address(), &path)) {
+      return;
+    }
     if (path.empty()) {
       loader_data.launch_path = "game:\\default.xex";
     } else {
       if (rex::string::utf8_find_name_from_guest_path(path) == path) {
+        // (Hunt v1.4.6, ronda 10, A3-R10-15.)
+        // GetExecutableModule() can return nullptr; the old code
+        // derefed it here with only an assert (a no-op in Release).
+        auto module = REX_KERNEL_STATE()->GetExecutableModule();
+        if (!module) {
+          return;
+        }
         path = rex::string::utf8_join_guest_paths(
-            rex::string::utf8_find_base_guest_path(
-                REX_KERNEL_STATE()->GetExecutableModule()->path()),
-            path);
+            rex::string::utf8_find_base_guest_path(module->path()), path);
       }
       loader_data.launch_path = path;
     }
@@ -443,6 +591,12 @@ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
     return X_E_INVALIDARG;
   }
 
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *out_ptr is written below
+  // with only the NULL check above: validate the 4-byte range first.
+  if (!GuestRangeWritable(out_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_E_INVALIDARG;
+  }
+
   assert_true(unk == 0);
 
   // Allocate from the heap. Not sure why XAM does this specially, perhaps
@@ -463,6 +617,14 @@ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
 }
 
 u32 XamFree_entry(mapped_u32 ptr) {
+  // (Hunt v1.4.6, ronda 10, A3-R10-04.) The old code freed any
+  // guest-supplied address in the system heap with no check at all.
+  // Only a live region start may be freed (same
+  // GuestSystemHeapRegionStart check as ExFreePool); a null pointer
+  // stays a no-op, as SystemHeapFree already treats it.
+  if (ptr && !GuestSystemHeapRegionStart(ptr.guest_address())) {
+    return X_E_INVALIDARG;
+  }
   REX_KERNEL_MEMORY()->SystemHeapFree(ptr.guest_address());
 
   return X_ERROR_SUCCESS;
@@ -475,6 +637,11 @@ u32 XamQueryLiveHiveW_entry(mapped_wstring name, mapped_void out_buf, u32 out_si
 
 u32 XamLoaderGetDvdTrayState_entry(mapped_u32 out_state) {
   // 0 = tray open, 1 = tray closed with disc
+  // (Hunt v1.4.6, ronda 10, A3-R10-12.) *out_state was written with
+  // only a NULL check: validate the 4-byte range first.
+  if (out_state && !GuestRangeWritable(out_state.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (out_state)
     *out_state = 1;
   return X_STATUS_SUCCESS;
