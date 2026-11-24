@@ -792,15 +792,34 @@ public class VirtualPadView extends View {
         // Another finger may still hold the same control (two-thumb stick
         // handover): only release when the LAST holder lifts.
         boolean stillHeld = false;
+        Pointer remaining = null;
         for (int i = 0; i < mPointers.size(); i++) {
             Pointer other = mPointers.get(mPointers.keyAt(i));
             if (other != null && other.control == p.control) {
                 stillHeld = true;
+                remaining = other;
                 break;
             }
         }
         if (!stillHeld) {
             releaseControl(p.control);
+        } else if (remaining != null) {
+            // (Hunt v1.4.6, ronda 10, A4-R10-01.) The remaining finger's
+            // position was never re-applied: the sent value stayed at the
+            // lifted finger's last position until the remaining finger
+            // moved (a still thumb on a centered stick kept sending
+            // up-left). Positional controls only — sticks recompute
+            // deflection and the d-pad recomputes its mask from the
+            // remaining pointer's stored x/y; buttons/pills/triggers are
+            // level state and correctly keep holding. updateControl is
+            // the same dispatch the move loop and pointer-down use, so
+            // the game reads the corrected value on the same path.
+            final PadGeometry.Control c = p.control >= 0
+                    && p.control < mControls.length ? mControls[p.control] : null;
+            if (c != null && (c.type == PadGeometry.TYPE_STICK
+                    || c.type == PadGeometry.TYPE_DPAD)) {
+                updateControl(remaining);
+            }
         }
         recyclePointer(p);
     }
