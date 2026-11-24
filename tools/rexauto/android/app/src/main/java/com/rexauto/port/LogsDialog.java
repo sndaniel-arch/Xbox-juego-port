@@ -9,6 +9,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.lang.ref.WeakReference;
 
 /**
  * Log viewer + crash report. Moved verbatim from SetupActivity (v1.2).
@@ -27,13 +28,35 @@ public final class LogsDialog {
     // crash-report / driver-guard dialogs below are one-shot startup
     // gates, not double-tappable buttons, so they keep their own flow.
     private static AlertDialog sDialog;
-    private static Activity sDialogActivity;
+    // (Hunt v1.4.6 ronda 11, A4-R11-03.) Same leak as PadSettingsDialog
+    // (R10-02): was a static strong Activity reference; the dismiss
+    // listener does not fire on destroy-without-dismiss, so the dead
+    // activity stayed alive until the next open. Held weakly now, and
+    // dropped when observed stale below; MainActivity.onDestroy() also
+    // clears it eagerly (A4-R11-04, clearStale()).
+    private static WeakReference<Activity> sDialogActivity;
 
     /** True when the log viewer is currently up in a live activity. */
     private static boolean isShowing() {
-        return sDialog != null && sDialog.isShowing()
-                && sDialogActivity != null
-                && !sDialogActivity.isFinishing() && !sDialogActivity.isDestroyed();
+        Activity activity = sDialogActivity == null ? null : sDialogActivity.get();
+        boolean showing = sDialog != null && sDialog.isShowing()
+                && activity != null
+                && !activity.isFinishing() && !activity.isDestroyed();
+        if (!showing) {
+            // (Hunt v1.4.6 ronda 11, A4-R11-03.) Drop the stale statics
+            // instead of only returning false, like PadSettingsDialog
+            // does: sDialog holds the dead activity via the dialog's
+            // context.
+            sDialog = null;
+            sDialogActivity = null;
+        }
+        return showing;
+    }
+
+    /** (Hunt v1.4.6 ronda 11, A4-R11-04.) Eager release of the dialog statics, called from MainActivity.onDestroy(): drops the (possibly dead) activity reference at destroy time instead of waiting for the next open to observe it stale (the R10-02 residual). */
+    public static void clearStale() {
+        sDialog = null;
+        sDialogActivity = null;
     }
 
     private static File logsDir(Activity activity) {
@@ -240,7 +263,7 @@ public final class LogsDialog {
         // (Hunt v1.4.6 ronda 4, A4-R4-09.) Track the live instance for the
         // isShowing() guard; clear it on dismiss.
         sDialog = dialog;
-        sDialogActivity = activity;
+        sDialogActivity = new WeakReference<>(activity);
         dialog.setOnDismissListener(d -> {
             if (sDialog == dialog) {
                 sDialog = null;
