@@ -146,6 +146,15 @@ u32 XMACreateContext_entry(mapped_u32 context_out_ptr) {
   if (!context_out_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 20, A3-R20-05.) The NULL check above does not
+  // cover a non-NULL wild pointer: *context_out_ptr is written below
+  // with no range validation (same class as A3-R9-02/R10-09, which
+  // fixed the same hole in ~15 other 4-byte out-params; this entry
+  // was missed). The XMA entries around it all validate their
+  // pointers (A3-R7-06/A3-R8-07).
+  if (!GuestRangeWritable(context_out_ptr.guest_address(), sizeof(uint32_t))) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   REXKRNL_NOISY_DEBUG("XMACreateContext called!");
   auto xma_decoder =
