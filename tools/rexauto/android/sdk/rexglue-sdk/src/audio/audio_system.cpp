@@ -53,6 +53,16 @@ constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
 constexpr std::chrono::milliseconds kPauseFenceTimeout{1000};
 }  // namespace
 
+// (Hunt v1.4.6, ronda 16, build FULL R16.) Out-of-line definition of the
+// static const member: RegisterClient/Restore pass kMaximumClientCount to
+// the REXAPU_* log formatters, which odr-use it (bind it to a reference),
+// and a static const member with only an in-class initializer has no
+// storage. The R15 link happened to fold the uses away under LTO; the R16
+// re-link of librexruntime.so (xam_net.cpp / xboxkrnl_video.cpp changed)
+// exposed it as: ld.lld: undefined symbol
+// rex::audio::AudioSystem::kMaximumClientCount.
+const size_t AudioSystem::kMaximumClientCount;
+
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
       function_dispatcher_(function_dispatcher),
