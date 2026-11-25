@@ -411,6 +411,25 @@ uint32_t KernelState::AllocateTLS(PPCContext* context) {
     kernel::xboxkrnl::xeKeKfReleaseSpinLock(context, tls_lock, old_irql);
     return X_TLS_OUT_OF_INDEXES;
   }
+  // (Hunt v1.4.6, ronda 20, A3-R20-04.) KTHREAD.process is
+  // guest-writable memory (the KTHREAD lives in the system heap,
+  // mapped RW in guest space): the guest can rewrite it to any
+  // address, and the bitmap accesses below would then read/write an
+  // arbitrary guest range -- TranslateVirtual never validates and
+  // never returns null, so the !process_ptr check above cannot catch
+  // it (same class as A3-R9-09, r13-derived PCR). A thread only ever
+  // belongs to one of the kernel's three processes, so check identity
+  // against them (same idea as A3-R19-01, which used pcr_ptr()
+  // instead of a range check). The spinlock above is already held:
+  // release it on this path, as the two failure paths above do.
+  uint32_t process_address =
+      static_cast<uint32_t>(current_thread->guest_object<X_KTHREAD>()->process);
+  if (process_address != GetTitleProcess() && process_address != GetSystemProcess() &&
+      process_address != GetIdleProcess()) {
+    REXSYS_ERROR("AllocateTLS: thread process {:08X} is not a kernel process", process_address);
+    kernel::xboxkrnl::xeKeKfReleaseSpinLock(context, tls_lock, old_irql);
+    return X_TLS_OUT_OF_INDEXES;
+  }
 
   for (uint32_t bitmap_index = 0; bitmap_index < 8; ++bitmap_index) {
     uint32_t bitmap_value = static_cast<uint32_t>(process_ptr->tls_slot_bitmap[bitmap_index]);
@@ -460,6 +479,15 @@ void KernelState::FreeTLS(PPCContext* context, uint32_t slot) {
       memory()->TranslateVirtual<X_KPROCESS*>(static_cast<uint32_t>(current_kthread->process));
   if (!process_ptr) {
     REXSYS_ERROR("FreeTLS: failed to resolve current process");
+    return;
+  }
+  // (Hunt v1.4.6, ronda 20, A3-R20-04.) As in AllocateTLS above:
+  // KTHREAD.process is guest-writable; only the kernel's three
+  // processes are legitimate. No lock is held yet on this path.
+  uint32_t process_address = static_cast<uint32_t>(current_kthread->process);
+  if (process_address != GetTitleProcess() && process_address != GetSystemProcess() &&
+      process_address != GetIdleProcess()) {
+    REXSYS_ERROR("FreeTLS: thread process {:08X} is not a kernel process", process_address);
     return;
   }
 
