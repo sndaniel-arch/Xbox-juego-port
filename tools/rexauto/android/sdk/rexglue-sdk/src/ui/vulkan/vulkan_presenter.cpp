@@ -1190,6 +1190,25 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
        current_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) {
     swapchain_pre_transform = current_transform;
   }
+  // (Caza v1.4.6 ronda 20, A1-R20-01.) Do NOT pre-rotate: the present-effect
+  // shaders sample the guest image from gl_FragCoord
+  // (guest_output_bilinear_ps.h, guest_output_ffx_cas_sharpen_ps.h and every
+  // other guest_output_*_ps.h: uv = ((int(gl_FragCoord.xy) - output_offset)
+  // + 0.5) * output_size_inv), so the UV map is a per-axis scale/offset in
+  // buffer space and cannot express the axis swap a 90/270-degree rotation
+  // needs. RotateRectangleForSwapchainPreTransform only rotates the quad's
+  // coverage, not the sampled image: with a rotated pre-transform the game
+  // renders sideways and aspect-distorted on the physical display (the R15
+  // phone screenshot shows exactly that). Until the present-effect shaders
+  // gain a rotation-aware UV transform (regenerated SPIR-V via
+  // xb buildshaders -- the HLSL sources are not in this tree), present
+  // with IDENTITY and let the compositor rotate: the image is correct,
+  // presents are suboptimal, and the R15-01 one-shot forced recreate keeps
+  // that from becoming a loop (exactly one recreate per connection, then
+  // suboptimal presents forever with a correct image -- the R14
+  // configuration). When the shaders rotate the UVs, delete this override
+  // and the pre-rotation above becomes correct again.
+  swapchain_pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
   const bool swapchain_pre_transform_swaps_extent =
       swapchain_pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
       swapchain_pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
