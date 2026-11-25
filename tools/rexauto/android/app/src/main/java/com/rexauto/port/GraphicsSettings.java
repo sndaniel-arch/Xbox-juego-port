@@ -273,7 +273,23 @@ public final class GraphicsSettings {
             m.put("texture_cache_memory_limit_hard", "768");
             m.put("texture_cache_memory_limit_render_to_texture", "24");
             m.put("async_shader_compilation", "true");
-            m.put("vulkan_async_skip_incomplete_frames", "true");
+            // (Caza v1.4.6 ronda 16, A1-R16-02.) Deliberate exception to
+            // "accuracy is the SDK defaults": the SDK default (true) drops
+            // WHOLE frames that used any async placeholder pipeline
+            // (vulkan/command_processor.cpp, swap handler). On desktop
+            // compiles finish in milliseconds, so the warm-up stutter is
+            // invisible; on Mali the driver compiles take 10-100 ms each
+            // and the title screen warms up for seconds -- with true, every
+            // frame is dropped, RefreshGuestOutput never runs and the guest
+            // frame counter freezes at 0.0 fps while the presenter spins
+            // re-presenting a stale image (R15 phone log: MAILBOX mode 1,
+            // guest 0.0 fps, placeholder spam). False presents the frames
+            // with holes where pipelines are still placeholders, exactly
+            // like the performance/balanced presets already do; async
+            // compilation itself stays on, so the holes fill in as
+            // creation completes. Re-enable via the "extra" cvars if ever
+            // needed for a debug comparison.
+            m.put("vulkan_async_skip_incomplete_frames", "false");
             m.put("vulkan_allow_present_mode_immediate", "true");
             m.put("vulkan_allow_present_mode_mailbox", "true");
             m.put("vulkan_allow_present_mode_fifo_relaxed", "true");
