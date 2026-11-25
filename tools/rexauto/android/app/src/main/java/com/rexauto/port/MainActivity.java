@@ -126,6 +126,27 @@ public class MainActivity extends SDLActivity {
 
     /** Everything that used to run inline in onCreate after the root check. */
     private void startGame() {
+        // (Hunt v1.4.6 ronda 16, A4-R16-01.) Rewrite settings.txt from the
+        // current prefs on EVERY boot, before the SDL thread can start:
+        // MainActivity is the LAUNCHER (AndroidManifest.xml), so a normal
+        // launch never goes through SetupActivity.launchGame(), and
+        // settings.txt was only a snapshot rewritten when the graphics
+        // dialog was OKed or the game was (re)installed. A snapshot that
+        // predates the prefs (failed write, hand-deleted file) booted the
+        // game on SDK defaults with no word to anyone -- on Mali that
+        // silently selects MAILBOX (all present modes allowed, IMMEDIATE
+        // not offered), which is exactly the mode 1 the R15 phone log
+        // shows against a performance/balanced preset. The write is
+        // atomic (tmp+rename, hand-added lines preserved), and a failure
+        // here only logs: the game still starts, exactly like
+        // launchGame(). BEFORE releaseDeferredSdlStart(): the SDL thread
+        // (and the native settings.txt read) can start as soon as the
+        // deferred flag is released.
+        try {
+            new GraphicsSettings(this).write(this);
+        } catch (Exception e) {
+            Log.w("MainActivity", "startGame: settings rewrite failed; running on the previous settings.txt", e);
+        }
         releaseDeferredSdlStart();
         applyOrientation();
         // Ask the OS for the sustained (thermally stable) clock profile instead of
