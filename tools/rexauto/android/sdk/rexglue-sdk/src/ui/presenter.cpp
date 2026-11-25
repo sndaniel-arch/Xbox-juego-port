@@ -1440,9 +1440,24 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           // Don't know yet what the first result was (success or suboptimal).
           surface_paint_connection_was_optimal_at_successful_paint_.store(false);
           // (Run #16, C-02.) New connection, new budget of consecutive
-          // suboptimal presents and a new forced recreate.
+          // suboptimal presents.
           consecutive_suboptimal_presents_.store(0);
-          forced_suboptimal_recreate_done_.store(false);
+          // (Caza v1.4.6 ronda 15, A1-R15-01.) Do NOT reset
+          // forced_suboptimal_recreate_done_ here: a forced recreate IS a
+          // reconnect, so resetting it here re-arms the "at most once per
+          // connection" budget and the forced recreate repeats forever --
+          // the R14 phone log shows one every ~1.3 s (60 presents apart)
+          // for the whole session, each one awaiting all submissions and
+          // rebuilding the swapchain framebuffers. Only grant a fresh
+          // budget when the geometry actually changed (rotation/resize),
+          // which is when a recreate could pick a different surface. The
+          // comparison uses the still-stored old size (the new size is
+          // stored just below); on the first connection the old size is
+          // 0, so it differs and a fresh budget is granted.
+          if (surface_width_in_paint_connection_ != surface_width ||
+              surface_height_in_paint_connection_ != surface_height) {
+            forced_suboptimal_recreate_done_.store(false);
+          }
           surface_paint_connection_state_.store(SurfacePaintConnectionState::kConnectedPaintable);
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
