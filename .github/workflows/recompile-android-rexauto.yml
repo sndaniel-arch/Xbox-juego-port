@@ -170,23 +170,24 @@ jobs:
     # honoured in full. (V-A5-01 added the Python-deps timeout to the
     # count: it was untimed before, so the old sum missed it.)
     # (A5-R7-11, ronda 7; aritmetica corregida A5-R8-05, ronda 8;
-    # actualizada A5-R14-01, ronda 14.) The old comment also assumed the
-    # steps WITHOUT a timeout (checkouts, injections, localize, pack,
-    # uploads, ...) fit in the 10 min left over -- an untested
-    # hypothesis. 27 of the 28 steps in this job now carry their own
-    # timeout-minutes, and their sum is 560, not the 530 the R8-05
-    # comment claimed: the six long steps sum to 350 (10 + 10 + 30 + 60
-    # + 60 + 180), the 19 R7-11 steps sum to 175, the 5-min "Overlay
-    # tracked ci_sdk.py" step (R7-03) was in neither list, and the
-    # 30-min cache restore step got its cap in ronda 11 (A5-R11-04)
-    # (350 + 175 + 5 + 30 = 560). Only "Validate inputs" has no timeout
-    # (a one-line regex that cannot hang). Step timeouts are per-step
-    # ATTRIBUTION caps, NOT an additive budget: their sum (560) exceeds
-    # the job ceiling by design -- steps run sequentially and the job
-    # timeout (360) is still the hard ceiling that fires first if the
-    # run as a whole overruns. A step cap only fires when that single
-    # step hangs past its own cap, so the failure names the hanging step
-    # instead of dying anonymously at the job timeout.
+    # actualizada A5-R14-01, ronda 14; corregida A5-R19-05, ronda 19.)
+    # The old comment also assumed the steps WITHOUT a timeout
+    # (checkouts, injections, localize, pack, uploads, ...) fit in the
+    # 10 min left over -- an untested hypothesis. 28 of the 29 steps in
+    # this job now carry their own timeout-minutes, and their sum is
+    # 570, not the 560 the R14-01 comment claimed: the six long steps
+    # sum to 350 (10 + 10 + 30 + 60 + 60 + 180) and the other 22 timed
+    # steps sum to 220. The R14-01 arithmetic predates the "Guard R14
+    # crash" step (ronda 15, A2-R15-01, 10 min), which added one timed
+    # step and 10 min without updating this comment (560 + 10 = 570).
+    # Only "Validate inputs" has no timeout (a one-line regex that
+    # cannot hang). Step timeouts are per-step ATTRIBUTION caps, NOT an
+    # additive budget: their sum (570) exceeds the job ceiling by
+    # design -- steps run sequentially and the job timeout (360) is
+    # still the hard ceiling that fires first if the run as a whole
+    # overruns. A step cap only fires when that single step hangs past
+    # its own cap, so the failure names the hanging step instead of
+    # dying anonymously at the job timeout.
     timeout-minutes: 360
     outputs:
       title: ${{ steps.meta.outputs.title }}
@@ -901,6 +902,10 @@ jobs:
           # (DECLARE + 1 guard comment: sub_824C8940, sub_824C8018,
           # sub_824C9A60, sub_82A60450, sub_824C9DA8, sub_82A60C40,
           # sub_824C99D8) -- 22 markers in total, still per file.)
+          # (Ronda 19, A2-R19-01: the state-2 once-hook sub_824C52F8 passes
+          # the same +156 to sub_82459F10 through the wrapper sub_82488668,
+          # so the guard covers 1 more file -- .99.cpp carries 2 (DECLARE +
+          # 1 guard comment) -- 24 markers in total, still per file.)
           $gen = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port\generated\default"
           python "$env:GITHUB_WORKSPACE\tools\guard_r15_col.py" "$gen\childoflight_recomp.*.cpp"
           $guardRc = $LASTEXITCODE
@@ -914,9 +919,10 @@ jobs:
           $marks128 = @(Select-String -Path "$gen\childoflight_recomp.128.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           $marks98 = @(Select-String -Path "$gen\childoflight_recomp.98.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           $marks50 = @(Select-String -Path "$gen\childoflight_recomp.50.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks99 = @(Select-String -Path "$gen\childoflight_recomp.99.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           if ($guardRc -ne 0) { exit $guardRc }
-          if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2 -or -not $marks32 -or $marks32 -lt 3 -or -not $marks129 -or $marks129 -lt 2 -or -not $marks86 -or $marks86 -lt 2 -or -not $marks136 -or $marks136 -lt 2 -or -not $marks184 -or $marks184 -lt 2 -or -not $marks128 -or $marks128 -lt 2 -or -not $marks98 -or $marks98 -lt 2 -or -not $marks50 -or $marks50 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150), $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70), $marks32 in childoflight_recomp.32.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C4D70), $marks129 in .129.cpp, $marks86 in .86.cpp, $marks136 in .136.cpp, $marks184 in .184.cpp, $marks128 in .128.cpp, $marks98 in .98.cpp, $marks50 in .50.cpp (each expected >= 2: DECLARE + 1 guard comment)"; exit 1 }
-          Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70) + $marks32 in .32.cpp (sub_824C4D70) + $marks129 in .129.cpp (sub_824C8940) + $marks86 in .86.cpp (sub_824C8018) + $marks136 in .136.cpp (sub_824C9A60) + $marks184 in .184.cpp (sub_82A60450) + $marks128 in .128.cpp (sub_824C9DA8) + $marks98 in .98.cpp (sub_82A60C40) + $marks50 in .50.cpp (sub_824C99D8)"
+          if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2 -or -not $marks32 -or $marks32 -lt 3 -or -not $marks129 -or $marks129 -lt 2 -or -not $marks86 -or $marks86 -lt 2 -or -not $marks136 -or $marks136 -lt 2 -or -not $marks184 -or $marks184 -lt 2 -or -not $marks128 -or $marks128 -lt 2 -or -not $marks98 -or $marks98 -lt 2 -or -not $marks50 -or $marks50 -lt 2 -or -not $marks99 -or $marks99 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150), $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70), $marks32 in childoflight_recomp.32.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C4D70), $marks129 in .129.cpp, $marks86 in .86.cpp, $marks136 in .136.cpp, $marks184 in .184.cpp, $marks128 in .128.cpp, $marks98 in .98.cpp, $marks50 in .50.cpp (each expected >= 2: DECLARE + 1 guard comment), $marks99 in .99.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C52F8)"; exit 1 }
+          Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70) + $marks32 in .32.cpp (sub_824C4D70) + $marks129 in .129.cpp (sub_824C8940) + $marks86 in .86.cpp (sub_824C8018) + $marks136 in .136.cpp (sub_824C9A60) + $marks184 in .184.cpp (sub_82A60450) + $marks128 in .128.cpp (sub_824C9DA8) + $marks98 in .98.cpp (sub_82A60C40) + $marks50 in .50.cpp (sub_824C99D8) + $marks99 in .99.cpp (sub_824C52F8)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
@@ -1329,15 +1335,30 @@ jobs:
           set -euo pipefail
           mkdir -p rexauto/android/app/src/main/assets
           cp rexauto/tools/xbox360_titles.json rexauto/android/app/src/main/assets/
+          # (Hunt v1.4.6, ronda 19, A5-R19-07.) Install pillow ONCE, with
+          # retry, before the branch below: both branches used to run
+          # their own bare `pip install` with no retry, so a transient
+          # PyPI failure killed the run here (after the ~25 min codegen
+          # job) with no second chance -- every other network fetch in
+          # this workflow retries (apt, sdkmanager, SDK install, game
+          # input). One install serves both branches (android_icon.py
+          # needs pillow in either case). Fails loudly after 3 attempts.
+          for _i in 1 2 3; do
+            if python3 -m pip install -q "pillow==13.0.0"; then
+              echo "pip pillow OK (attempt $_i)"
+              break
+            fi
+            echo "::warning::pip install pillow attempt $_i failed"
+            if [ "$_i" = "3" ]; then echo "::error::pip install pillow failed after 3 attempts"; exit 1; fi
+            sleep 10
+          done
           if [ -f "${{ runner.temp }}/in/cover.png" ]; then
             cp "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/assets/cover.png
-            python3 -m pip install -q "pillow==13.0.0"
             python3 rexauto/tools/android_icon.py "${{ runner.temp }}/in/cover.png" rexauto/android/app/src/main/res
           else
             # (Ronda 4, G-F4.) A missing cover used to fall through silently
             # to the generic rexauto icon. Warn so the log says why.
             echo "::warning::cover.png missing in port-src artifact -- the APK will use the generic rexauto icon"
-            python3 -m pip install -q "pillow==13.0.0"
             python3 rexauto/tools/android_icon.py rexauto/gui/rexauto_icon.png rexauto/android/app/src/main/res
           fi
 
@@ -1616,6 +1637,23 @@ jobs:
             echo "::error::SHA-256 of the copied APK differs from the built APK (corrupt copy) -- refusing to upload it."
             exit 1
           fi
+          # (Hunt v1.4.6, ronda 19, A5-R19-06.) Verify ZIP alignment of
+          # the built APK: AGP aligns release APKs automatically, but
+          # nothing in CI ever checked the result -- the FULL script
+          # gates it twice (pre-firma A5-R17-01, post-firma A5-R18-03)
+          # while this step checked everything except alignment. The
+          # Android docs say the same for AGP builds: "you should still
+          # use zipalign to verify that the APK is aligned, but you
+          # don't need to align it"
+          # (https://developer.android.com/tools/zipalign). -c is
+          # read-only: it cannot change the APK or its signature, and
+          # it runs here, after every gate and before the upload, on the
+          # same $APK the gates above verified. zipalign lives next to
+          # the apksigner/aapt2 pinned above (build-tools 35.0.0).
+          _ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          if [ ! -x "$_ZIPALIGN" ]; then echo "::error::zipalign not found at $_ZIPALIGN (AGP 8.7.3 build-tools 35.0.0) -- check the Android SDK on the runner"; exit 1; fi
+          "$_ZIPALIGN" -c 4 "$APK" || { echo "::error::zipalign -c failed on $APK (uncompressed entries misaligned -- the APK would install but waste RAM on mmap); check the Gradle/AGP alignment step"; exit 1; }
+          echo "APK ZIP alignment OK (zipalign -c 4)"
           SIZE=$(stat -c%s "$APK")
           {
             echo "### ✅ ${{ needs.recompile.outputs.title }} — Android Edition"
