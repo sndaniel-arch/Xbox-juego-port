@@ -790,7 +790,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.swapchain_pre_transform);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -894,7 +895,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.swapchain_pre_transform);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1130,8 +1132,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out,
+    VkSurfaceTransformFlagBitsKHR& pre_transform_out) {
   ui_surface_unusable_out = false;
+  pre_transform_out = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1160,13 +1164,48 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // device, and the minimum swap chain size on the whole instance - fail to
   // create until the surface becomes smaller).
   VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device->properties());
+  // (Caza v1.4.6 ronda 15, A1-R15-02.) Pre-rotation: on Android the display
+  // reports its orientation via currentTransform (ROTATE_90/270 for a
+  // landscape game on a portrait-native phone). Creating the swapchain with
+  // IDENTITY pre-transform makes SurfaceFlinger rotate every presented
+  // image, and Android returns VK_SUBOPTIMAL_KHR on every present -- the
+  // R14 log shows exactly that ("60 consecutive suboptimal presents
+  // without an optimal one", recreate every ~1.3 s), and the forced
+  // recreate never fixes it because it recreates with IDENTITY again.
+  // Use the surface's current transform when it's a single supported
+  // rotation (identity/90/180/270, no mirror bits); otherwise fall back to
+  // identity/inherit as before. The swapchain extent is in pre-transformed
+  // (buffer) space, so for a 90/270-degree rotation the requested width
+  // and height are swapped: a 2340x1080 window becomes a 1080x2340 image.
+  // (Android Developers, "Vulkan pre-rotation";
+  // https://developer.android.com/games/optimize/vulkan-prerotation)
+  VkSurfaceTransformFlagBitsKHR swapchain_pre_transform =
+      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  const VkSurfaceTransformFlagBitsKHR current_transform =
+      surface_capabilities.currentTransform;
+  if ((surface_capabilities.supportedTransforms & current_transform) &&
+      (current_transform == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ||
+       current_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+       current_transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ||
+       current_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) {
+    swapchain_pre_transform = current_transform;
+  }
+  const bool swapchain_pre_transform_swaps_extent =
+      swapchain_pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+      swapchain_pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
+  const uint32_t swapchain_image_width =
+      swapchain_pre_transform_swaps_extent ? height : width;
+  const uint32_t swapchain_image_height =
+      swapchain_pre_transform_swaps_extent ? width : height;
   VkExtent2D image_extent;
-  image_extent.width = std::min(std::max(std::min(width, max_framebuffer_extent.width),
-                                         surface_capabilities.minImageExtent.width),
-                                surface_capabilities.maxImageExtent.width);
-  image_extent.height = std::min(std::max(std::min(height, max_framebuffer_extent.height),
-                                          surface_capabilities.minImageExtent.height),
-                                 surface_capabilities.maxImageExtent.height);
+  image_extent.width =
+      std::min(std::max(std::min(swapchain_image_width, max_framebuffer_extent.width),
+                        surface_capabilities.minImageExtent.width),
+               surface_capabilities.maxImageExtent.width);
+  image_extent.height =
+      std::min(std::max(std::min(swapchain_image_height, max_framebuffer_extent.height),
+                        surface_capabilities.minImageExtent.height),
+               surface_capabilities.maxImageExtent.height);
   if (!image_extent.width || !image_extent.height ||
       image_extent.width > max_framebuffer_extent.width ||
       image_extent.height > max_framebuffer_extent.height) {
@@ -1207,8 +1246,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     return VK_NULL_HANDLE;
   }
 
-  // TODO(Triang3l): Support transforms.
-  if (!(surface_capabilities.supportedTransforms &
+  // (Caza v1.4.6 ronda 15, A1-R15-02.) The pre-transform was chosen above
+  // from currentTransform; only require identity/inherit support when no
+  // rotation was chosen (a chosen rotation is supported by construction).
+  if (swapchain_pre_transform == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR &&
+      !(surface_capabilities.supportedTransforms &
         (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR))) {
     REXLOG_ERROR(
         "VulkanPresenter: The surface doesn't support identity or "
@@ -1373,10 +1415,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.queueFamilyIndexCount = 0;
     swapchain_create_info.pQueueFamilyIndices = nullptr;
   }
-  swapchain_create_info.preTransform =
-      (surface_capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
-          : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  // (Caza v1.4.6 ronda 15, A1-R15-02.) Use the pre-transform chosen above
+  // (the surface currentTransform when it's a supported rotation) instead
+  // of always identity: identity on a rotated display makes Android
+  // return VK_SUBOPTIMAL_KHR on every present.
+  swapchain_create_info.preTransform = swapchain_pre_transform;
   // Prefer opaque to avoid blending in the window system, or let that be
   // specified via the window system if it can't be forced. As a last resort,
   // just pick any - guest output will write alpha of 1 anyway.
@@ -1433,14 +1476,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}",
+      "{}, presentation mode {}, pre-transform {}",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode));
+      uint32_t(swapchain_create_info.presentMode), uint32_t(swapchain_pre_transform));
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
+  pre_transform_out = swapchain_pre_transform;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
                 swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
   return swapchain;
@@ -1547,6 +1591,46 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   }
 
   return true;
+}
+
+// (Caza v1.4.6 ronda 15, A1-R15-02.) A window-space rectangle (in the
+// orientation the guest sees: landscape for this game) rotated into
+// swapchain (buffer) space for a pre-rotated swapchain. The rotation is
+// the one the compositor would otherwise apply at present time; the
+// swapchain image extent is in buffer space, so for a 90/270-degree
+// pre-transform the window is the extent with width/height swapped.
+// Mappings (x, y, width, height), derived from the Vulkan spec definition
+// of VkSurfaceTransformFlagBitsKHR (rotation is clockwise on screen) and
+// cross-checked in NDC space:
+//   IDENTITY:  (x, y, w, h)
+//   ROTATE_90:  (window_height - y - h, x, h, w)
+//   ROTATE_180: (window_width - x - w, window_height - y - h, w, h)
+//   ROTATE_270: (y, window_width - x - w, h, w)
+// The rotation direction has NOT been verified on the phone yet -- check
+// the orientation on first run (if the image is upside down or mirrored,
+// the 90/270 mappings are swapped).
+struct PreRotatedRectangle {
+  int32_t x;
+  int32_t y;
+  uint32_t width;
+  uint32_t height;
+};
+
+PreRotatedRectangle RotateRectangleForSwapchainPreTransform(
+    int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t window_width,
+    uint32_t window_height, VkSurfaceTransformFlagBitsKHR pre_transform) {
+  switch (pre_transform) {
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+      return PreRotatedRectangle{int32_t(window_height) - y - int32_t(height), x, height, width};
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+      return PreRotatedRectangle{int32_t(window_width) - x - int32_t(width),
+                                 int32_t(window_height) - y - int32_t(height), width, height};
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+      return PreRotatedRectangle{y, int32_t(window_width) - x - int32_t(width), height, width};
+    case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR:
+    default:
+      return PreRotatedRectangle{x, y, width, height};
+  }
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -1947,6 +2031,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         VkRect2D guest_output_scissor;
         guest_output_scissor.offset.x = 0;
         guest_output_scissor.offset.y = 0;
+        // (Caza v1.4.6 ronda 15, A1-R15-02.) Window-space size of the
+        // surface: the guest output rectangles and the letterbox clears
+        // below are in window space, while paint_context_.swapchain_extent
+        // is in buffer (pre-transformed) space. With a 90/270-degree
+        // pre-transform the window is the extent with width/height
+        // swapped (e.g. 1080x2340 extent <-> 2340x1080 window); for
+        // identity/180 the window is the extent itself.
+        const bool swapchain_pre_transform_swaps_extent =
+            paint_context_.swapchain_pre_transform ==
+                VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+            paint_context_.swapchain_pre_transform ==
+                VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
+        const uint32_t surface_window_width = swapchain_pre_transform_swaps_extent
+                                                  ? paint_context_.swapchain_extent.height
+                                                  : paint_context_.swapchain_extent.width;
+        const uint32_t surface_window_height = swapchain_pre_transform_swaps_extent
+                                                   ? paint_context_.swapchain_extent.width
+                                                   : paint_context_.swapchain_extent.height;
         if (guest_output_flow.effect_count > 1) {
           paint_context_.guest_output_intermediate_image_last_submission =
               current_paint_submission_index;
@@ -1964,18 +2066,21 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           std::pair<uint32_t, uint32_t> effect_rect_size = guest_output_flow.effect_output_sizes[i];
           if (is_final_effect && guest_output_flow.output_x == 0 &&
               guest_output_flow.output_y == 0 &&
-              effect_rect_size.first < paint_context_.swapchain_extent.width &&
-              effect_rect_size.second < paint_context_.swapchain_extent.height) {
+              effect_rect_size.first < surface_window_width &&
+              effect_rect_size.second < surface_window_height) {
             static std::atomic<bool> logged_swapchain_expand = false;
             if (!logged_swapchain_expand.exchange(true)) {
               REXLOG_WARN(
                   "VulkanPresenter: expanding final guest output rect from "
                   "{}x{} to swapchain {}x{} to avoid top-left-only output",
-                  effect_rect_size.first, effect_rect_size.second,
-                  paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+                  effect_rect_size.first, effect_rect_size.second, surface_window_width,
+                  surface_window_height);
             }
-            effect_rect_size = std::make_pair(paint_context_.swapchain_extent.width,
-                                              paint_context_.swapchain_extent.height);
+            // (Caza v1.4.6 ronda 15, A1-R15-02.) Expand to the WINDOW
+            // size, not the swapchain extent: the rectangle is in window
+            // space, and with a 90/270-degree pre-transform the extent is
+            // the window with width/height swapped.
+            effect_rect_size = std::make_pair(surface_window_width, surface_window_height);
             // Keep all final-pass data coherent - shader constants and
             // letterbox clears are derived from guest_output_flow.
             guest_output_flow.effect_output_sizes[i] = effect_rect_size;
@@ -2042,6 +2147,27 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           if (is_final_effect) {
             effect_rect_x = guest_output_flow.output_x;
             effect_rect_y = guest_output_flow.output_y;
+            // (Caza v1.4.6 ronda 15, A1-R15-02.) The final rectangle is in
+            // window space but the swapchain image (and the viewport set
+            // just below) is in buffer space: rotate the rectangle into
+            // buffer space before the NDC conversion. Intermediate effects
+            // render offscreen in window space and are unaffected.
+            const PreRotatedRectangle effect_rect_rotated =
+                RotateRectangleForSwapchainPreTransform(
+                    effect_rect_x, effect_rect_y, effect_rect_size.first, effect_rect_size.second,
+                    surface_window_width, surface_window_height,
+                    paint_context_.swapchain_pre_transform);
+            effect_rect_x = effect_rect_rotated.x;
+            effect_rect_y = effect_rect_rotated.y;
+            effect_rect_size = std::make_pair(effect_rect_rotated.width, effect_rect_rotated.height);
+            // Keep all final-pass data coherent -- the fragment-shader
+            // constants (BilinearConstants output_offset/output_size_inv,
+            // CAS/FSR input/output ratios) are derived from
+            // guest_output_flow, so they must see the buffer-space rect
+            // too (same pattern as the expand above).
+            guest_output_flow.effect_output_sizes[i] = effect_rect_size;
+            guest_output_flow.output_x = effect_rect_x;
+            guest_output_flow.output_y = effect_rect_y;
             dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                                      VK_SUBPASS_CONTENTS_INLINE);
             swapchain_image_pass_begun = true;
@@ -2170,14 +2296,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                     letterbox_clear_vulkan_rectangles[i];
                 const GuestOutputPaintFlow::ClearRectangle& letterbox_clear_rectangle =
                     guest_output_flow.letterbox_clear_rectangles[i];
-                letterbox_clear_vulkan_rectangle.rect.offset.x =
-                    int32_t(letterbox_clear_rectangle.x);
-                letterbox_clear_vulkan_rectangle.rect.offset.y =
-                    int32_t(letterbox_clear_rectangle.y);
-                letterbox_clear_vulkan_rectangle.rect.extent.width =
-                    letterbox_clear_rectangle.width;
+                // (Caza v1.4.6 ronda 15, A1-R15-02.) The letterbox rects
+                // are in window space; the swapchain image is in buffer
+                // space, so rotate them like the final output rect above.
+                const PreRotatedRectangle letterbox_clear_rotated =
+                    RotateRectangleForSwapchainPreTransform(
+                        letterbox_clear_rectangle.x, letterbox_clear_rectangle.y,
+                        letterbox_clear_rectangle.width, letterbox_clear_rectangle.height,
+                        surface_window_width, surface_window_height,
+                        paint_context_.swapchain_pre_transform);
+                letterbox_clear_vulkan_rectangle.rect.offset.x = letterbox_clear_rotated.x;
+                letterbox_clear_vulkan_rectangle.rect.offset.y = letterbox_clear_rotated.y;
+                letterbox_clear_vulkan_rectangle.rect.extent.width = letterbox_clear_rotated.width;
                 letterbox_clear_vulkan_rectangle.rect.extent.height =
-                    letterbox_clear_rectangle.height;
+                    letterbox_clear_rotated.height;
                 letterbox_clear_vulkan_rectangle.baseArrayLayer = 0;
                 letterbox_clear_vulkan_rectangle.layerCount = 1;
               }
