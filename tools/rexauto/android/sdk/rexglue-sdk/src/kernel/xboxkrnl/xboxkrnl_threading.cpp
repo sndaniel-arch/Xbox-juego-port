@@ -593,6 +593,19 @@ u32 KeGetCurrentProcessType_entry() {
 void KeSetCurrentProcessType_entry(u32 type) {
   // One of X_PROCTYPE_?
   assert_true(type <= 2);
+  // (Hunt v1.4.6, ronda 20, A3-R20-01.) The assert above is a no-op in
+  // Release, and both stores below truncate: set_process_type writes
+  // uint8_t(value) into title_process.process_type, and the PCR write
+  // stores static_cast<uint8_t>(type) into processtype_value_in_dpc.
+  // A guest passing 3+ would silently poison the process type later
+  // read back by KeGetCurrentProcessType during a DPC. The contract
+  // is 0 = IDLE, 1 = USER, 2 = SYSTEM (kernel_state.h:102-104); same
+  // INVALID_PARAMETER class as A3-R19-04 (wait_type), but this entry
+  // is void, so reject by returning early, as KeInitializeTimerEx
+  // does (A3-R9-03).
+  if (type > 2) {
+    return;
+  }
 
   REX_KERNEL_STATE()->set_process_type(type);
 
@@ -775,6 +788,20 @@ void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 event_type, u32 
   if (!event_ptr) {
     return;
   }
+  // (Hunt v1.4.6, ronda 20, A3-R20-02.) event_type has only two values
+  // (0 = NotificationEvent, 1 = SynchronizationEvent); the header.type
+  // write below truncates the u32 to a u8, and GetNativeObject is then
+  // called with the raw value as as_type. With event_type == 2 the
+  // header is stamped MutantObject, GetNativeObject builds an XMutant,
+  // and the XEvent type check (A3-R4-11) rejects it -- so the entry
+  // returns having created a permanently dead event: no primitive, no
+  // stashed handle, and every later Set/Pulse/Reset/Wait on that
+  // address fails the same way (5 stamps a SemaphoreObject with the
+  // same result). Reject up front, mirroring KeInitializeTimerEx
+  // (A3-R9-03); the struct is left untouched, as if never initialized.
+  if (event_type > 1) {
+    return;
+  }
   // (Hunt v1.4.6, ronda 9, A3-R9-03.) The writes below span the whole
   // X_KEVENT (16 B: the dispatch header); same shape as
   // KeInitializeSemaphore (R8-03).
@@ -955,6 +982,21 @@ void KeInitializeSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 coun
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) The header/limit writes below
   // dereference semaphore_ptr with no check.
   if (!semaphore_ptr) {
+    return;
+  }
+  // (Hunt v1.4.6, ronda 20, A3-R20-03.) Semaphore::Create
+  // (threading_posix.cpp) refuses initial_count < 0, initial_count >
+  // maximum_count and maximum_count <= 0 (signed ints), so
+  // InitializeNative leaves semaphore_ null and GetNativeObject still
+  // hands out the wrapper (A3-R8-09): waits fail via the null handle
+  // and releases are no-ops -- a permanently dead semaphore.
+  // NtCreateSemaphore already rejects this through Initialize's false
+  // return (A3-R4-04 class); this void entry cannot report failure,
+  // so refuse the values here instead, mirroring KeInitializeTimerEx
+  // (A3-R9-03). The signed casts mirror Create's condition exactly: a
+  // u32 count/limit with bit 31 set converts to a negative int.
+  if (static_cast<int32_t>(limit) <= 0 || static_cast<int32_t>(count) < 0 ||
+      static_cast<int32_t>(count) > static_cast<int32_t>(limit)) {
     return;
   }
   // (Hunt v1.4.6, ronda 8, A3-R8-03.) The three writes below span
@@ -1383,6 +1425,18 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   if (!objects_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // (Hunt v1.4.6, ronda 20, A3-R20-07.) count == 0 used to fall
+  // through to WaitMultiple with an empty vector: WaitAll returns
+  // instant SUCCESS on zero handles (vacuous truth), while WaitAny
+  // sleeps on the shared multi-wait channel until a deadline that
+  // never comes with an infinite timeout -- an effective hang, since
+  // no handle can ever signal it. ReactOS NtWaitForMultipleObjects
+  // rejects it the same way (0 == ObjectCount ->
+  // STATUS_INVALID_PARAMETER). Same bound as the count > 64 check
+  // next to it.
+  if (!count) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (count > 64) {
     return X_STATUS_INVALID_PARAMETER;
   }
@@ -1452,6 +1506,16 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
   // NetDll_WSAWaitForMultipleEvents (which caps at 64 already) and
   // NtWaitForMultipleObjectsEx.
   if (!handles) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // (Hunt v1.4.6, ronda 20, A3-R20-07.) As in
+  // KeWaitForMultipleObjects_entry above: count == 0 must not reach
+  // WaitMultiple. This is also the choke point for
+  // NtWaitForMultipleObjectsEx_entry and for
+  // NetDll_WSAWaitForMultipleEvents (which maps the failure through
+  // RtlNtStatusToDosError to ERROR_INVALID_PARAMETER, the correct
+  // Winsock answer for 0 events).
+  if (!count) {
     return X_STATUS_INVALID_PARAMETER;
   }
   if (count > 64) {
