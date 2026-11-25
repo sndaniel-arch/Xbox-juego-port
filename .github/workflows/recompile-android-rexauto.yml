@@ -868,6 +868,31 @@ jobs:
           }
           Write-Host "register-as-local verified: manifest keys + generated init flags + $marks LOCALIZE_FIX markers"
 
+      - name: Guard R14 crash (null +156) -- ronda 15 A2-R15-01
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          # tools/guard_r15_col.py runs on the GENERATED tree, right after
+          # the localize pass and before the pack step. It guards the two
+          # unchecked uses of *(this+156) that crash R14 deterministically
+          # at JUGAR (SIGSEGV base+4, guest NULL in sub_82459F10): the
+          # state-2 handler sub_824C5150 and the state-4 branch of
+          # sub_824C4B70. The guard recreates the sub-object exactly as
+          # sub_824C4FD8 would (Alloc(60,66) + Ctor sub_8242EAC8) and, if
+          # the Alloc fails again, skips the block without crashing (state
+          # 2 retries next frame). The script FAILS the job when an anchor
+          # does not match verbatim, so a codegen change cannot silently
+          # ship unguarded code. The marker count below is the tripwire
+          # that the guard actually landed in the packed tree (2 markers
+          # per guarded file: the DECLARE line + the guard comment).
+          $gen = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port\generated\default"
+          python "$env:GITHUB_WORKSPACE\tools\guard_r15_col.py" "$gen\childoflight_recomp.*.cpp"
+          $guardRc = $LASTEXITCODE
+          $marks = (Get-ChildItem $gen -Filter "childoflight_recomp.*.cpp" | Select-String -Pattern "GUARD_R15_A2-R15-01").Count
+          if ($guardRc -ne 0) { exit $guardRc }
+          if (-not $marks -or $marks -lt 4) { Write-Host "::error::guard_r15_col ran but only $marks GUARD_R15 markers found (expected >= 4: 2 per guarded file) -- the guard did not land"; exit 1 }
+          Write-Host "crash guard verified: $marks GUARD_R15 markers (sub_824C5150 + sub_824C4B70)"
+
       - name: Title metadata (name, Title ID, cover)
         id: meta
         if: always()
