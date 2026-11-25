@@ -232,6 +232,17 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
       std::string env_name = key.substr(4);
       const size_t efirst = env_name.find_first_not_of(" \t");
       if (efirst != std::string::npos) env_name.erase(0, efirst);
+      // (Hunt v1.4.6 ronda 20, A4-R20-05.) An env.* line with no name
+      // ("env.=1", "env. =1", "env.   =1"): setenv("") fails with EINVAL
+      // and a blank-only name stores a junk variable nothing reads, but
+      // the line still counted as applied in the "N lines applied" log
+      // below -- the count overcounted and the typo'd line was silent.
+      // Skip it with a warning, like the other malformed lines above.
+      while (!env_name.empty() && (env_name.back() == ' ' || env_name.back() == '\t')) env_name.pop_back();
+      if (env_name.empty()) {
+        ALOGW("settings.txt: ignoring '%s' (env.* line with no variable name)", line.c_str());
+        continue;
+      }
       setenv(env_name.c_str(), value.c_str(), 1);
       if (env_count) ++(*env_count);
       continue;
@@ -1141,6 +1152,19 @@ int RunAndroidApp() {
       SDL_SetHint(SDL_HINT_ORIENTATIONS, orientations_hint.c_str());
     }
   }
+  // (Hunt v1.4.6 ronda 20, A4-R20-01.) Enable the SDL HIDAPI driver for
+  // Bluetooth Steam Controllers: it is off by default
+  // (SDL_HINT_JOYSTICK_HIDAPI_STEAM defaults to "0", SDL_hints.h), and
+  // without it hid_init() never calls HIDDeviceManager.initialize(false,
+  // true) -- so the bonded-device enumeration, the GATT connect and the
+  // Chromebook poll in HIDDeviceBLESteamController never run in the
+  // shipped build. Must be set before the runtime's
+  // SDL_InitSubSystem(SDL_INIT_GAMEPAD) (app_context.Initialize() below);
+  // on API 31+ SDL itself requests BLUETOOTH_CONNECT (declared in
+  // AndroidManifest.xml) and initialize() runs from its grant callback,
+  // so a deny just leaves Bluetooth off and the game still plays on the
+  // touch pad / USB / standard Android gamepads.
+  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
   // (Ronda 6, auditor E — R6-E3.) Resolve the log dir, wipe the stale
   // markers and install the crash reporter BEFORE loading the custom
   // driver: the old order did it after LoadCustomVulkanDriver, so a crash
