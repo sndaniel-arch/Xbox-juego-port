@@ -1876,8 +1876,92 @@ void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void
   dpc->Initialize(routine.guest_address(), context.guest_address());
 }
 
+// (Hunt v1.4.6, ronda 18, A3-R18-03 + F41.) KeInsertQueueDpc used to only
+// append to dpc_list(); nothing ever drained it — KeRetireDpcList is a plain
+// stub and the assert_always("DPC does not dispatch yet; going to hang!")
+// compiled out in Release — so every DPC-driven signal was lost since the
+// initial commit. CrownPark's ReXGlue fork fixed the identical bug the same
+// way, matching xenia-canary: run the DPC inline under DPC impersonation
+// (IRQL_DISPATCH, depth-guarded). The drain here is iterative, not
+// recursive: KeInsertQueueDpc enqueues, then drains the whole list while it
+// is the outermost drain on this thread (thread_local flag). A DPC routine
+// that queues another DPC only appends; the outer loop picks it up, so no
+// DPC is ever lost and the stack cannot grow. The global lock is released
+// before any guest code runs (same rule as DeliverAPCs, which releases the
+// APC spinlock first). KeRetireDpcList stays a stub: with inline draining
+// the list is empty whenever it could run.
+static void DrainDpcList() {
+  // Only the outermost drain on this thread runs the loop; a nested
+  // KeInsertQueueDpc (called from inside a DPC routine) only enqueues and
+  // returns, and the outer loop picks the new entry up.
+  static thread_local bool draining = false;
+  if (draining) {
+    return;
+  }
+  XThread* thread = XThread::GetCurrentThread();
+  if (!thread) {
+    // Host thread with no guest TLS (see ExTerminateThread, R3-20): no
+    // ThreadState to execute with. The DPC stays queued; the next insert
+    // from a guest thread drains it.
+    return;
+  }
+  auto* thread_state = thread->thread_state();
+  auto* dispatcher = REX_KERNEL_STATE()->function_dispatcher();
+  if (!thread_state || !dispatcher) {
+    return;
+  }
+  draining = true;
+  auto* mem = rex::system::kernel_state()->memory();
+  auto* dpc_list = REX_KERNEL_STATE()->dpc_list();
+  auto* ctx = thread_state->context();
+  while (true) {
+    uint32_t list_entry_ptr = 0;
+    {
+      // Take one DPC under the lock, then release the lock before running
+      // guest code. HasPending + Shift share one acquisition so the list
+      // cannot empty between the check and the take.
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (dpc_list->HasPending()) {
+        list_entry_ptr = dpc_list->Shift();
+      }
+    }
+    if (!list_entry_ptr) {
+      break;
+    }
+    // XDPC::list_entry sits at +4, so the struct starts 4 bytes earlier.
+    uint32_t dpc_ptr = list_entry_ptr - 4;
+    if (!GuestRangeWritable(dpc_ptr, sizeof(XDPC))) {
+      REXKRNL_ERROR("[DPC] Dropping queued DPC at {:08X}: not a writable XDPC",
+                    dpc_ptr);
+      continue;
+    }
+    XDPC* dpc = mem->TranslateVirtual<XDPC*>(dpc_ptr);
+    // Copy the fields out before executing: the routine may mutate the DPC.
+    uint32_t routine = uint32_t(dpc->routine);
+    uint32_t deferred_context = uint32_t(dpc->context);
+    uint32_t arg1 = uint32_t(dpc->arg1);
+    uint32_t arg2 = uint32_t(dpc->arg2);
+    if (!routine || !dispatcher->GetFunction(routine)) {
+      REXKRNL_ERROR(
+          "[DPC] Dropping queued DPC at {:08X}: routine {:08X} not found",
+          dpc_ptr, routine);
+      continue;
+    }
+    // DPC routine signature: (Dpc, DeferredContext, SystemArgument1,
+    // SystemArgument2). Same call shape as DeliverAPCs uses for APCs.
+    uint64_t dpc_args[] = {dpc_ptr, deferred_context, arg1, arg2};
+    uint32_t old_irql = xeKfRaiseIrql(ctx, IRQL_DISPATCH);
+    dispatcher->ExecuteTrap(thread_state, routine, dpc_args, 4);
+    // Same restore rule as xeKeKfReleaseSpinLock: only lower when the old
+    // level was below DISPATCH (above DISPATCH the level stays put).
+    if (old_irql < IRQL_DISPATCH) {
+      xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
+    }
+  }
+  draining = false;
+}
+
 u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
-  assert_always("DPC does not dispatch yet; going to hang!");
 
   // (Hunt v1.4.6, ronda 3, A3-R3-07.) dpc->arg1/arg2 are written
   // below; a NULL dpc used to crash the host there.
@@ -1891,20 +1975,27 @@ u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
   }
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
 
-  // Lock dispatcher.
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
-  auto dpc_list = REX_KERNEL_STATE()->dpc_list();
+  {
+    // Lock dispatcher.
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    auto dpc_list = REX_KERNEL_STATE()->dpc_list();
 
-  // If already in a queue, abort.
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    return 0;
+    // If already in a queue, abort.
+    if (dpc_list->IsQueued(list_entry_ptr)) {
+      return 0;
+    }
+
+    // Prep DPC.
+    dpc->arg1 = (uint32_t)arg1;
+    dpc->arg2 = (uint32_t)arg2;
+
+    dpc_list->Insert(list_entry_ptr);
   }
 
-  // Prep DPC.
-  dpc->arg1 = (uint32_t)arg1;
-  dpc->arg2 = (uint32_t)arg2;
-
-  dpc_list->Insert(list_entry_ptr);
+  // (Hunt v1.4.6, ronda 18, A3-R18-03.) The DPC is drained inline now
+  // (DrainDpcList above); the lock is released first so guest code never
+  // runs under it.
+  DrainDpcList();
 
   return 1;
 }
