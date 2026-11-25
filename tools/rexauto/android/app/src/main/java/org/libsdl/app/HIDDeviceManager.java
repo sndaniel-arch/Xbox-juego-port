@@ -446,17 +446,34 @@ public class HIDDeviceManager {
             mHandler = new Handler(Looper.getMainLooper());
             mLastBluetoothDevices = new ArrayList<BluetoothDevice>();
 
-            // final HIDDeviceManager finalThis = this;
-            // mHandler.postDelayed(new Runnable() {
-            //     @Override
-            //     public void run() {
-            //         finalThis.chromebookConnectionHandler();
-            //     }
-            // }, 5000);
+            // (Hunt v1.4.6 ronda 19, A4-R19-04.) This poll is the only
+            // Chromebook path: ACTION_ACL_CONNECTED / ACTION_ACL_DISCONNECTED
+            // do not fire there (see the NOTE above), so without it a
+            // bonded Steam Controller is never picked up after launch.
+            // The initial post was commented out, so the handler below
+            // (which only re-arms itself) never ran at all -- dead code.
+            // Re-enable it; shutdownBluetooth() cancels the pending
+            // posts so the loop stops when the manager is released.
+            final HIDDeviceManager finalThis = this;
+            mHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    finalThis.chromebookConnectionHandler();
+                }
+            }, 5000);
         }
     }
 
     private void shutdownBluetooth() {
+        // (Hunt v1.4.6 ronda 19, A4-R19-04.) Cancel the Chromebook poll:
+        // its Runnable holds this manager and re-arms itself, so without
+        // this it would keep polling (and calling back into native code)
+        // after release(). The Handler is private to this instance and
+        // only serves that loop, so dropping all its work is safe.
+        if (mHandler != null) {
+            mHandler.removeCallbacksAndMessages(null);
+            mHandler = null;
+        }
         try {
             mContext.unregisterReceiver(mBluetoothBroadcast);
         } catch (Exception e) {
@@ -497,13 +514,17 @@ public class HIDDeviceManager {
             connectBluetoothDevice(bluetoothDevice);
         }
 
-        final HIDDeviceManager finalThis = this;
-        mHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                finalThis.chromebookConnectionHandler();
-            }
-        }, 10000);
+        // (Hunt v1.4.6 ronda 19, A4-R19-04.) mHandler is nulled by
+        // shutdownBluetooth(): do not re-arm a released manager.
+        if (mHandler != null) {
+            final HIDDeviceManager finalThis = this;
+            mHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    finalThis.chromebookConnectionHandler();
+                }
+            }, 10000);
+        }
     }
 
     boolean connectBluetoothDevice(BluetoothDevice bluetoothDevice) {
