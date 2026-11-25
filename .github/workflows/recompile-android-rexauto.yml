@@ -882,16 +882,24 @@ jobs:
           # the Alloc fails again, skips the block without crashing (state
           # 2 retries next frame). The script FAILS the job when an anchor
           # does not match verbatim, so a codegen change cannot silently
-          # ship unguarded code. The marker count below is the tripwire
-          # that the guard actually landed in the packed tree (2 markers
-          # per guarded file: the DECLARE line + the guard comment).
+          # ship unguarded code. The marker count below is the per-file
+          # tripwire that the guard actually landed in the packed tree:
+          # childoflight_recomp.90.cpp carries 3 markers (the DECLARE line
+          # + 2 guard comments in sub_824C5150: the +156 explanation and
+          # the r3-restore note) and childoflight_recomp.46.cpp carries 2
+          # (the DECLARE line + 1 guard comment in sub_824C4B70) -- 5 in
+          # total. Counted per file, not globally: a global >= 4 would also
+          # pass if a future script change moved markers between files,
+          # and the old comment ("2 per guarded file") was wrong for
+          # .90.cpp. (Ronda 16, A5-R16-02.)
           $gen = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port\generated\default"
           python "$env:GITHUB_WORKSPACE\tools\guard_r15_col.py" "$gen\childoflight_recomp.*.cpp"
           $guardRc = $LASTEXITCODE
-          $marks = (Get-ChildItem $gen -Filter "childoflight_recomp.*.cpp" | Select-String -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks90 = @(Select-String -Path "$gen\childoflight_recomp.90.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks46 = @(Select-String -Path "$gen\childoflight_recomp.46.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           if ($guardRc -ne 0) { exit $guardRc }
-          if (-not $marks -or $marks -lt 4) { Write-Host "::error::guard_r15_col ran but only $marks GUARD_R15 markers found (expected >= 4: 2 per guarded file) -- the guard did not land"; exit 1 }
-          Write-Host "crash guard verified: $marks GUARD_R15 markers (sub_824C5150 + sub_824C4B70)"
+          if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150) and $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70)"; exit 1 }
+          Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
@@ -950,8 +958,17 @@ jobs:
           Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
           Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
 
+      # (Hunt v1.4.6, ronda 16, A5-R16-03.) NO if: always() on this step on
+      # purpose. The Pack step above runs with if: always() for
+      # diagnostics, so on a failed guard step it still produces a
+      # port-src.zip -- but that zip would carry an UNGUARDED tree, and
+      # uploading it as an artifact of a red run invites consuming it by
+      # hand. The artifact is only uploaded when every prior step
+      # (including the guard + tripwire) succeeded; the run is red
+      # otherwise and the apk job is skipped via needs: recompile.
+      # (Upload logs below keeps if: always(): logs are diagnostics,
+      # not a build input.)
       - uses: actions/upload-artifact@v7
-        if: always()
         timeout-minutes: 15
         with:
           name: port-src-${{ env.REX_PROJECT }}
