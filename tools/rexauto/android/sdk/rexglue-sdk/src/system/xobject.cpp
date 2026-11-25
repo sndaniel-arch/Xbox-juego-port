@@ -238,7 +238,15 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
     if (timeout_ticks == std::numeric_limits<int64_t>::min()) {
       return UINT32_MAX;
     }
-    return (uint32_t)(-timeout_ticks / 10000);  // Ticks -> MS
+    // (Hunt v1.4.6, ronda 17, A3-R17-02.) -timeout_ticks / 10000 can exceed
+    // UINT32_MAX for a relative wait past ~49.7 days, and the uint32_t cast
+    // then wraps it to a short (even 0 ms) wait -- the same truncation the
+    // absolute branch above already clamps. Clamp it instead.
+    uint64_t relative_ms = static_cast<uint64_t>(-timeout_ticks) / 10000;
+    if (relative_ms > UINT32_MAX) {
+      return UINT32_MAX;
+    }
+    return static_cast<uint32_t>(relative_ms);  // Ticks -> MS
   } else {
     return 0;
   }
