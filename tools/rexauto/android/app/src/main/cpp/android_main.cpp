@@ -88,6 +88,7 @@ constexpr char kDriverDirName[] = "gpu_driver";
 constexpr char kDriverConfigName[] = "driver.txt";
 
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, REX_APP_NAME, __VA_ARGS__)
+#define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, REX_APP_NAME, __VA_ARGS__)
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, REX_APP_NAME, __VA_ARGS__)
 
 std::string ReadTrimmedFile(const std::string& path) {
@@ -100,20 +101,31 @@ std::string ReadTrimmedFile(const std::string& path) {
 }
 
 // settings.txt -> ["--key=value", ...]. Blank lines and '#' comments ignored.
-std::vector<std::string> ReadSettingsArgs(const std::string& path) {
+// (Hunt v1.4.6 ronda 17, A4-R17-03.) env_count (when non-null) receives the
+// number of env.* lines consumed here: they never reach argv, so without
+// it the "N lines applied" log below undercounted every boot (the default
+// file always carries env.REX_HEAL_DISCOVER=1). A malformed line (no '=',
+// empty key) used to be skipped silently -- warn in logcat, so a typo'd
+// hand-added line is visible instead of looking applied.
+std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_count) {
   std::vector<std::string> out;
+  if (env_count) *env_count = 0;
   std::ifstream in(path, std::ios::binary);
   if (!in) return out;
   std::string line;
   while (std::getline(in, line)) {
-    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
     if (line.empty() || line[0] == '#') continue;
     const auto eq = line.find('=');
-    if (eq == std::string::npos || eq == 0) continue;
+    if (eq == std::string::npos || eq == 0) {
+      ALOGW("settings.txt: ignoring malformed line '%s' (expected key=value)", line.c_str());
+      continue;
+    }
     if (line.rfind("env.", 0) == 0) {
       // env.NAME=value -> setenv(NAME, value); consumed by getenv() readers
       // such as the tolerant dispatcher (REX_HEAL_DISCOVER).
       setenv(line.substr(4, eq - 4).c_str(), line.substr(eq + 1).c_str(), 1);
+      if (env_count) ++(*env_count);
       continue;
     }
     out.emplace_back("--" + line);
@@ -897,11 +909,68 @@ int RunAndroidApp() {
   // a typo'd key used to die silently -- cvar::Init stashes unknown
   // --options as pending values and only a later-registered cvar ever
   // applies them, so an unknown key never produced any feedback at all.
+  // (Hunt v1.4.6 ronda 17, A4-R17-03.) env.* lines are consumed by
+  // ReadSettingsArgs (setenv) and never reach argv; count them so the
+  // log below does not undercount.
+  int env_lines = 0;
   const std::vector<std::string> settings_args =
-      ReadSettingsArgs(external_dir + "/" + kSettingsFileName);
+      ReadSettingsArgs(external_dir + "/" + kSettingsFileName, &env_lines);
   for (const auto& a : settings_args) {
     ALOGI("setting: %s", a.c_str());
     args.emplace_back(a);
+  }
+
+  // (Hunt v1.4.6 ronda 17, A4-R17-01/02.) Deduplicate --key=value args,
+  // last occurrence wins. cvar::Init does NOT do last-wins, despite the
+  // comment on the R16 log below claiming so: bool cvars are registered
+  // with CLI11 add_flag_function + Sum policy (cvar.cpp), so
+  // "--key=false --key=true" sums to 0 and applies as FALSE -- an
+  // "extra" override of vulkan_async_skip_incomplete_frames=true was
+  // silently inverted to false (verified against the vendored CLI11:
+  // to_flag_value("false")=-1, to_flag_value("true")=+1, Sum adds
+  // them). String/int cvars use the default Throw policy, so a duplicate
+  // aborts the whole parse with a CLI11 ParseError that only reaches
+  // stderr, no cvar callback runs at all, and the game boots on SDK
+  // defaults (no gpu_plugin -> black screen, license_mask 0 -> DLCs
+  // off, async_skip true -> guest 0.0 fps). Duplicates are reachable:
+  // the mobile defaults above share a key with settings.txt
+  // (vulkan_async_skip_incomplete_frames), and the "extra" box or a
+  // hand-added line can repeat any argv key (gpu_plugin,
+  // log_flush_interval, game_data_root, ...). Collapsing here makes
+  // the documented "settings.txt wins" contract true for every type.
+  // Positionals (argv[0], anything not starting with "--") pass through
+  // untouched; "--no-key" counts as the same key as "--key".
+  {
+    std::unordered_map<std::string, size_t> first_pos;
+    std::vector<std::string> deduped;
+    deduped.reserve(args.size());
+    for (const auto& a : args) {
+      if (a.size() > 2 && a[0] == '-' && a[1] == '-') {
+        const size_t eq = a.find('=');
+        std::string key = a.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+        if (key.rfind("no-", 0) == 0) key.erase(0, 3);
+        if (key.empty()) {
+          deduped.emplace_back(a);
+          continue;
+        }
+        auto it = first_pos.find(key);
+        if (it == first_pos.end()) {
+          first_pos.emplace(key, deduped.size());
+          deduped.emplace_back(a);
+        } else {
+          // Same value twice (the normal case: the mobile default and
+          // settings.txt agree) is silent; only a real override warns.
+          if (deduped[it->second] != a) {
+            ALOGW("android_main: duplicate cvar arg '%s' dropped, keeping '%s'",
+                  deduped[it->second].c_str(), a.c_str());
+          }
+          deduped[it->second] = a;
+        }
+      } else {
+        deduped.emplace_back(a);
+      }
+    }
+    args.swap(deduped);
   }
 
   std::vector<char*> argv_ptrs;
@@ -966,15 +1035,18 @@ int RunAndroidApp() {
       // re-apply is last-wins). A missing/empty file boots on SDK
       // defaults, which on Mali selects MAILBOX -- say so loudly
       // instead of silently.
-      if (settings_args.empty()) {
+      // (Hunt v1.4.6 ronda 17, A4-R17-03.) A file with only env.* lines
+      // is NOT missing/empty: its lines were consumed (setenv) above.
+      // Only warn when nothing at all came out of settings.txt.
+      if (settings_args.empty() && env_lines == 0) {
         REXLOG_WARN("settings.txt: missing or empty under {} -- running on "
                     "SDK defaults (all present modes allowed; on Mali this "
                     "selects MAILBOX)",
                     external_dir);
       } else {
-        REXLOG_INFO("settings.txt: {} lines applied from {}; effective "
+        REXLOG_INFO("settings.txt: {} cvar lines + {} env lines applied from {}; effective "
                     "present modes: immediate={} mailbox={} fifo_relaxed={}",
-                    settings_args.size(), external_dir,
+                    settings_args.size(), env_lines, external_dir,
                     REXCVAR_GET(vulkan_allow_present_mode_immediate),
                     REXCVAR_GET(vulkan_allow_present_mode_mailbox),
                     REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed));
