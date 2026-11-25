@@ -504,7 +504,28 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
 
     // Reset the semaphore and recreate the driver ourselves.
     if (client.driver) {
-      UnregisterClient(entry.id);
+      // (Hunt v1.4.6, ronda 17, A3-R17-01.) Do NOT call UnregisterClient
+      // here: it frees clients_[id].wrapped_callback_arg, but the restored
+      // client reuses the same guest cell -- the stream stores its address,
+      // and the audio worker passes that address to the guest callback,
+      // which dereferences it. Freeing it leaves the restored client
+      // pointing at freed guest heap (the next 4-byte guest alloc can reuse
+      // the cell and the callback reads garbage). Destroy the driver and
+      // drain the semaphore only; free the old cell only when the stream
+      // points at a different one.
+      DestroyDriver(client.driver);
+      client.driver = nullptr;
+      if (client.wrapped_callback_arg != entry.wrapped_callback_arg) {
+        memory()->SystemHeapFree(client.wrapped_callback_arg);
+      }
+      client.wrapped_callback_arg = 0;
+      auto drain_semaphore = client_semaphores_[entry.id].get();
+      rex::thread::WaitResult drain_result;
+      do {
+        drain_result =
+            rex::thread::Wait(drain_semaphore, false, std::chrono::milliseconds(0));
+      } while (drain_result == rex::thread::WaitResult::kSuccess);
+      client.in_use = false;
     }
 
     client.callback = entry.callback;
