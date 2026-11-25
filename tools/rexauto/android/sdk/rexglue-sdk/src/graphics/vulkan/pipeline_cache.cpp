@@ -1292,6 +1292,17 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
       modification.vertex.user_clip_plane_cull = 1;
     } else if (!device_properties.shaderClipDistance) {
       // No supported clip/cull built-in for user clip planes.
+      // (Caza v1.4.6 ronda 19, A1-R19-01.) This used to drop the planes
+      // silently: the game keeps rendering with clipping ignored and the
+      // log shows nothing. One line per process; the branch is per-draw.
+      static bool user_clip_planes_unsupported_logged = false;
+      if (!user_clip_planes_unsupported_logged) {
+        user_clip_planes_unsupported_logged = true;
+        REXGPU_WARN(
+            "VulkanPipelineCache: User clip planes dropped: device supports "
+            "neither shaderClipDistance nor shaderCullDistance, so clipping "
+            "is ignored");
+      }
       user_clip_planes = 0;
       modification.vertex.user_clip_plane_cull = 0;
     } else {
