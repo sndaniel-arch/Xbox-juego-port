@@ -733,8 +733,21 @@ u32 SetFilePointerEx_entry(u32 hFile, u32 distHigh, u32 distLow, mapped_void lpN
   if (lpNewFilePointer) {
     auto* out = reinterpret_cast<be<uint32_t>*>(
         static_cast<uint8_t*>(static_cast<void*>(lpNewFilePointer)));
-    out[0] = static_cast<uint32_t>(new_pos & 0xFFFFFFFF);  // LowPart
-    out[1] = static_cast<uint32_t>(new_pos >> 32);         // HighPart
+    // (Hunt v1.4.6, caza ronda 15, A3-R15-01.) A LARGE_INTEGER in guest
+    // memory is one big-endian u64: the HIGH dword lives at offset 0
+    // and the LOW dword at offset 4 -- the same layout GetFileSizeEx
+    // writes just above, every be<uint64_t> in the SDK
+    // (X_FILE_POSITION_INFORMATION, X_FILE_END_OF_FILE_INFORMATION,
+    // X_FILE_NETWORK_OPEN_INFORMATION) and every mapped_u64 the kernel
+    // reads (NtReadFile byte_offset, KeQuerySystemTime). The old code
+    // wrote LowPart first, so the guest read the returned position as
+    // (low << 32) | high: a position of 1 came back as 0x100000000 --
+    // exactly the value in x1/x19 at the R14 title->JUGAR crash
+    // (fault 0x100000004). FILETIME is different and stays as-is: it
+    // is a struct of two u32s (Low first, no QuadPart member), which
+    // CompareFileTime / FillFindData already handle correctly.
+    out[0] = static_cast<uint32_t>(new_pos >> 32);         // HighPart
+    out[1] = static_cast<uint32_t>(new_pos & 0xFFFFFFFF);  // LowPart
   }
   return 1;
 }
@@ -957,20 +970,27 @@ u32 GetDiskFreeSpaceExA_entry(mapped_string lpDirectoryName,
   if (lpFreeBytesAvailableToCaller) {
     auto* out = reinterpret_cast<be<uint32_t>*>(
         static_cast<uint8_t*>(static_cast<void*>(lpFreeBytesAvailableToCaller)));
-    out[0] = static_cast<uint32_t>(free_bytes & 0xFFFFFFFF);
-    out[1] = static_cast<uint32_t>(free_bytes >> 32);
+    // (Hunt v1.4.6, caza ronda 15, A3-R15-02.) Same swapped halves as
+    // SetFilePointerEx (A3-R15-01): a ULARGE_INTEGER is one big-endian
+    // u64, high dword at offset 0. The old low-first write made the
+    // guest read (low << 32) | high, so e.g. exactly 4 GiB free read
+    // back as 1 byte.
+    out[0] = static_cast<uint32_t>(free_bytes >> 32);
+    out[1] = static_cast<uint32_t>(free_bytes & 0xFFFFFFFF);
   }
   if (lpTotalNumberOfBytes) {
     auto* out = reinterpret_cast<be<uint32_t>*>(
         static_cast<uint8_t*>(static_cast<void*>(lpTotalNumberOfBytes)));
-    out[0] = static_cast<uint32_t>(total_bytes & 0xFFFFFFFF);
-    out[1] = static_cast<uint32_t>(total_bytes >> 32);
+    // (Hunt v1.4.6, caza ronda 15, A3-R15-02.) See above.
+    out[0] = static_cast<uint32_t>(total_bytes >> 32);
+    out[1] = static_cast<uint32_t>(total_bytes & 0xFFFFFFFF);
   }
   if (lpTotalNumberOfFreeBytes) {
     auto* out = reinterpret_cast<be<uint32_t>*>(
         static_cast<uint8_t*>(static_cast<void*>(lpTotalNumberOfFreeBytes)));
-    out[0] = static_cast<uint32_t>(free_bytes & 0xFFFFFFFF);
-    out[1] = static_cast<uint32_t>(free_bytes >> 32);
+    // (Hunt v1.4.6, caza ronda 15, A3-R15-02.) See above.
+    out[0] = static_cast<uint32_t>(free_bytes >> 32);
+    out[1] = static_cast<uint32_t>(free_bytes & 0xFFFFFFFF);
   }
 
   REXKRNL_TRACE("rexcrt_GetDiskFreeSpaceExA: '{}' total={}MB free={}MB", path,
