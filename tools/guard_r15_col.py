@@ -282,7 +282,20 @@ def main():
         print("usage: guard_r15_col.py [--dry-run] <glob>", file=sys.stderr)
         return 2
     dry_run = "--dry-run" in sys.argv
-    pattern = next(a for a in sys.argv[1:] if not a.startswith("--"))
+    # Ronda 16 (A2-R16-02): UN SOLO glob posicional. Antes,
+    # `guard_r15_col.py a.cpp b.cpp` procesaba SOLO a.cpp en silencio
+    # (next() tomaba el primer posicional e ignoraba el resto; solo se
+    # delataba si un target vivia en el fichero ignorado, por el chequeo
+    # de missing al final). Y con solo `--dry-run` (sin posicional),
+    # next() tiraba StopIteration sin mensaje. Un solo glob es la unica
+    # forma soportada: guard_r15_col.py "childoflight_recomp.*.cpp".
+    positionals = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(positionals) != 1:
+        print(f"guard_r15_col: ERROR: se esperaba exactamente un glob "
+              f"posicional, recibidos {len(positionals)}: {positionals!r}",
+              file=sys.stderr)
+        return 2
+    pattern = positionals[0]
     paths = sorted(glob.glob(pattern))
     if not paths:
         print(f"guard_r15_col: no files matched {pattern!r}", file=sys.stderr)
