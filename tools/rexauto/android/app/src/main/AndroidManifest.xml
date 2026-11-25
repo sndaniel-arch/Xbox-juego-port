@@ -3,6 +3,19 @@
 
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Allow access to Bluetooth devices (Hunt v1.4.6 ronda 20,
+         A4-R20-01): the SDL HIDAPI driver for Bluetooth Steam Controllers
+         (HIDDeviceBLESteamController) needs BLUETOOTH_CONNECT on API 31+
+         — a runtime permission, which SDL requests at joystick init and
+         initializeBluetooth() re-checks — and BLUETOOTH on API <=30.
+         Without these declarations the merged release manifest carried
+         only VIBRATE, so the whole BLE stack was dead code. No scanning
+         is done (bonded devices + GATT only), so BLUETOOTH_SCAN is not
+         needed. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
     <!-- The Xenos GPU backend needs a full Vulkan 1.1 implementation. -->
     <uses-feature
         android:name="android.hardware.vulkan.version"
