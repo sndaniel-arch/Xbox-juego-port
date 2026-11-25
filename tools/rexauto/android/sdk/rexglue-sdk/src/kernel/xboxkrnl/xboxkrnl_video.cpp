@@ -656,6 +656,20 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
       !GuestRangeReadable(height.guest_address(), sizeof(uint32_t))) {
     return;
   }
+  // (Hunt v1.4.6, ronda 16, A3-R16-02.) Accepted-swap counter,
+  // logged every 300 swaps (~5 s at 60 fps): the presenter's
+  // "Guest FPS" counts successful RefreshGuestOutput completions,
+  // not VdSwap calls, so a phone log reading "guest 0.0 fps"
+  // cannot tell "the guest never swapped" from "the swap failed
+  // downstream". This line discriminates the two in the next phone
+  // log. Counts accepted swaps only (after the validation above);
+  // one INFO line per 300, no per-frame cost beyond an atomic
+  // increment (<atomic> is already included in this file).
+  static std::atomic<uint64_t> vdswap_count{0};
+  const uint64_t vdswap_n = vdswap_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (vdswap_n % 300 == 0) {
+    REXKRNL_INFO("VdSwap: {} accepted swaps since boot", vdswap_n);
+  }
   assert(buffer_ptr);
   assert(fetch_ptr);
   assert(frontbuffer_ptr);
