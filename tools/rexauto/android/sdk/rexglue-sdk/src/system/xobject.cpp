@@ -229,6 +229,15 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
     return static_cast<uint32_t>(remaining_ms);
   } else if (timeout_ticks < 0) {
     // Relative time.
+    // (Hunt v1.4.6, caza ronda 15, A3-R15-03.) INT64_MIN is the
+    // infinite-wait sentinel NtRemoveIoCompletion passes for a NULL
+    // timeout (and a guest may pass it to any wait): -INT64_MIN is
+    // signed overflow (UB). Clamp it to the longest representable
+    // wait instead -- effectively infinite for a game, and
+    // deterministic, unlike the wrap-around the old code relied on.
+    if (timeout_ticks == std::numeric_limits<int64_t>::min()) {
+      return UINT32_MAX;
+    }
     return (uint32_t)(-timeout_ticks / 10000);  // Ticks -> MS
   } else {
     return 0;
