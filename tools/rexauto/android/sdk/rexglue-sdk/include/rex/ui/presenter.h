@@ -380,6 +380,18 @@ class Presenter {
   void RequestUIPaintFromUIThread();
 
  protected:
+  // (Hunt v1.4.6, ronda 16, A1-R16-01, parent fix.) Moved here from the
+  // private section: VulkanPresenter::PaintAndPresentImpl (and any future
+  // painting implementation) must pass the WINDOW size as the flow's host
+  // render target, and the window size lives in these members. They were
+  // private, so the R16-01 flow fix in vulkan_presenter.cpp would not
+  // compile. Same declarations, same comments, only the access level
+  // changed; the painting thread already reads them.
+  // Modifiable only by the UI thread, can be read by the thread that's
+  // painting.
+  uint32_t surface_width_in_paint_connection_ = 0;
+  uint32_t surface_height_in_paint_connection_ = 0;
+
   enum class PaintResult {
     kPresented,
     kPresentedSuboptimal,
@@ -931,10 +943,6 @@ class Presenter {
   // thread regardless of the paint mode) while (re)connecting painting to the
   // surface.
   bool surface_paint_connection_has_implicit_vsync_ = false;
-  // Modifiable only by the UI thread, can be read by the thread that's
-  // painting.
-  uint32_t surface_width_in_paint_connection_ = 0;
-  uint32_t surface_height_in_paint_connection_ = 0;
 
   // Can be set by both the UI thread and the guest output thread before doing
   // window_->RequestPaint() - whether an extra painting (preceded by
