@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <limits>
+
 #include <rex/chrono/chrono.h>
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
@@ -62,7 +64,15 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
   if (due_time < 0) {
     // Any timer implementation uses absolute times eventually, convert as early
     // as possible for increased accuracy
-    auto after = rex::chrono::hundrednanoseconds(-due_time);
+    // (Hunt v1.4.6, ronda 18, A3-R18-02.) -due_time is signed overflow (UB)
+    // when due_time == INT64_MIN (the infinite-wait sentinel a guest may
+    // pass; same class as A3-R15-03/A3-R17-02/A3-R18-01). Clamp it to the
+    // longest representable duration instead.
+    int64_t relative_ticks =
+        due_time == std::numeric_limits<int64_t>::min()
+            ? std::numeric_limits<int64_t>::max()
+            : -due_time;
+    auto after = rex::chrono::hundrednanoseconds(relative_ticks);
     due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::now() + after);
   } else {
     due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::from_file_time(due_time));
