@@ -190,6 +190,14 @@ void XThread::set_name(const std::string_view name) {
 static std::atomic<uint32_t> next_cpu = 0;
 static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
   // NOTE: proc_mask is logical processors, not physical processors or cores.
+  // (Hunt v1.4.6, ronda 20, A3-R20-06.) Only bits 0..5 name Xbox 360
+  // hardware threads; bits 6/7 are not valid affinities, and the
+  // assert below is a no-op in Release: 7 - lzcnt(0x40) = 6 would
+  // escape as current_cpu 6/7 in SetActiveCpu, outside the 0..5 fake
+  // range every reader assumes (KeSetAffinityThread reports
+  // 1 << active_cpu() back). Drop the high bits up front, so a mask
+  // of only high bits is treated exactly like mask 0 (round-robin).
+  proc_mask = static_cast<uint8_t>(proc_mask & 0x3F);
   if (!proc_mask) {
     // (Hunt v1.4.6, ronda 8, A3-R8-14.) Same race as
     // next_xthread_id_ above: the round-robin counter was a plain
@@ -521,8 +529,17 @@ X_STATUS XThread::Exit(int exit_code) {
   thread->exit_status = exit_code;
 
   // Unlink thread from process thread list.
+  // (Hunt v1.4.6, ronda 20, A3-R20-04.) As in AllocateTLS/FreeTLS:
+  // thread->process is read out of the guest-writable KTHREAD, and
+  // TranslateVirtual never validates: a rewritten process would make
+  // the spinlock CAS and the thread_count decrement below land on an
+  // arbitrary guest address. Only the kernel's three processes are
+  // legitimate; anything else has no list to unlink from, so skip it
+  // (the thread object itself is being destroyed either way).
   uint32_t process_guest = thread->process;
-  if (process_guest) {
+  if (process_guest == kernel_state_->GetTitleProcess() ||
+      process_guest == kernel_state_->GetSystemProcess() ||
+      process_guest == kernel_state_->GetIdleProcess()) {
     auto* ctx = thread_state_->context();
     auto kprocess = memory()->TranslateVirtual<X_KPROCESS*>(process_guest);
     auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kprocess->thread_list_spinlock);
