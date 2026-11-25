@@ -65,6 +65,7 @@
 #include <rex/platform.h>
 #include <rex/runtime.h>
 #include <rex/thread.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
@@ -954,6 +955,30 @@ int RunAndroidApp() {
       // here is a typo (or a hand-added line for a module that never
       // loads), and the player finally hears about it in childoflight.log.
       LogUnknownSettingsCvars(settings_args);
+      // (Hunt v1.4.6 ronda 16, A4-R16-01.) Record the preset outcome in
+      // childoflight.log: the per-line "setting:" log in RunAndroidApp
+      // only goes to logcat (ALOGI), so a pasted childoflight.log never
+      // showed whether settings.txt was even read, let alone which
+      // present mode the preset selected. At this point the runtime
+      // exists, so the present-mode cvars are registered and REXCVAR_GET
+      // reads the effective values (settings.txt wins over the mobile
+      // defaults: its lines were appended after them, and same-source
+      // re-apply is last-wins). A missing/empty file boots on SDK
+      // defaults, which on Mali selects MAILBOX -- say so loudly
+      // instead of silently.
+      if (settings_args.empty()) {
+        REXLOG_WARN("settings.txt: missing or empty under {} -- running on "
+                    "SDK defaults (all present modes allowed; on Mali this "
+                    "selects MAILBOX)",
+                    external_dir);
+      } else {
+        REXLOG_INFO("settings.txt: {} lines applied from {}; effective "
+                    "present modes: immediate={} mailbox={} fifo_relaxed={}",
+                    settings_args.size(), external_dir,
+                    REXCVAR_GET(vulkan_allow_present_mode_immediate),
+                    REXCVAR_GET(vulkan_allow_present_mode_mailbox),
+                    REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed));
+      }
       result = app_context.RunMainMessageLoop();
     } else {
       REXLOG_ERROR("OnInitialize failed - see earlier errors");
