@@ -2014,7 +2014,17 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                   (VkDeviceSize(etc2_bytes_per_block) *
                    ((uint64_t(bz) * y_blocks + by) * x_blocks + bx));
               if (is_etc2_rgba) {
-                etc2::DecodeBc3Block(guest_block, pixels);
+                // (Hunt v1.4.6 ronda 20, A1-R20-02.) BC2 (DXT3) transcodes
+                // to ETC2 RGBA8 too: same 16 bytes/block as BC3, explicit
+                // 4-bit alpha + BC1 color block (DecodeBc2Block). The
+                // dispatch is on the GUEST format, not the target: both
+                // BC2 and BC3 land on ETC2 RGBA8.
+                if (guest_format == xenos::TextureFormat::k_DXT2_3 ||
+                    guest_format == xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16) {
+                  etc2::DecodeBc2Block(guest_block, pixels);
+                } else {
+                  etc2::DecodeBc3Block(guest_block, pixels);
+                }
                 etc2::EncodeEtc2Rgba8(pixels, etc2_block);
               } else {
                 etc2::DecodeBc1Block(guest_block, pixels);
@@ -3578,12 +3588,14 @@ bool VulkanTextureCache::Initialize() {
   // TODO(Triang3l): Raise the host texture memory usage limit if S3TC has to be
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
-  // (Run #11, F3, point 6.) S3TC -> ETC2 is done for DXT1 (opaque) and DXT5
-  // below: when the BC format is not linear-filterable, the texture is
-  // transcoded on the CPU to ETC2 at load time instead of being decompressed
-  // to RGBA8, keeping the 4x memory saving. DXT3, DXN and DXT5A still use the
-  // RGBA8 compute fallback (DXT3 has explicit alpha per texel, DXN/DXT5A are
-  // single/dual-channel and have no ETC2 equivalent worth the transcode).
+  // (Run #11, F3, point 6.) S3TC -> ETC2 is done for DXT1 (opaque), DXT3
+  // and DXT5 below: when the BC format is not linear-filterable, the
+  // texture is transcoded on the CPU to ETC2 at load time instead of being
+  // decompressed to RGBA8, keeping the 4x memory saving. DXN and DXT5A
+  // still use the uncompressed fallback: single/dual-channel formats need
+  // EAC R11/RG11, and there is no EAC encoder in etc2_encode.h yet
+  // (Hunt v1.4.6 ronda 20, A1-R20-02: DXT3/BC2 now transcodes to ETC2
+  // RGBA8, same 16 bytes/block as BC3 with explicit 4-bit alpha).
   // One-shot diagnostic for BC fallbacks: decompressing BC textures to RGBA8
   // multiplies texture memory and re-upload bandwidth 4x (and adds a compute
   // decode pass on every invalidation). On mobile this alone can dominate
@@ -3651,12 +3663,28 @@ bool VulkanTextureCache::Initialize() {
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
                                           &format_properties);
   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    log_bc_fallback("k_DXT2_3", VK_FORMAT_BC2_UNORM_BLOCK,
-                    format_properties.optimalTilingFeatures);
-    host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
-    host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt2_3.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    if (etc2_rgba8_supported) {
+      // Same 16 bytes per 4x4 block as BC3: the transcode is a block-for-block
+      // replacement, no buffer resizing anywhere. BC2's explicit 4-bit alpha
+      // and BC1 color block decode with DecodeBc2Block (etc2_encode.h) and
+      // re-encode to ETC2 RGBA8, exactly like DXT4_5 below.
+      // (Hunt v1.4.6 ronda 20, A1-R20-02.)
+      REXGPU_INFO(
+          "VulkanTextureCache: Transcoding k_DXT2_3 to ETC2 "
+          "(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) on the CPU because BC2 is not "
+          "linear-filterable on this device");
+      host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndex128bpb;
+      host_format_dxt2_3.format_unsigned.format = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+      host_format_dxt2_3.format_unsigned.block_compressed = true;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    } else {
+      log_bc_fallback("k_DXT2_3", VK_FORMAT_BC2_UNORM_BLOCK,
+                      format_properties.optimalTilingFeatures);
+      host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
+      host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt2_3.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    }
   }
   HostFormatPair& host_format_dxt4_5 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5)];
   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
