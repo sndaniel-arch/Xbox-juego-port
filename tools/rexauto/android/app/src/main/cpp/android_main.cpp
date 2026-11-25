@@ -128,9 +128,75 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
       if (env_count) ++(*env_count);
       continue;
     }
-    out.emplace_back("--" + line);
+    // (Hunt v1.4.6 ronda 18, A4-R18-03.) A value wrapped in one pair of
+    // matching quotes ("xenos", 'xenos') is not a value with quotes in
+    // it: the extra box has no shell, so nothing ever strips them, and
+    // CLI11 receives the quotes as part of the value -- gpu_plugin=
+    // "xenos" fails the plugin lookup (black screen, verified against
+    // the vendored CLI11: the stored value keeps both quote characters).
+    // Strip one matching pair; an unbalanced quote is left alone, and a
+    // value that is only quotes ("" / '') falls through to the empty
+    // check below and is skipped there.
+    std::string value = line.substr(eq + 1);
+    if (value.size() >= 2) {
+      const char q = value.front();
+      if ((q == '"' || q == '\'') && value.back() == q) {
+        ALOGW("settings.txt: stripped quotes from the value of '%s'",
+              line.substr(0, eq).c_str());
+        value = value.substr(1, value.size() - 2);
+      }
+    }
+    // (Hunt v1.4.6 ronda 18, A4-R18-01.) An empty value is NOT "reset to
+    // default": CLI11 reads "--key=" as "--key" with the value still to
+    // come, so it eats the NEXT argv element as this key's value
+    // (verified against the vendored CLI11: "--gpu_plugin=" swallows
+    // "--log_flush_interval=1" as the plugin name, and
+    // "--log_flush_interval=" swallows
+    // "--vulkan_async_skip_incomplete_frames=false", leaving async_skip
+    // at its SDK default true = guest 0.0 fps), and as the LAST arg it
+    // throws "1 required TEXT missing", aborting the whole parse with no
+    // cvar applied at all (no gpu_plugin -> black screen, license_mask 0
+    // -> DLCs off). A "--bool=" line is just as bad in the other
+    // direction: a flag with an empty value counts as a bare flag, i.e.
+    // true ("--vulkan_async_skip_incomplete_frames=" freezes the guest).
+    // Skip the line with a warning and keep the earlier value (mobile
+    // default or an earlier settings line). env.* lines are exempt:
+    // setenv(NAME, "") is meaningful -- REX_HEAL_DISCOVER is read as
+    // presence, and REX_FPS_CAP="" parses to 0 and is ignored.
+    if (value.empty()) {
+      ALOGW("settings.txt: ignoring '%s' (empty value; delete the line to use the default)",
+            line.substr(0, eq).c_str());
+      continue;
+    }
+    out.emplace_back("--" + line.substr(0, eq + 1) + value);
   }
   return out;
+}
+
+// (Hunt v1.4.6 ronda 18, A4-R18-02.) Whether a string is a value CLI11's
+// to_flag_value accepts as a bool literal: "true"/"false" (matched
+// case-insensitively, as to_flag_value lowercases before comparing),
+// on/off/yes/no/enable/disable, single letters t/y/+/f/n/-, and single
+// digits 0/1. Multi-digit numbers are deliberately NOT in the set:
+// to_flag_value accepts them, but a "--no-<int-key>=5" line is nonsense
+// input, and keeping the "no-" key distinct is the safe side for it
+// (the un-stripped form is a harmless unknown option to CLI11).
+bool IsBoolLiteral(const std::string& v) {
+  size_t b = 0, e = v.size();
+  while (b < e && (v[b] == ' ' || v[b] == '\t')) ++b;
+  while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t')) --e;
+  std::string lower;
+  for (size_t i = b; i < e; ++i) lower += char(std::tolower(static_cast<unsigned char>(v[i])));
+  if (lower == "true" || lower == "false" || lower == "on" || lower == "off" ||
+      lower == "yes" || lower == "no" || lower == "enable" || lower == "disable") {
+    return true;
+  }
+  if (lower.size() == 1) {
+    const char c = lower[0];
+    return (c >= '0' && c <= '1') || c == 't' || c == 'y' || c == '+' || c == 'f' ||
+           c == 'n' || c == '-';
+  }
+  return false;
 }
 
 // (Hunt v1.4.6, R-A-M4.) Warn about settings.txt lines whose key names no
@@ -948,7 +1014,23 @@ int RunAndroidApp() {
       if (a.size() > 2 && a[0] == '-' && a[1] == '-') {
         const size_t eq = a.find('=');
         std::string key = a.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
-        if (key.rfind("no-", 0) == 0) key.erase(0, 3);
+        // (Hunt v1.4.6 ronda 18, A4-R18-02.) Only treat "--no-key" as the
+        // same key as "--key" when it can BE a bool negation: a bare
+        // "--no-key", or "--no-key=<bool literal>". The "--no-" form only
+        // exists for bool flags (cvar.cpp registers "--key,!--no-key");
+        // for a string/int key it is an unknown option CLI11 would stash
+        // as an extra and ignore -- but the unconditional strip above
+        // collapsed it onto the real key, so "--gpu_plugin=xenos" plus
+        // "--no-gpu_plugin=turnip" kept ONLY the unknown form and
+        // gpu_plugin was never set (verified against the vendored CLI11:
+        // black screen). A value that is not a bool literal (a name, a
+        // path, a multi-digit number) cannot be a flag value, so the
+        // "--no-" form keeps its own key and passes through as a harmless
+        // unknown instead of swallowing the real one.
+        if (key.rfind("no-", 0) == 0 &&
+            (eq == std::string::npos || IsBoolLiteral(a.substr(eq + 1)))) {
+          key.erase(0, 3);
+        }
         if (key.empty()) {
           deduped.emplace_back(a);
           continue;
