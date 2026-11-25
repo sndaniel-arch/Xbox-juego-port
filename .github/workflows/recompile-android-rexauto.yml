@@ -89,7 +89,10 @@
 #     CI_KEYSTORE_KEY_PASSWORD (+ CI_KEYSTORE_KEY_ALIAS, opcional) antes
 #     del primer run de producción. (CI_KEYSTORE_PASSWORD es legado,
 #     no se usa: ver §4.)
-#   - Title ID a confirmar con el dump (citado 5841140D, no verificado).
+#   - Title ID 5841140D, verificado contra el dump (STFS header @0x360;
+#     ronda 20, A5-R20-03: el mismo offset que StfsAsset.verifyUsable
+#     lee en runtime; el metodo se valido reproduciendo los content
+#     IDs de DLC_TABLE desde @0x32C).
 #   - Jump tables: el CI salta jumptables siempre (--no-jumptables, no hay IDA).
 #   - Verificar tools/localize_fix_col.py sobre codigo generado REAL del SDK:
 #     el script YA esta adaptado a la sintaxis del SDK (DEFINE_REX_FUNC /
@@ -327,7 +330,27 @@ jobs:
           # TypeError), and an unpinned --upgrade installs 6.x, which
           # REMOVED fuzzy (run #3 died on the same TypeError). Verified
           # against the real wheels: 6.5.1 has no fuzzy, 5.2.0 has it.
-          python -m pip install -q --upgrade pip "pillow==13.0.0" "gdown==5.2.0"
+          # (Hunt v1.4.6, ronda 20, A5-R20-01.) This pip install had no
+          # retry: a transient PyPI failure killed the run here, before
+          # codegen, with no second chance -- while every other network
+          # fetch in this workflow retries (apt x3, sdkmanager x3, SDK
+          # install x3, game input x3, Stage assets pillow x3 since
+          # A5-R19-07). "Python deps" was the last bare network install
+          # left. Retry 3 times, sleep 10 (same shape as the Stage
+          # assets pillow loop; the while/$attempt skeleton is the one
+          # the SDK install and game input loops in this same file use).
+          # The $LASTEXITCODE check below (A5-R4-02) still runs after
+          # the loop as a backstop: the loop itself exits 1 on the 3rd
+          # failure, so the check only ever sees 0.
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            python -m pip install -q --upgrade pip "pillow==13.0.0" "gdown==5.2.0"
+            if ($LASTEXITCODE -eq 0) { Write-Host "pip install OK (attempt $attempt)"; break }
+            if ($attempt -ge 3) { Write-Host "::error::pip install failed after 3 attempts"; exit 1 }
+            Write-Host "::warning::pip install attempt $attempt failed, retrying in 10s..."
+            Start-Sleep -Seconds 10
+          }
           # (A5-R4-02, ronda 4.) pwsh only reports the LAST native
           # command's exit code ($LASTEXITCODE): a failed pip install used
           # to be masked by the import below succeeding against the
@@ -389,7 +412,19 @@ jobs:
         timeout-minutes: 30
         with:
           path: rexauto/rexglue
-          key: rexglue-sdk-${{ env.REXGLUE_BUNDLE_SHA256 }}-${{ hashFiles('rexauto/rexauto.py') }}-${{ steps.sdk.outputs.url }}
+          # (Hunt v1.4.6, ronda 20, A5-R20-04.) The key used to name
+          # rexauto.py as the rexauto input, but rexauto.py is not in the
+          # SDK install path (ci_sdk.py cmd_install imports setup only;
+          # only cmd_verify imports rexauto) -- the installed tree is
+          # laid out by gui/setup.py:_lay_out_sdk from the bundle. A pin
+          # bump that touched only setup.py (or ci_sdk.py) served the
+          # previous tree: same key, cache-hit, install skipped, and the
+          # marker check still passed (the marker is only the bundle
+          # SHA). Key on the pin itself (any upstream change invalidates)
+          # plus the two files that determine the install. One cache
+          # miss on the first run with the new key; the reinstall is
+          # the price of the corrected key.
+          key: rexglue-sdk-${{ env.REXGLUE_BUNDLE_SHA256 }}-${{ env.REXAUTO_REF }}-${{ hashFiles('rexauto/gui/setup.py', 'rexauto/tools/ci_sdk.py') }}-${{ steps.sdk.outputs.url }}
 
       - name: Verify ReXGlue SDK bundle SHA-256
         if: steps.sdk-cache.outputs.cache-hit != 'true'
@@ -977,6 +1012,22 @@ jobs:
           $tomlIn = @(Get-ChildItem $port -File -Filter *.toml).Count
           $tomlOut = @(Get-ChildItem $out -File -Filter *.toml).Count
           if ($tomlOut -ne $tomlIn) { Write-Host "::error::pack copy failed: $tomlOut of $tomlIn *.toml files reached $out"; exit 1 }
+          # (Hunt v1.4.6, ronda 20, A5-R20-02.) Same hole A5-R14-02
+          # closed for generated/ and *.toml, one cargo short: src/ was
+          # only proven by test -f src/main.cpp, so a failed Copy-Item
+          # of another src/ file shipped a partial port-src.zip -- and
+          # job 2 ("Unpack port") also only tests src/main.cpp, so the
+          # loss surfaced only at CMake compile, a job later, with a
+          # confusing error. (The R14-02 comment above already names
+          # "src/ files" among the cargos a failed copy could lose; no
+          # count ever enforced it.) src/ has 4 files (main.cpp +
+          # childoflight_app.h, included by main.cpp, + childoflight.ico
+          # + childoflight.rc); count them like the other two cargos.
+          # No hardcoded 4: the check compares source vs copy, so it
+          # holds whatever the init stage authors.
+          $srcIn = @(Get-ChildItem "$port\src" -Recurse -File).Count
+          $srcOut = @(Get-ChildItem "$out\src" -Recurse -File).Count
+          if ($srcOut -ne $srcIn) { Write-Host "::error::pack copy failed: $srcOut of $srcIn files under src/ reached $out"; exit 1 }
           # sources.cmake is ${CMAKE_CURRENT_LIST_DIR}-relative -> relocatable as-is
           Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
           Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
@@ -1218,17 +1269,26 @@ jobs:
           cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java
           cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java
           cp tools/rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java
+          # (Hunt v1.4.6, ronda 20, A4-R20-04b, enmienda del coordinador.)
+          # HIDDeviceUSB.java becomes tracked in this same round (A4-R20-04:
+          # null/empty guard in writeReport/readReport). Without this line
+          # android_sdk.sh would stage the STOCK SDL3 glue over the new
+          # tracked file and the fix would never reach the APK -- same
+          # pattern as SDLAudioManager in R12 (A5-R12-01).
+          cp tools/rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceUSB.java rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceUSB.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java
           test -f rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java
+          test -f rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceUSB.java
           grep -q "Hunt v1.4.6 ronda 4, A4-R4-01" rexauto/android/app/src/main/java/org/libsdl/app/SDLActivity.java || { echo "::error::SDLActivity.java lost the onDestroy fix (A4-R4-01) -- the tracked file no longer carries it"; exit 1; }
           grep -q "Hunt v1.4.6 ronda 9, A4-R9-04" rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java || { echo "::error::HIDDeviceBLESteamController.java lost the GATT fixes (A4-R9-03/04/05/06) -- the tracked file no longer carries them"; exit 1; }
           grep -q "Hunt v1.4.6 ronda 11, A4-R11-02" rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceManager.java || { echo "::error::HIDDeviceManager.java lost the USB-handler fix (A4-R11-02) -- the tracked file no longer carries it"; exit 1; }
           grep -q "Hunt v1.4.6 ronda 11, A4-R11-05" rexauto/android/app/src/main/java/org/libsdl/app/SDLControllerManager.java || { echo "::error::SDLControllerManager.java lost the pollInputDevices null-guard (A4-R11-05) -- the tracked file no longer carries it"; exit 1; }
           grep -q "Hunt v1.4.6 ronda 11, A4-R11-06" rexauto/android/app/src/main/java/org/libsdl/app/SDLSurface.java || { echo "::error::SDLSurface.java lost the enableSensor null-guard (A4-R11-06) -- the tracked file no longer carries it"; exit 1; }
           grep -q "Hunt v1.4.6 ronda 12, A4-R12-02" rexauto/android/app/src/main/java/org/libsdl/app/SDLAudioManager.java || { echo "::error::SDLAudioManager.java lost the getProductName null-guard (A4-R12-02) -- the tracked file no longer carries it"; exit 1; }
+          grep -q "Hunt v1.4.6 ronda 20, A4-R20-04" rexauto/android/app/src/main/java/org/libsdl/app/HIDDeviceUSB.java || { echo "::error::HIDDeviceUSB.java lost the null/empty guard (A4-R20-04) -- the tracked file no longer carries it"; exit 1; }
 
       - name: Guard tracked SDK files carry their patch hunks (M-5)
         timeout-minutes: 10
@@ -1461,6 +1521,25 @@ jobs:
           # Hunt 2, P2-6: un Title ID 00000000 (fallback) enmascararia que
           # title_meta.py no produjo nada; la APK rechazaría el juego.
           if [ -z "${REX_TITLE_ID:-}" ] || [ "$REX_TITLE_ID" = "00000000" ]; then echo "::error::REX_TITLE_ID is empty or 00000000 -- title_meta.py produced nothing"; exit 1; fi
+          # (Hunt v1.4.6, ronda 20, A5-R20-03.) The check above only
+          # proves title_meta.py produced SOMETHING nonzero: a wrong
+          # nonzero Title ID (wrong ISO dispatched without iso_sha256,
+          # or a misparse in title_meta.py, which swallows every data
+          # error and degrades) shipped a CI APK that every gate passed
+          # -- and the app refuses it at startup (StfsAsset.verifyUsable
+          # reads the STFS header Title ID @0x360 and returns false on
+          # mismatch; SetupActivity.checkXexTitle throws err_wrong_game).
+          # The FULL hardcodes -PrexTitleId=5841140D, but nothing ever
+          # compared CI's derived value against it. 5841140D is the
+          # dump's own Title ID, read from the game STFS header @0x360
+          # (method validated: the same read at @0x32C reproduces the
+          # DLC_TABLE content IDs exactly, and the title DB maps
+          # 5841140D to "Child of Light"). Require it here, before
+          # Gradle, and require a real title, not the "Xbox 360 Game"
+          # fallback title_meta.py degrades to (with the right Title ID
+          # the DB lookup yields "Child of Light").
+          if [ "$REX_TITLE_ID" != "5841140D" ]; then echo "::error::REX_TITLE_ID is $REX_TITLE_ID, expected 5841140D (Child of Light -- read from the game STFS header @0x360; the FULL hardcodes the same value). Wrong ISO dispatched, or title_meta.py misparsed the dump"; exit 1; fi
+          if [ "${REX_TITLE:-}" = "Xbox 360 Game" ]; then echo "::error::REX_TITLE is the generic fallback 'Xbox 360 Game' -- title_meta.py produced no title (expected 'Child of Light' from the title DB)"; exit 1; fi
           if [ "${{ inputs.baseline_arm }}" = "true" ]; then export REX_ANDROID_BASELINE_ARM=1; fi
           cd rexauto/android
           chmod +x gradlew
