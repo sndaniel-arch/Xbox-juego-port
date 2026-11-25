@@ -879,8 +879,10 @@ jobs:
           # state-2 handler sub_824C5150 and the state-4 branch of
           # sub_824C4B70. The guard recreates the sub-object exactly as
           # sub_824C4FD8 would (Alloc(60,66) + Ctor sub_8242EAC8) and, if
-          # the Alloc fails again, skips the block without crashing (state
-          # 2 retries next frame). The script FAILS the job when an anchor
+          # the Alloc fails again, skips the block without crashing (ronda
+          # 18, A2-R18-02: sub_824C5150 is the state-3 once-hook, not the
+          # state-2 per-frame function -- the skip re-arms its once-flag
+          # so it retries next frame). The script FAILS the job when an anchor
           # does not match verbatim, so a codegen change cannot silently
           # ship unguarded code. The marker count below is the per-file
           # tripwire that the guard actually landed in the packed tree:
