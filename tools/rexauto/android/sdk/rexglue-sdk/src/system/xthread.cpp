@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 
 #include <fmt/format.h>
 
@@ -1039,7 +1040,22 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     timeout_ms = 0;
   } else if (timeout_ticks < 0) {
     // Relative time.
-    timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
+    // (Hunt v1.4.6, ronda 18, A3-R18-01.) Same truncation as
+    // XObject::TimeoutTicksToMs (A3-R17-02): -timeout_ticks / 10000 can
+    // exceed UINT32_MAX for a relative wait past ~49.7 days, and the
+    // uint32_t cast then wraps it to a short (even 0 ms) wait. Clamp it
+    // instead, mirroring the absolute branch of TimeoutTicksToMs.
+    // INT64_MIN is the infinite-wait sentinel a guest may pass (see
+    // A3-R15-03): -INT64_MIN is signed overflow (UB). Clamp it to the
+    // longest representable wait.
+    if (timeout_ticks == std::numeric_limits<int64_t>::min()) {
+      timeout_ms = UINT32_MAX;
+    } else {
+      uint64_t relative_ms = static_cast<uint64_t>(-timeout_ticks) / 10000;
+      timeout_ms = relative_ms > UINT32_MAX
+                       ? UINT32_MAX
+                       : static_cast<uint32_t>(relative_ms);
+    }
   } else {
     timeout_ms = 0;
   }
