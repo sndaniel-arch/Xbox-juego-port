@@ -891,15 +891,30 @@ jobs:
           # total. Counted per file, not globally: a global >= 4 would also
           # pass if a future script change moved markers between files,
           # and the old comment ("2 per guarded file") was wrong for
-          # .90.cpp. (Ronda 16, A5-R16-02.)
+          # .90.cpp. (Ronda 16, A5-R16-02.) (Ronda 17, A2-R17-01/A2-R17-02:
+          # the same nullable +156 field is used unchecked in 9 more
+          # sites, so the guard now covers 8 more files -- .32.cpp carries
+          # 3 (DECLARE + 2 guard comments in sub_824C4D70, same `this`)
+          # and each of .129/.86/.136/.184/.128/.98/.50.cpp carries 2
+          # (DECLARE + 1 guard comment: sub_824C8940, sub_824C8018,
+          # sub_824C9A60, sub_82A60450, sub_824C9DA8, sub_82A60C40,
+          # sub_824C99D8) -- 22 markers in total, still per file.)
           $gen = "$env:REXAUTO_WORK\${{ env.REX_PROJECT }}\port\generated\default"
           python "$env:GITHUB_WORKSPACE\tools\guard_r15_col.py" "$gen\childoflight_recomp.*.cpp"
           $guardRc = $LASTEXITCODE
           $marks90 = @(Select-String -Path "$gen\childoflight_recomp.90.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           $marks46 = @(Select-String -Path "$gen\childoflight_recomp.46.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks32 = @(Select-String -Path "$gen\childoflight_recomp.32.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks129 = @(Select-String -Path "$gen\childoflight_recomp.129.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks86 = @(Select-String -Path "$gen\childoflight_recomp.86.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks136 = @(Select-String -Path "$gen\childoflight_recomp.136.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks184 = @(Select-String -Path "$gen\childoflight_recomp.184.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks128 = @(Select-String -Path "$gen\childoflight_recomp.128.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks98 = @(Select-String -Path "$gen\childoflight_recomp.98.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
+          $marks50 = @(Select-String -Path "$gen\childoflight_recomp.50.cpp" -Pattern "GUARD_R15_A2-R15-01").Count
           if ($guardRc -ne 0) { exit $guardRc }
-          if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150) and $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70)"; exit 1 }
-          Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70)"
+          if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2 -or -not $marks32 -or $marks32 -lt 3 -or -not $marks129 -or $marks129 -lt 2 -or -not $marks86 -or $marks86 -lt 2 -or -not $marks136 -or $marks136 -lt 2 -or -not $marks184 -or $marks184 -lt 2 -or -not $marks128 -or $marks128 -lt 2 -or -not $marks98 -or $marks98 -lt 2 -or -not $marks50 -or $marks50 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150), $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70), $marks32 in childoflight_recomp.32.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C4D70), $marks129 in .129.cpp, $marks86 in .86.cpp, $marks136 in .136.cpp, $marks184 in .184.cpp, $marks128 in .128.cpp, $marks98 in .98.cpp, $marks50 in .50.cpp (each expected >= 2: DECLARE + 1 guard comment)"; exit 1 }
+          Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70) + $marks32 in .32.cpp (sub_824C4D70) + $marks129 in .129.cpp (sub_824C8940) + $marks86 in .86.cpp (sub_824C8018) + $marks136 in .136.cpp (sub_824C9A60) + $marks184 in .184.cpp (sub_82A60450) + $marks128 in .128.cpp (sub_824C9DA8) + $marks98 in .98.cpp (sub_82A60C40) + $marks50 in .50.cpp (sub_824C99D8)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
