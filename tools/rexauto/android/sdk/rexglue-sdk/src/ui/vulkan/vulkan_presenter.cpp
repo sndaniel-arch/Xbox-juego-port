@@ -2057,24 +2057,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         VkRect2D guest_output_scissor;
         guest_output_scissor.offset.x = 0;
         guest_output_scissor.offset.y = 0;
-        // (Caza v1.4.6 ronda 15, A1-R15-02.) Window-space size of the
-        // surface: the guest output rectangles and the letterbox clears
-        // below are in window space, while paint_context_.swapchain_extent
-        // is in buffer (pre-transformed) space. With a 90/270-degree
-        // pre-transform the window is the extent with width/height
-        // swapped (e.g. 1080x2340 extent <-> 2340x1080 window); for
-        // identity/180 the window is the extent itself.
-        const bool swapchain_pre_transform_swaps_extent =
-            paint_context_.swapchain_pre_transform ==
-                VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
-            paint_context_.swapchain_pre_transform ==
-                VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
-        const uint32_t surface_window_width = swapchain_pre_transform_swaps_extent
-                                                  ? paint_context_.swapchain_extent.height
-                                                  : paint_context_.swapchain_extent.width;
-        const uint32_t surface_window_height = swapchain_pre_transform_swaps_extent
-                                                   ? paint_context_.swapchain_extent.width
-                                                   : paint_context_.swapchain_extent.height;
+        // (Caza v1.4.6 ronda 15, A1-R15-02; ronda 17, A1-R17-01.)
+        // Window-space size of the surface: the guest output rectangles
+        // and the letterbox clears below are in window space, while
+        // paint_context_.swapchain_extent is in buffer (pre-transformed)
+        // space. Take the window size from the paint connection
+        // (surface_width/height_in_paint_connection_), the same source
+        // GetGuestOutputPaintFlow above is fed as host render target:
+        // deriving it back from the swapchain extent (swap w/h on a
+        // 90/270-degree pre-transform) is only equal to the window when
+        // the extent was not clamped to min/maxImageExtent or the
+        // maximum framebuffer extent at creation, and a stale swapchain
+        // would give a stale window here while the flow already uses
+        // the new one. On this phone both sources agree (1080x2340
+        // extent <-> 2340x1080 window), so this is a no-op here.
+        const uint32_t surface_window_width = surface_width_in_paint_connection_;
+        const uint32_t surface_window_height = surface_height_in_paint_connection_;
         if (guest_output_flow.effect_count > 1) {
           paint_context_.guest_output_intermediate_image_last_submission =
               current_paint_submission_index;
