@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -113,38 +114,127 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
   std::ifstream in(path, std::ios::binary);
   if (!in) return out;
   std::string line;
+  bool first_line = true;
   while (std::getline(in, line)) {
     while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+    // (Hunt v1.4.6 ronda 19, A4-R19-02.) A UTF-8 BOM (EF BB BF) at the
+    // start of the file -- what Windows editors write when a hand-edited
+    // settings.txt is saved as UTF-8 -- used to become part of the first
+    // line's key ("--\xEF\xBB\xBFgpu_plugin=xenos"), an unknown option
+    // CLI11 stashed and ignored, so the first line silently never
+    // applied. Strip it once, on the first line only: a BOM is a file
+    // header, never line content. Verified against the real
+    // ReadSettingsArgs: the BOM'd first line reached argv with the BOM
+    // bytes in the key.
+    if (first_line) {
+      first_line = false;
+      if (line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
+    }
+    // (Hunt v1.4.6 ronda 19, A4-R19-01.) Leading blanks are not part of
+    // the key: " resolution_scale=2" used to reach CLI11 as
+    // "-- resolution_scale=2", an unknown option that was silently
+    // ignored, and "  # comment" was warned about as malformed instead
+    // of skipped as a comment. A "--" prefix is not part of the key
+    // either: the file format is "key=value" (this function adds the
+    // "--"), so "--gpu_plugin=xenos" used to arrive as
+    // "----gpu_plugin=xenos" and was silently ignored too.
+    const size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos) continue;
+    if (first > 0) line.erase(0, first);
+    if (line.rfind("--", 0) == 0) line.erase(0, 2);
     if (line.empty() || line[0] == '#') continue;
     const auto eq = line.find('=');
     if (eq == std::string::npos || eq == 0) {
       ALOGW("settings.txt: ignoring malformed line '%s' (expected key=value)", line.c_str());
       continue;
     }
-    if (line.rfind("env.", 0) == 0) {
-      // env.NAME=value -> setenv(NAME, value); consumed by getenv() readers
-      // such as the tolerant dispatcher (REX_HEAL_DISCOVER).
-      setenv(line.substr(4, eq - 4).c_str(), line.substr(eq + 1).c_str(), 1);
-      if (env_count) ++(*env_count);
+    // (Hunt v1.4.6 ronda 19, A4-R19-01.) Blanks around the key are not
+    // part of it: "resolution_scale =2" used to reach CLI11 as
+    // "--resolution_scale =2", an unknown option that was silently
+    // ignored (and " env.FOO=1" setenv'd " FOO"). The key is empty
+    // after the trim only for the "--=value" spelling, whose "--" strip
+    // above leaves an empty key; plain "=value" is already rejected by
+    // the check above.
+    std::string key = line.substr(0, eq);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+    if (key.empty()) {
+      ALOGW("settings.txt: ignoring malformed line '%s' (expected key=value)", line.c_str());
       continue;
     }
-    // (Hunt v1.4.6 ronda 18, A4-R18-03.) A value wrapped in one pair of
-    // matching quotes ("xenos", 'xenos') is not a value with quotes in
-    // it: the extra box has no shell, so nothing ever strips them, and
-    // CLI11 receives the quotes as part of the value -- gpu_plugin=
-    // "xenos" fails the plugin lookup (black screen, verified against
-    // the vendored CLI11: the stored value keeps both quote characters).
+    // The value, normalised once and shared by the env.* branch below
+    // and the cvar branch after it, so both read the same value.
+    // Leading blanks are not part of it: "gpu_plugin= xenos" used to
+    // store " xenos" (the plugin lookup failed: black screen), and
+    // "vulkan_async_skip_incomplete_frames= true" was applied as false
+    // by CLI11 (verified against the vendored CLI11: to_flag_value
+    // returns 0 for a value with a leading blank).
+    std::string value = line.substr(eq + 1);
+    const size_t vfirst = value.find_first_not_of(" \t");
+    if (vfirst == std::string::npos) {
+      value.clear();
+    } else if (vfirst > 0) {
+      value.erase(0, vfirst);
+    }
+    // (Hunt v1.4.6 ronda 19, A4-R19-01.) An unquoted trailing comment
+    // ("key=value # why") is not part of the value: a bool with one was
+    // applied as false by CLI11 ("vulkan_async_skip_incomplete_frames=
+    // true # warmup" froze the guest: to_flag_value("true # warmup")
+    // is 0) and a string kept the suffix ("gpu_plugin=xenos # use
+    // xenos" failed the plugin lookup). Only a "#" preceded by a blank
+    // starts a comment, so "a#b" survives; a value that IS a comment
+    // ("key= # ...") is empty and falls through to the empty check
+    // below. A "#" inside quotes is data: for a quoted value only a
+    // comment AFTER the closing quote is dropped, so the R18-03 strip
+    // below still sees the pair.
+    if (!value.empty() && (value.front() == '"' || value.front() == '\'')) {
+      const char q = value.front();
+      const size_t close = value.find(q, 1);
+      if (close != std::string::npos) {
+        const std::string rest = value.substr(close + 1);
+        const size_t rfirst = rest.find_first_not_of(" \t");
+        if (rfirst == std::string::npos || rest[rfirst] == '#') {
+          value.erase(close + 1);
+        }
+      }
+    } else if (!value.empty() && value.front() == '#') {
+      value.clear();
+    } else {
+      const size_t hash = value.find('#');
+      if (hash != std::string::npos && hash > 0 &&
+          (value[hash - 1] == ' ' || value[hash - 1] == '\t')) {
+        value.erase(hash);
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
+      }
+    }
+    // (Hunt v1.4.6 ronda 18, A4-R18-03, moved before the env.* branch in
+    // ronda 19, A4-R19-01.) A value wrapped in one pair of matching
+    // quotes ("xenos", 'xenos') is not a value with quotes in it: the
+    // extra box has no shell, so nothing ever strips them, and CLI11
+    // receives the quotes as part of the value -- gpu_plugin= "xenos"
+    // fails the plugin lookup (black screen, verified against the
+    // vendored CLI11: the stored value keeps both quote characters).
     // Strip one matching pair; an unbalanced quote is left alone, and a
     // value that is only quotes ("" / '') falls through to the empty
-    // check below and is skipped there.
-    std::string value = line.substr(eq + 1);
+    // check below and is skipped there. It runs here, before the env.*
+    // branch, so an env value gets the same unquoting: env.REX_FPS_CAP=
+    // "30" used to setenv the quotes, and atof("\"30\"") is 0.
     if (value.size() >= 2) {
       const char q = value.front();
       if ((q == '"' || q == '\'') && value.back() == q) {
         ALOGW("settings.txt: stripped quotes from the value of '%s'",
-              line.substr(0, eq).c_str());
+              key.c_str());
         value = value.substr(1, value.size() - 2);
       }
+    }
+    if (key.rfind("env.", 0) == 0) {
+      // env.NAME=value -> setenv(NAME, value); consumed by getenv() readers
+      // such as the tolerant dispatcher (REX_HEAL_DISCOVER).
+      std::string env_name = key.substr(4);
+      const size_t efirst = env_name.find_first_not_of(" \t");
+      if (efirst != std::string::npos) env_name.erase(0, efirst);
+      setenv(env_name.c_str(), value.c_str(), 1);
+      if (env_count) ++(*env_count);
+      continue;
     }
     // (Hunt v1.4.6 ronda 18, A4-R18-01.) An empty value is NOT "reset to
     // default": CLI11 reads "--key=" as "--key" with the value still to
@@ -165,10 +255,10 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
     // presence, and REX_FPS_CAP="" parses to 0 and is ignored.
     if (value.empty()) {
       ALOGW("settings.txt: ignoring '%s' (empty value; delete the line to use the default)",
-            line.substr(0, eq).c_str());
+            key.c_str());
       continue;
     }
-    out.emplace_back("--" + line.substr(0, eq + 1) + value);
+    out.emplace_back("--" + key + "=" + value);
   }
   return out;
 }
@@ -210,14 +300,247 @@ void LogUnknownSettingsCvars(const std::vector<std::string>& settings_args) {
   for (const auto& arg : settings_args) {
     if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') continue;
     const auto eq = arg.find('=');
-    const std::string name =
+    std::string name =
         arg.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+    if (name.empty()) continue;
+    // (Hunt v1.4.6 ronda 19, A4-R19-03.) A "--no-key" line names the
+    // key with its negation prefix: without the strip every legitimate
+    // negation warned spuriously about a cvar named "no-key". Look the
+    // base key up; an unknown base still warns, under its own name.
+    if (name.rfind("no-", 0) == 0) name.erase(0, 3);
     if (name.empty()) continue;
     if (!rex::cvar::GetFlagInfo(name)) {
       REXLOG_WARN("settings.txt: no cvar named '{}' is registered yet "
                   "(typo? the line has no effect unless a cvar with that "
                   "name registers later)",
                   name);
+    }
+  }
+}
+
+// (Hunt v1.4.6 ronda 19, A4-R19-03.) What CLI11's to_flag_value (vendored
+// CLI11 TypeTools.hpp) makes of a bool value: exact true/false (any case),
+// on/off/yes/no/enable/disable, single letters t/y/+ /f/n/- and single
+// digits 0/1, or any integer (strtoll base 0, so "2" and "0x10" count as
+// true, "-1" as false). Anything else yields a count of 0 -- the flag is
+// applied as false -- with no diagnostic from CLI11 or from the cvar
+// setter (the bool setter always returns true). A number with trailing
+// junk ("1.5", "2x") applies as its numeric prefix, which is still not a
+// bool literal. CLI11 trims TRAILING blanks from the value ("true "
+// applies as true) but not leading ones (" true" applies as false), so
+// only trailing blanks are trimmed here. Verified against the vendored
+// CLI11: "maybe", "tru", "yesplease", "enabled", " true" and
+// "true # comment" all apply as false; "1.5" and "2x" apply as true; a
+// single unknown letter ("q") applies as false; none of them throws, so
+// the parse continues and the wrong value is silent. `recognised` is
+// false for those; `applies_true` is what the flag ends up as.
+bool SettingsBoolAppliesAs(const std::string& v, bool& applies_true, bool& recognised) {
+  std::string t = v;
+  while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+  std::string lower;
+  for (char c : t) lower += char(std::tolower(static_cast<unsigned char>(c)));
+  if (lower == "true" || lower == "on" || lower == "yes" || lower == "enable") {
+    applies_true = true;
+    recognised = true;
+    return true;
+  }
+  if (lower == "false" || lower == "off" || lower == "no" || lower == "disable") {
+    applies_true = false;
+    recognised = true;
+    return true;
+  }
+  if (lower.size() == 1) {
+    const char c = lower[0];
+    if (c >= '1' && c <= '9') {
+      applies_true = true;
+      recognised = true;
+      return true;
+    }
+    if (c == '0' || c == 'f' || c == 'n' || c == '-') {
+      applies_true = false;
+      recognised = true;
+      return true;
+    }
+    if (c == 't' || c == 'y' || c == '+') {
+      applies_true = true;
+      recognised = true;
+      return true;
+    }
+  }
+  char* end = nullptr;
+  const long long n = std::strtoll(t.c_str(), &end, 0);
+  if (end != t.c_str()) {
+    applies_true = (n != 0);
+    recognised = (end == t.c_str() + t.size());
+    return true;
+  }
+  applies_true = false;
+  recognised = false;
+  return true;
+}
+
+// (Hunt v1.4.6 ronda 19, A4-R19-03.) Warn about settings.txt values the
+// parse silently misapplied. Runs next to LogUnknownSettingsCvars, after
+// the runtime exists, so the cvar types are known; warnings only, the
+// applied values do not change. Three silent cases, all verified against
+// the vendored CLI11 and the cvar setters (cvar.h):
+//  * a bool value that is not a bool literal ("tru", "yesplease",
+//    "enabled", " true", "true # comment") is applied as false -- or as
+//    its numeric prefix ("1.5", "2x" apply as true) -- with no diagnostic
+//    from CLI11 or the setter;
+//  * an int value the setter rejects (" 2", "abc", "-1" for a uint32, a
+//    number too large for the type) is dropped and the previous/default
+//    value kept, with no diagnostic (cvar::Init ignores the setter's
+//    return value);
+//  * an int value with trailing junk ("2x", "0x2") applies as its numeric
+//    prefix (from_chars stops at the first bad char and the setter only
+//    checks ec, not full consumption): "0x2" applies as 0, and a negative
+//    texture-cache limit wraps to ~4 GiB where the cache converts the
+//    INT32 to uint32 (cache.cpp CompletedSubmissionUpdated).
+// The last-wins value per key is checked, matching the dedupe: a dropped
+// duplicate with a bad value does not warn. A "--no-key=value" line is
+// checked against the base key; a non-literal value there is doubly
+// wrong, because CLI11 does NOT negate a numeric prefix
+// ("--no-key=2x" applies as true, verified against the vendored CLI11),
+// so only a recognised literal is flipped.
+void LogSuspiciousSettingsValues(const std::vector<std::string>& settings_args) {
+  std::map<std::string, std::pair<std::string, bool>> last;  // key -> (value, negated)
+  for (const auto& arg : settings_args) {
+    if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') continue;
+    const auto eq = arg.find('=');
+    std::string key =
+        arg.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+    std::string value = (eq == std::string::npos) ? "true" : arg.substr(eq + 1);
+    bool negated = false;
+    // A "--no-key" line targets the base key when the base is a bool
+    // cvar (the "--key,!--no-key" registration). A non-literal value
+    // there ("--no-key=2x") is broken no matter what follows it: CLI11
+    // does NOT negate a numeric prefix (it counts +2), and no later
+    // line cancels that count (bool flags sum), so warn here, at the
+    // line, instead of only when it happens to win.
+    if (key.rfind("no-", 0) == 0) {
+      const std::string base = key.substr(3);
+      const rex::cvar::FlagEntry* base_info = rex::cvar::GetFlagInfo(base);
+      if (base_info && base_info->type == rex::cvar::FlagType::Boolean) {
+        key = base;
+        negated = true;
+        if (eq != std::string::npos && !IsBoolLiteral(value)) {
+          bool applies_true = false, recognised = false;
+          SettingsBoolAppliesAs(value, applies_true, recognised);
+          REXLOG_WARN("settings.txt: '--no-{}={}' is not a bool negation "
+                      "(the value is not a bool literal); CLI11 applied it "
+                      "as {} -- a numeric value is not negated by --no-",
+                      key, value, applies_true ? "true" : "false");
+        }
+      }
+    }
+    if (key.empty()) continue;
+    last[key] = {value, negated};
+  }
+  for (const auto& [key, value_negated] : last) {
+    const auto& [value, negated] = value_negated;
+    const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(key);
+    if (!info) continue;  // LogUnknownSettingsCvars already warns.
+    switch (info->type) {
+      case rex::cvar::FlagType::Boolean: {
+        bool applies_true = false, recognised = false;
+        SettingsBoolAppliesAs(value, applies_true, recognised);
+        if (negated && recognised) applies_true = !applies_true;
+        // A negated non-literal was already warned about while building
+        // the map (it is broken no matter what follows it); only warn
+        // here for the plain form.
+        if (!recognised && !negated) {
+          REXLOG_WARN("settings.txt: value '{}' for bool cvar '{}' is not "
+                      "a bool literal; CLI11 applied it as {} (use "
+                      "true/false, on/off, yes/no, 0/1)",
+                      value, key, applies_true ? "true" : "false");
+        }
+        break;
+      }
+      case rex::cvar::FlagType::Int32: {
+        int32_t n = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), n);
+        if (ec != std::errc()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                      "by the setter (not a number for this type); the "
+                      "previous/default value was kept",
+                      value, key);
+        } else if (ptr != value.data() + value.size()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                      "trailing characters '{}' were ignored",
+                      value, key, n, value.substr(ptr - value.data()));
+        } else if (n < 0 && (key == "texture_cache_memory_limit_soft" ||
+                             key == "texture_cache_memory_limit_hard" ||
+                             key == "texture_cache_memory_limit_render_to_texture" ||
+                             key == "texture_cache_memory_limit_soft_lifetime")) {
+          REXLOG_WARN("settings.txt: negative value {} for cvar '{}' wraps "
+                      "to ~4 GiB when the texture cache converts it to "
+                      "uint32; use 0 to disable or a positive MiB limit",
+                      n, key);
+        }
+        break;
+      }
+      case rex::cvar::FlagType::Int64: {
+        int64_t n = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), n);
+        if (ec != std::errc()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                      "by the setter (not a number for this type); the "
+                      "previous/default value was kept",
+                      value, key);
+        } else if (ptr != value.data() + value.size()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                      "trailing characters '{}' were ignored",
+                      value, key, n, value.substr(ptr - value.data()));
+        }
+        break;
+      }
+      case rex::cvar::FlagType::Uint32: {
+        uint32_t n = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), n);
+        if (ec != std::errc()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                      "by the setter (not a number for this type); the "
+                      "previous/default value was kept",
+                      value, key);
+        } else if (ptr != value.data() + value.size()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                      "trailing characters '{}' were ignored",
+                      value, key, n, value.substr(ptr - value.data()));
+        }
+        break;
+      }
+      case rex::cvar::FlagType::Uint64: {
+        uint64_t n = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), n);
+        if (ec != std::errc()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                      "by the setter (not a number for this type); the "
+                      "previous/default value was kept",
+                      value, key);
+        } else if (ptr != value.data() + value.size()) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                      "trailing characters '{}' were ignored",
+                      value, key, n, value.substr(ptr - value.data()));
+        }
+        break;
+      }
+      case rex::cvar::FlagType::Double: {
+        double d = 0;
+        if (!rex::cvar::ParseDouble(value, d)) {
+          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                      "by the setter (not a number); the previous/default "
+                      "value was kept",
+                      value, key);
+        }
+        break;
+      }
+      default:
+        break;  // String stores anything; Command is not a setting.
     }
   }
 }
@@ -1106,6 +1429,11 @@ int RunAndroidApp() {
       // here is a typo (or a hand-added line for a module that never
       // loads), and the player finally hears about it in childoflight.log.
       LogUnknownSettingsCvars(settings_args);
+      // (Hunt v1.4.6 ronda 19, A4-R19-03.) Same point, same argument: a
+      // key can be known and its value still silently wrong (a bool typo
+      // applied as false, an int the setter dropped, a negative cache
+      // limit that wraps to ~4 GiB). Warnings only.
+      LogSuspiciousSettingsValues(settings_args);
       // (Hunt v1.4.6 ronda 16, A4-R16-01.) Record the preset outcome in
       // childoflight.log: the per-line "setting:" log in RunAndroidApp
       // only goes to logcat (ALOGI), so a pasted childoflight.log never
