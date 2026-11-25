@@ -320,6 +320,25 @@ inline void DecodeBc3Block(const uint8_t block[16], Rgba out[16]) {
   }
 }
 
+// Decodes a BC2 (DXT3) block to 16 RGBA texels, row-major.
+// `block` must already be endian-swapped. The first 8 bytes are the
+// explicit 4-bit alpha values: texel i is nibble i of the little-endian
+// 64-bit value, expanded x17 (0 -> 0, 15 -> 255). The last 8 bytes are a
+// BC1 color block in 4-color (opaque) mode, exactly like the color part
+// of BC3 above. Same 16 bytes per 4x4 block as BC3, so the transcode to
+// ETC2 RGBA8 is a block-for-block replacement.
+// (Hunt v1.4.6 ronda 20, A1-R20-02.)
+inline void DecodeBc2Block(const uint8_t block[16], Rgba out[16]) {
+  uint64_t alpha_bits = 0;
+  for (int i = 0; i < 8; ++i) {
+    alpha_bits |= uint64_t(block[i]) << (8 * i);
+  }
+  DecodeBc1Block(block + 8, out, /*force_opaque=*/true);
+  for (int i = 0; i < 16; ++i) {
+    out[i].a = uint8_t(((alpha_bits >> (4 * i)) & 0xFu) * 17u);
+  }
+}
+
 // Encodes 16 RGBA texels (row-major) as one ETC2_RGB8 block (8 bytes).
 // Only the individual and differential modes are used; T/H/planar are never
 // emitted, and a differential candidate is only accepted when R+dR, G+dG
