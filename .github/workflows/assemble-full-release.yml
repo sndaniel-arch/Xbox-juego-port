@@ -37,6 +37,9 @@ jobs:
   assemble:
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout repo (gh needs a git repo to resolve the target)
+        uses: actions/checkout@v4
+
       - name: Download parts
         env:
           PART_URLS: ${{ inputs.part_urls }}
