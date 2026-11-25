@@ -1366,6 +1366,14 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
+  // (Hunt v1.4.6, ronda 19, A3-R19-04.) The assert above is a no-op in
+  // Release, and WaitMultiple treats any nonzero wait_type as WaitAny:
+  // a guest passing 2+ silently got WaitAny instead of an error. The
+  // contract is 0 = WaitAll, 1 = WaitAny (same bound the assert
+  // states, same INVALID_PARAMETER the count > 64 check returns).
+  if (wait_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // (Hunt v1.4.6, ronda 3, A3-R3-13.) objects_ptr was dereferenced
   // with no null check, and count was uncapped: a guest array
@@ -1429,6 +1437,14 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint32_t wait_type, uint32_t wait_mode, uint32_t alertable,
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
+  // (Hunt v1.4.6, ronda 19, A3-R19-04.) The assert above is a no-op in
+  // Release, and WaitMultiple treats any nonzero wait_type as WaitAny:
+  // a guest passing 2+ silently got WaitAny instead of an error. The
+  // contract is 0 = WaitAll, 1 = WaitAny (same bound the assert
+  // states, same INVALID_PARAMETER the count > 64 check returns).
+  if (wait_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // (Hunt v1.4.6, ronda 3, A3-R3-13.) As in
   // KeWaitForMultipleObjects_entry above: handles was unchecked and
@@ -1608,6 +1624,19 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
   // just readable. A system-heap APC (NtQueueApcThread) always names
   // a real KTHREAD, so this passes for it.
   if (!GuestRangeWritable(thread_guest_pointer, sizeof(X_KTHREAD))) {
+    return 0;
+  }
+  // (Hunt v1.4.6, ronda 19, A3-R19-03.) apc_mode indexes
+  // X_KTHREAD::apc_lists[2] below (0 = kernel, 1 = user); it comes
+  // straight from the guest's KeInitializeApc ProcessorMode argument
+  // (u32, truncated to the u8 field in xeKeInitializeApc) with no
+  // bound check anywhere. A mode >= 2 indexes past the array and
+  // InsertTail writes list pointers over the KTHREAD fields that
+  // follow it (process pointer at +0x84, apc_lock at +0x8C) -- guest
+  // memory corruption from a single guest-controlled byte. Reject it
+  // here, the choke point every insert path shares (KeInsertQueueApc,
+  // NtQueueApcThread and XThread::EnqueueApc all pass mode 0/1).
+  if (apc->apc_mode > 1) {
     return 0;
   }
   auto* mem = rex::system::kernel_state()->memory();
@@ -1882,7 +1911,7 @@ void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void
 // compiled out in Release — so every DPC-driven signal was lost since the
 // initial commit. CrownPark's ReXGlue fork fixed the identical bug the same
 // way, matching xenia-canary: run the DPC inline under DPC impersonation
-// (IRQL_DISPATCH, depth-guarded). The drain here is iterative, not
+// (IRQL_DISPATCH + dpc_active, depth-guarded). The drain here is iterative, not
 // recursive: KeInsertQueueDpc enqueues, then drains the whole list while it
 // is the outermost drain on this thread (thread_local flag). A DPC routine
 // that queues another DPC only appends; the outer loop picks it up, so no
@@ -1913,7 +1942,6 @@ static void DrainDpcList() {
   draining = true;
   auto* mem = rex::system::kernel_state()->memory();
   auto* dpc_list = REX_KERNEL_STATE()->dpc_list();
-  auto* ctx = thread_state->context();
   while (true) {
     uint32_t list_entry_ptr = 0;
     {
@@ -1950,13 +1978,19 @@ static void DrainDpcList() {
     // DPC routine signature: (Dpc, DeferredContext, SystemArgument1,
     // SystemArgument2). Same call shape as DeliverAPCs uses for APCs.
     uint64_t dpc_args[] = {dpc_ptr, deferred_context, arg1, arg2};
-    uint32_t old_irql = xeKfRaiseIrql(ctx, IRQL_DISPATCH);
+    // (Hunt v1.4.6, ronda 19, A3-R19-01.) The R18 drain only raised
+    // IRQL: it never set PRCB dpc_active, so KeGetCurrentProcessType
+    // (which branches on dpc_active) returned the thread's normal
+    // process type instead of processtype_value_in_dpc for the whole
+    // DPC routine, and any guest code reading the PRCB saw "not in a
+    // DPC". Impersonate properly with the existing (previously dead)
+    // Begin/EndDPCImpersonation pair, which sets IRQL_DISPATCH and
+    // dpc_active=1 and restores both afterwards -- including restoring
+    // an old IRQL above DISPATCH, which the manual raise/lower above
+    // silently lost.
+    auto dpc_scope = REX_KERNEL_STATE()->BeginDPCImpersonation();
     dispatcher->ExecuteTrap(thread_state, routine, dpc_args, 4);
-    // Same restore rule as xeKeKfReleaseSpinLock: only lower when the old
-    // level was below DISPATCH (above DISPATCH the level stays put).
-    if (old_irql < IRQL_DISPATCH) {
-      xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
-    }
+    REX_KERNEL_STATE()->EndDPCImpersonation(dpc_scope);
   }
   draining = false;
 }
@@ -2205,6 +2239,26 @@ void ExReleaseReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
       xeKeReleaseSemaphore(&lock_ptr->reader_semaphore, 1, readers_waiting_count, 0);
       return;
     }
+    // (Hunt v1.4.6, ronda 19, A3-R19-02.) No readers entered and none
+    // waiting: the lock is free for a waiting writer. The old code
+    // fell through to --readers_entry_count below, which underflows a
+    // zero be<uint32_t> to 0xFFFFFFFF and returns WITHOUT setting
+    // writer_event -- so an exclusive waiter slept forever on a lock
+    // whose owner had already released it, and the lock stayed wedged
+    // (readers_entry_count poisoned) for every later acquire. Wake the
+    // writer here instead.
+    if (lock_ptr->writers_waiting_count) {
+      lock_ptr->writers_waiting_count--;
+      xeKeKfReleaseSpinLock(ctx, &lock_ptr->spin_lock, old_irql);
+      xeKeSetEvent(&lock_ptr->writer_event, 1, 0);
+      return;
+    }
+    // No waiters at all: unreachable for a consistent lock (an
+    // exclusive owner releasing with no waiter already returned via
+    // the lock_count < 0 branch above), but never fall through to
+    // --readers_entry_count: it would underflow the zero count.
+    xeKeKfReleaseSpinLock(ctx, &lock_ptr->spin_lock, old_irql);
+    return;
   }
 
   auto readers_entry_count = --lock_ptr->readers_entry_count;
