@@ -30,10 +30,18 @@
 #      if it is 0, create the sub-object exactly as sub_824C4FD8 would
 #      (Alloc(60, 66) via sub_827AE488, then Ctor sub_8242EAC8, store to +156).
 #      If the Alloc fails again, skip the block (goto loc_824C5150_skip, just
-#      before the epilogue): no crash, state stays 2, the state machine
-#      retries next frame (sub_824C6568 calls this slot every frame while
-#      state == 2). The temp at r1+80 is never touched, so its destructor is
-#      skipped too -- it was never constructed on this path.
+#      before the epilogue): no crash. CORRECCION RONDA 18 (A2-R18-02):
+#      sub_824C5150 is NOT the state-2 per-frame function -- it is the
+#      state-3 ONCE-HOOK (vtable offset 48; the state-2 per-frame function
+#      is sub_824C4D70 at offset 52). Proven from the XEX static data
+#      (derived vtable 0x820D37D0: offset 48 = thunk 0x82A60E88 -> 5150,
+#      offset 52 = thunk 0x82A60E90 -> 4D70) and sub_824C6568's source.
+#      sub_824C6568 sets the once-flag (byte +52) to 1 BEFORE calling, so
+#      the skip re-arms the flag (+52 = 0, r4 is already 0 on that path)
+#      and the state machine retries next frame; without the re-arm the
+#      one-time init would be lost forever (stall, not crash). The temp
+#      at r1+80 is never touched, so its destructor is skipped too -- it
+#      was never constructed on this path.
 #      CORRECCION DEL COORDINADOR (ronda 15, verificacion): el Alloc/ctor
 #      clobberan r3 (r3 es volatil en PPC: el Alloc devuelve el puntero en
 #      r3), pero el codigo original llama a sub_8247B6D0 con r3 = el temporal
@@ -83,7 +91,7 @@
 #   Skip targets are EXISTING labels only (no new label is created for the
 #   R17 sites): the epilogue of each function, or the existing "not ready"
 #   path (sub_824C4D70 -> loc_824C4DF0, i.e. SetState(1), mirroring the
-#   13AD8-returns-0 failure path; sub_824C9DA8 -> loc_824C9F8C, the early-exit
+#   13AD8-returns-0 failure path; sub_824C9DA8 -> loc_824C9FA0, the state!=4
 #   epilogue). The script verifies each skip label exists inside the target
 #   function and fails closed if it does not.
 #   Liveness (verified per site against the generated code): the snippets
@@ -132,9 +140,11 @@
 #     sub_8242DE20 / sub_82426CF8). That is why the guard calls the real ctor
 #     instead of hand-rolling a memset.
 #   - No logging is added: the generated PCH does not include <cstdio>, and
-#     the observable outcome (game proceeds past JUGAR vs. stalls in state 2
-#     with no crash) is itself the diagnostic. If it stalls, the next step
-#     is guest-heap instrumentation, not a bigger guard.
+#     the observable outcome (game proceeds past JUGAR vs. stalls with no
+#     crash) is itself the diagnostic. (Ronda 18, A2-R18-02: the stall, if
+#     the heap never recovers, is the state-3 once-hook retrying every
+#     frame, not "state 2" as this note used to say.) If it stalls, the
+#     next step is guest-heap instrumentation, not a bigger guard.
 #   - Idempotent: files already carrying the GUARD_R15_A2-R15-01 marker are
 #     skipped. Any target function or anchor that does not match EXACTLY
 #     fails the run (exit 1) instead of shipping unguarded code.
@@ -159,6 +169,50 @@ MARKER = "GUARD_R15_A2-R15-01"
 
 # --- recovery snippet for sub_824C5150 (r4 = *(this+156), this = ctx.r31) ---
 RECOVERY_5150 = """\t// %s: +156 es el sub-objeto creado por sub_824C4FD8 (Alloc(60, heap 66)
+\t// + Ctor sub_8242EAC8); el ctor base pone +156 = 0 y solo sub_824C4FD8 lo
+\t// llena. En el crash de R14 llega a 0 (init no corrio o el Alloc fallo)
+\t// y sub_8247B6D0 lo pasa como `this` a sub_82459F10, que lee [r3+4] ->
+\t// SIGSEGV en base+4. Si falta, se crea aqui como haria el init; si el
+\t// Alloc vuelve a fallar se salta el bloque (sin crash). OJO (ronda 18,
+\t// A2-R18-02): sub_824C5150 NO es la funcion por frame del estado 2 --
+\t// es el once-hook del estado 3 (vtable offset 48; el per-frame del
+\t// estado 2 es sub_824C4D70, offset 52). sub_824C6568 pone el flag once
+\t// (+52) a 1 ANTES de llamar, asi que el salto rearma el flag (+52 = 0)
+\t// y el proximo frame lo reintenta; sin el rearmado el init se perderia
+\t// para siempre. Idioma propio del juego:
+\t// sub_824C4C00 chequea +156 == 0 antes de llamar a sub_82459F10.
+\tif (ctx.r4.u32 == 0) {
+\t\tctx.r3.s64 = 60;
+\t\tctx.r4.s64 = 66;
+\t\tctx.lr = 0x824C516C;
+\t\tsub_827AE488(ctx, base);
+\t\tif (ctx.r3.u32 != 0) {
+\t\t\tctx.lr = 0x824C516C;
+\t\t\tsub_8242EAC8(ctx, base);
+\t\t\tREX_STORE_U32(ctx.r31.u32 + 156, ctx.r3.u32);
+\t\t\tctx.r4.u64 = ctx.r3.u64;
+\t\t}
+\t}
+\tif (ctx.r4.u32 == 0) {
+\t\t// A2-R18-02: rearmar el once-hook del estado 3 (byte +52 a 0) para
+\t\t// que sub_824C6568 vuelva a llamar a sub_824C5150 el proximo frame.
+\t\t// r4 ya es 0 en esta rama (es la condicion del salto) y r31 sigue
+\t\t// siendo `this`; el epilogo no lee r4. Solo dos sitios escriben
+\t\t// este flag: el ctor sub_824C6980 (= 0) y sub_824C6568 (= 1).
+\t\tREX_STORE_U8(ctx.r31.u32 + 52, ctx.r4.u8);
+\t\tgoto loc_824C5150_skip;
+\t}
+\t// %s (coord.): r3 es volatil y el Alloc/ctor lo clobberan (devuelven el
+\t// puntero en r3); el codigo original llama a sub_8247B6D0 con r3 = el
+\t// temporal de r1+80. Restaurarlo aqui (no-op si +156 ya venia creado).
+\tctx.r3.s64 = ctx.r1.s64 + 80;
+""" % (MARKER, MARKER)
+
+# --- R17 text of the 5150 recovery, verbatim (ronda 18, A2-R18-04) ---
+# The migration below replaces this text with RECOVERY_5150 above when it
+# finds it in a file guarded by the R17 script. Do not edit either literal
+# without updating the other side of the migration.
+RECOVERY_5150_R17 = """\t// %s: +156 es el sub-objeto creado por sub_824C4FD8 (Alloc(60, heap 66)
 \t// + Ctor sub_8242EAC8); el ctor base pone +156 = 0 y solo sub_824C4FD8 lo
 \t// llena. En el crash de R14 llega a 0 (init no corrio o el Alloc fallo)
 \t// y sub_8247B6D0 lo pasa como `this` a sub_82459F10, que lee [r3+4] ->
@@ -437,14 +491,22 @@ TARGETS = {
             "\t// lwz r27,156(r6)\n"
             "\tctx.r27.u64 = REX_LOAD_U32(ctx.r6.u32 + 156);\n"
         )],
-        "recovery": _before_v2("r27", "0x824C9F00", "loc_824C9F8C"),
+        "recovery": _before_v2("r27", "0x824C9F00", "loc_824C9FA0"),
         "label_anchor": None,
         "label": None,
-        # Early-exit epilogue (the 13AD8-returns-0 path). The 150 lines
-        # between the load and the call prepare a 9DA8-local temp for the
-        # post-59F10 work; the epilogue does not read it, so skipping the
-        # whole block on Alloc failure is safe (retried next frame).
-        "skip_label": "loc_824C9F8C",
+        # State!=4 epilogue (returns r31, which is 0 at the guard point:
+        # `li r31,0` at .128.cpp:11531). A2-R18-01: the old target
+        # loc_824C9F8C did `mr r4,r28; mr r3,r29; bl sub_824C8600`, and r28
+        # is STALE on the skip path -- its computation (`r28 = *(this+204)
+        # + *(this+212)*60 - 60`, .128.cpp:11608) is jumped over -- while
+        # sub_824C8600 dereferences r4 unconditionally (`lwz r11,0(r31)`).
+        # loc_824C9FA0 reads no r28/r29, makes no calls, returns 0. The
+        # 150 lines between the load and the call prepare a 9DA8-local temp
+        # for the post-59F10 work; the epilogue does not read it, so
+        # skipping the whole block on Alloc failure is safe (retried on
+        # the next call of sub_824C9DA8; its host is vtable-reached, so
+        # per-frame frequency is not statically proven).
+        "skip_label": "loc_824C9FA0",
     },
     "sub_82A60C40": {
         "file_hint": "childoflight_recomp.98.cpp",
@@ -498,6 +560,77 @@ def find_function_span(lines, name):
     return None
 
 
+# --- migration from the R17 guard (ronda 18, parent catch, A2-R18-04) ---
+# Two recoveries changed in R18: sub_824C9DA8's skip label (loc_824C9F8C ->
+# loc_824C9FA0, A2-R18-01) and sub_824C5150's tail (the once-hook re-arm,
+# A2-R18-02). A file guarded by the R17 script carries MARKER, so the plain
+# "already applied" check would skip the whole file and the R18 fixes would
+# never reach a tree guarded by the old script -- the local FULL build
+# reuses its generated tree, and the tripwire only counts markers (22 either
+# way), so nothing else would catch it. Same class as the R16 root cause
+# (guard existed only in CI). The migration below replaces the old recovery
+# text with the new one, verbatim, failing closed on any text it does not
+# recognise.
+
+
+def _find_block(lines, block_lines):
+    """Start indices of every occurrence of block_lines as a contiguous run."""
+    hits = []
+    n = len(block_lines)
+    for i in range(len(lines) - n + 1):
+        if lines[i : i + n] == block_lines:
+            hits.append(i)
+    return hits
+
+
+def _migrations():
+    """(name, old recovery, new recovery) for the recoveries that changed."""
+    return [
+        ("sub_824C5150", RECOVERY_5150_R17, RECOVERY_5150),
+        ("sub_824C9DA8",
+         _before_v2("r27", "0x824C9F00", "loc_824C9F8C"),
+         TARGETS["sub_824C9DA8"]["recovery"]),
+    ]
+
+
+def migrate_guard_file(path, text, eol, lines):
+    """Upgrade a file guarded by the R17 script to the R18 recoveries.
+
+    Returns the same tuple shape as guard_file. Only the two changed
+    recoveries are touched; every other target is left exactly as it is.
+    A target whose function is not defined in this file is skipped. A
+    target whose recovery is neither the R17 nor the R18 text fails the
+    whole run (exit 1) with zero files modified -- same atomicity rule as
+    the fresh path."""
+    migrated = set()
+    for name, old_rec, new_rec in _migrations():
+        if f"DEFINE_REX_FUNC({name})" not in text:
+            continue
+        old_lines = old_rec.rstrip("\n").split("\n")
+        new_lines = new_rec.rstrip("\n").split("\n")
+        old_hits = _find_block(lines, old_lines)
+        new_hits = _find_block(lines, new_lines)
+        if new_hits and not old_hits:
+            continue  # already migrated
+        if old_hits and not new_hits:
+            if len(old_hits) != 1:
+                return (set(), False,
+                        f"{path}: {name}: R17 recovery found "
+                        f"{len(old_hits)} times, refusing to guess",
+                        None)
+            i = old_hits[0]
+            lines[i : i + len(old_lines)] = new_lines
+            migrated.add(name)
+            continue
+        return (set(), False,
+                f"{path}: {name}: recovery is neither the R17 nor the "
+                f"R18 text (old={len(old_hits)}, new={len(new_hits)})",
+                None)
+    if not migrated:
+        return (set(), True, None, None)
+    return (migrated, False, None, eol.join(lines))
+
+
 def guard_file(path, dry_run):
     """Apply the guards for any target function present in this file.
 
@@ -517,10 +650,13 @@ def guard_file(path, dry_run):
     with open(path, encoding="utf-8", errors="surrogateescape",
               newline="") as f:
         text = f.read()
-    if MARKER in text:
-        return (set(), True, None, None)
     eol = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(eol)
+    if MARKER in text:
+        # (Ronda 18, A2-R18-04.) A file guarded by the R17 script is
+        # UPGRADED to the R18 recoveries, not skipped: see
+        # migrate_guard_file above.
+        return migrate_guard_file(path, text, eol, lines)
     transformed = set()
     changed = False
     for name, spec in TARGETS.items():
