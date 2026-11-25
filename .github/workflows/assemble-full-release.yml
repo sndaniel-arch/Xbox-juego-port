@@ -23,12 +23,21 @@ on:
         required: true
         default: '1625565567'
       part_urls:
-        description: 'Part URLs in order part00..part16, whitespace-separated'
+        description: 'Part URLs in order part00..partNN, whitespace-separated'
         required: true
+      part_count:
+        description: 'Expected number of parts'
+        required: true
+        default: '17'
+      # (Hunt v1.4.6, ronda 15, A5-R15-01.) The old default said
+      # "PRUEBA R14": the only stale default that fails SILENTLY -- a
+      # wrong sha256/size/tag fails loudly at the verify step or at
+      # `gh release create`, but the R14 body text would have shipped
+      # on the R15 pre-release. Keep the default generic.
       notes:
         description: 'Release body'
         required: false
-        default: 'PRUEBA R14 — build de prueba para el teléfono del dueño. NO es el release final.'
+        default: 'PRUEBA — build de prueba para el teléfono del dueño. NO es el release final.'
 
 permissions:
   contents: write
@@ -36,26 +45,38 @@ permissions:
 jobs:
   assemble:
     runs-on: ubuntu-24.04
+    # (Hunt v1.4.6, ronda 15, A5-R15-01.) The job and every step used to
+    # carry no timeout-minutes at all, and the curl below had no
+    # --max-time: a stalled part download could hang the job until the
+    # 6 h GitHub default. Run #2 took ~2.5 min end to end; 60 min for
+    # the job and 30/10/15 for the steps is generous and names the
+    # hanging step instead of dying anonymously at the job timeout
+    # (same treatment the main workflow gives its jobs, R7-11/R8-06).
+    timeout-minutes: 60
     steps:
       - name: Checkout repo (gh needs a git repo to resolve the target)
         uses: actions/checkout@v4
+        timeout-minutes: 10
 
       - name: Download parts
+        timeout-minutes: 30
         env:
           PART_URLS: ${{ inputs.part_urls }}
+          PART_COUNT: ${{ inputs.part_count }}
         run: |
           set -euo pipefail
           i=0
           for url in $PART_URLS; do
             f=$(printf 'part%02d' "$i")
             echo "Downloading $f"
-            curl -fL --retry 3 -o "$f" "$url"
+            curl -fL --retry 3 --max-time 600 -o "$f" "$url"
             i=$((i + 1))
           done
           echo "Downloaded $i parts"
-          test "$i" -eq 17
+          test "$i" -eq "$PART_COUNT"
 
       - name: Reassemble and verify
+        timeout-minutes: 10
         env:
           EXPECTED_SHA: ${{ inputs.sha256 }}
           EXPECTED_SIZE: ${{ inputs.expected_size }}
@@ -70,6 +91,7 @@ jobs:
           test "$ACTUAL_SHA" = "$EXPECTED_SHA"
 
       - name: Publish pre-release
+        timeout-minutes: 15
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
