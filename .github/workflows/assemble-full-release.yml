@@ -1,0 +1,78 @@
+name: Assemble FULL release from parts
+
+# Une las partes de la APK FULL (subidas a Muse storage) y publica la
+# pre-release de prueba. Creado para la R14 (Buddy muerto); no toca el
+# workflow de recompilación. Solo workflow_dispatch manual.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+        default: 'v1.4.6-full-r14-test'
+      title:
+        description: 'Release title'
+        required: true
+        default: 'Child of Light FULL v1.4.6 — R14 PRUEBA (test, no es el release)'
+      sha256:
+        description: 'Expected SHA-256 of the reassembled APK'
+        required: true
+        default: '73754e3c9cb4c18a9cf6a799a7e57b8c3f7cff9722ae5bcc3419c42e1433c508'
+      expected_size:
+        description: 'Expected APK size in bytes'
+        required: true
+        default: '1625565567'
+      part_urls:
+        description: 'Part URLs in order part00..part16, whitespace-separated'
+        required: true
+      notes:
+        description: 'Release body'
+        required: false
+        default: 'PRUEBA R14 — build de prueba para el teléfono del dueño. NO es el release final.'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download parts
+        env:
+          PART_URLS: ${{ inputs.part_urls }}
+        run: |
+          set -euo pipefail
+          i=0
+          for url in $PART_URLS; do
+            f=$(printf 'part%02d' "$i")
+            echo "Downloading $f"
+            curl -fL --retry 3 -o "$f" "$url"
+            i=$((i + 1))
+          done
+          echo "Downloaded $i parts"
+          test "$i" -eq 17
+
+      - name: Reassemble and verify
+        env:
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+          EXPECTED_SIZE: ${{ inputs.expected_size }}
+        run: |
+          set -euo pipefail
+          cat part* > ChildOfLight-recomp-v1.4.6-full.apk
+          ACTUAL_SIZE=$(stat -c%s ChildOfLight-recomp-v1.4.6-full.apk)
+          echo "size: $ACTUAL_SIZE (expected $EXPECTED_SIZE)"
+          test "$ACTUAL_SIZE" = "$EXPECTED_SIZE"
+          ACTUAL_SHA=$(sha256sum ChildOfLight-recomp-v1.4.6-full.apk | cut -d' ' -f1)
+          echo "sha256: $ACTUAL_SHA"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" ChildOfLight-recomp-v1.4.6-full.apk --title "$TITLE" --notes "$NOTES" --prerelease
+          gh release view "$TAG" --json tagName,name,assets --jq '{tag: .tagName, title: .name, assets: [.assets[] | {name: .name, size: .size}]}'
