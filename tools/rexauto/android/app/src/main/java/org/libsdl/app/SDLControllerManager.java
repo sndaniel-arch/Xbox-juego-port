@@ -243,7 +243,14 @@ class SDLJoystickHandler {
                         if ((range.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0) {
                             if (range.getAxis() == MotionEvent.AXIS_HAT_X || range.getAxis() == MotionEvent.AXIS_HAT_Y) {
                                 joystick.hats.add(range);
-                            } else {
+                            } else if (range.getRange() != 0) {
+                                // (Hunt v1.4.6 ronda 19, A4-R19-07.) A range
+                                // with min == max (a broken descriptor)
+                                // makes handleMotionEvent divide by zero:
+                                // (value - min) / range.getRange() is
+                                // Infinity/NaN in float arithmetic, and that
+                                // reaches the guest as a joystick axis value.
+                                // Hats do not divide, so only axes are skipped.
                                 joystick.axes.add(range);
                             }
                         }
@@ -509,6 +516,17 @@ class SDLJoystickHandler {
         if (joystick == null || joystick.lights.isEmpty()) {
             return;
         }
+        // (Hunt v1.4.6 ronda 19, A4-R19-08.) lightsSession is read outside
+        // the getJoystick() lock: pollInputDevices() can remove this
+        // joystick in between, closing the session and nulling it, so
+        // requestLights() NPE'd (or threw IllegalStateException on a closed
+        // session) on the calling thread. No re-check under a lock can
+        // close the window -- the session can close at any moment -- so
+        // catch it here: a lost LED update is harmless.
+        LightsManager.LightsSession session = joystick.lightsSession;
+        if (session == null) {
+            return;
+        }
         LightsRequest.Builder lightsRequest = new LightsRequest.Builder();
         LightState lightState = new LightState.Builder().setColor(Color.rgb(red, green, blue)).build();
         for (Light light : joystick.lights) {
@@ -516,7 +534,13 @@ class SDLJoystickHandler {
                 lightsRequest.addLight(light, lightState);
             }
         }
-        joystick.lightsSession.requestLights(lightsRequest.build());
+        try {
+            session.requestLights(lightsRequest.build());
+        } catch (Exception e) {
+            // SDLJoystickHandler has no TAG of its own (it is a separate
+            // top-level class in this file); use the manager's tag.
+            Log.v("SDLControllerManager", "setLED failed for device " + device_id + ": " + e);
+        }
     }
 }
 
