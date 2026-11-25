@@ -19,7 +19,7 @@ import android.os.*;
 
 import java.lang.Runnable;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.LinkedList;
 import java.util.UUID;
 
@@ -84,7 +84,14 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     static final UUID reportCharacteristic = UUID.fromString("100F6C34-1735-4313-B402-38567131E5F3");
     static private final byte[] enterValveMode = new byte[] { (byte)0xC0, (byte)0x87, 0x03, 0x08, 0x07, 0x00 };
 
-    private HashMap<Integer, BluetoothGattCharacteristic> mOutputReportChars = new HashMap<Integer, BluetoothGattCharacteristic>();
+    // (Hunt v1.4.6 ronda 20, A4-R20-03.) ConcurrentHashMap, not HashMap:
+    // probeService() put()s into this map from the binder thread
+    // (onServicesDiscovered) and the main thread
+    // (checkConnectionForChromebookIssue), while writeReport() get()s from
+    // the SDL thread -- a plain HashMap is not safe for concurrent
+    // put/get. Only put/get are used (no iteration), so the swap is
+    // behavior-identical apart from the thread safety.
+    private ConcurrentHashMap<Integer, BluetoothGattCharacteristic> mOutputReportChars = new ConcurrentHashMap<Integer, BluetoothGattCharacteristic>();
 
     static class GattOperation {
         private enum Operation {
@@ -376,8 +383,10 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                     // to try to recover.
                     Log.v(TAG, "Chromebook: We are in a very bad state; the controller shows as connected in the underlying Bluetooth layer, but we never received a callback.  Forcing a reconnect.");
                     mIsReconnecting = true;
-                    mGatt.disconnect();
-                    mGatt = connectGatt(false);
+                    // (Hunt v1.4.6 ronda 20, A4-R20-02.) replaceGatt()
+                    // disconnects AND closes: the bare disconnect +
+                    // connectGatt here leaked a GATT clientIf per tick.
+                    replaceGatt();
                     break;
                 }
                 else if (!isRegistered()) {
@@ -388,8 +397,10 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                     else {
                         Log.v(TAG, "Chromebook: We are connected to a controller, but never discovered services.  Trying to recover.");
                         mIsReconnecting = true;
-                        mGatt.disconnect();
-                        mGatt = connectGatt(false);
+                        // (Hunt v1.4.6 ronda 20, A4-R20-02.) replaceGatt()
+                        // disconnects AND closes: the bare disconnect +
+                        // connectGatt here leaked a GATT clientIf per tick.
+                        replaceGatt();
                         break;
                     }
                 }
@@ -403,8 +414,10 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                 Log.v(TAG, "Chromebook: We have either been disconnected, or the Chromebook BtGatt.ContextMap bug has bitten us.  Attempting a disconnect/reconnect, but we may not be able to recover.");
 
                 mIsReconnecting = true;
-                mGatt.disconnect();
-                mGatt = connectGatt(false);
+                // (Hunt v1.4.6 ronda 20, A4-R20-02.) replaceGatt()
+                // disconnects AND closes: the bare disconnect +
+                // connectGatt here leaked a GATT clientIf per tick.
+                replaceGatt();
                 break;
 
             case BluetoothProfile.STATE_CONNECTING:
