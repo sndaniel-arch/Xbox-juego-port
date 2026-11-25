@@ -243,13 +243,23 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         mHandler = new Handler(Looper.getMainLooper());
 
         mGatt = connectGatt();
-        // final HIDDeviceBLESteamController finalThis = this;
-        // mHandler.postDelayed(new Runnable() {
-        //     @Override
-        //     void run() {
-        //         finalThis.checkConnectionForChromebookIssue();
-        //     }
-        // }, CHROMEBOOK_CONNECTION_CHECK_INTERVAL);
+        // (Hunt v1.4.6 ronda 19, A4-R19-04.) Same dead loop as the
+        // manager's chromebookConnectionHandler: the initial post was
+        // commented out, so checkConnectionForChromebookIssue (which only
+        // re-arms itself) never ran -- on a Chromebook a controller whose
+        // GATT connects without callbacks is never recovered. Re-enable
+        // it for Chromebooks only; shutdown() already cancels all Handler
+        // work (removeCallbacksAndMessages), so the loop stops when the
+        // device is shut down.
+        if (mIsChromebook) {
+            final HIDDeviceBLESteamController finalThis = this;
+            mHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    finalThis.checkConnectionForChromebookIssue();
+                }
+            }, CHROMEBOOK_CONNECTION_CHECK_INTERVAL);
+        }
     }
 
     String getIdentifier() {
@@ -348,6 +358,15 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             return;
         }
 
+        // (Hunt v1.4.6 ronda 19, A4-R19-04.) connectGatt() can return null
+        // (A4-R13-01): every branch below dereferences mGatt. Without a
+        // GATT there is nothing to check, but keep the loop alive -- a
+        // reconnect may have one by the next tick.
+        if (mGatt == null) {
+            rearmChromebookCheck();
+            return;
+        }
+
         int connectionState = getConnectionState();
 
         switch (connectionState) {
@@ -393,6 +412,26 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                 break;
         }
 
+        rearmChromebookCheck();
+    }
+
+    // (Hunt v1.4.6 ronda 19, A4-R19-04.) One re-arm point for the
+    // Chromebook loop, so the null-GATT path above and the normal path
+    // schedule the same next tick. shutdown() cancels all Handler work,
+    // so the loop stops when the device is shut down.
+    private void rearmChromebookCheck() {
+        // (Hunt v1.4.6 ronda 19, A4-R19-04b, PADRE.) mManager solo lo nullea
+        // shutdown() (los callbacks lo usan ya como señal de apagado):
+        // un tick en vuelo cuando shutdown() corre rearmaria el loop
+        // DESPUES de que shutdown() cancelara el trabajo del Handler, y
+        // el camino mGatt == null lo seguiria rearmando cada 10 s para
+        // siempre (mGatt queda en null; nada reconecta un dispositivo
+        // apagado). Misma clase que la guarda del manager en A4-R19-04
+        // (mHandler null); el lado BLE no nullea mHandler, asi que la
+        // señal de apagado aqui es mManager == null.
+        if (mManager == null) {
+            return;
+        }
         final HIDDeviceBLESteamController finalThis = this;
         mHandler.postDelayed(new Runnable() {
             @Override
@@ -420,9 +459,22 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             return false;
         }
 
+        // (Hunt v1.4.6 ronda 19, A4-R19-05.) Capture the GATT: shutdown()
+        // (main thread) nulls mGatt while this runs on a binder thread
+        // (onServicesDiscovered) or the SDL thread (writeReport), and the
+        // mManager == null guard in the callbacks is not atomic with this
+        // use -- a shutdown in between NPE'd on mGatt.getServices(). A
+        // stale-but-non-null local can at worst probe a closed GATT
+        // (getServices() is empty there); registration itself is still
+        // guarded by the mManager == null checks in the callbacks.
+        BluetoothGatt gatt = mGatt;
+        if (gatt == null) {
+            return false;
+        }
+
         Log.v(TAG, "probeService controller=" + controller);
 
-        for (BluetoothGattService service : mGatt.getServices()) {
+        for (BluetoothGattService service : gatt.getServices()) {
             if (service.getUuid().equals(steamControllerService)) {
                 Log.v(TAG, "Found Valve steam controller service " + service.getUuid());
 
@@ -470,7 +522,7 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             }
         }
 
-        if ((mGatt.getServices().size() == 0) && mIsChromebook && !mIsReconnecting) {
+        if ((gatt.getServices().size() == 0) && mIsChromebook && !mIsReconnecting) {
             Log.e(TAG, "Chromebook: Discovered services were empty; this almost certainly means the BtGatt.ContextMap bug has bitten us.");
             mIsConnected = false;
             mIsReconnecting = true;
@@ -993,7 +1045,22 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             return -1;
         }
 
+        // (Hunt v1.4.6 ronda 19, A4-R19-06.) A null buffer NPEs below
+        // (report.length); the copyOfRange calls in the feature and
+        // Triton branches throw IllegalArgumentException for a 0- or
+        // 1-byte report (from > to, per the Arrays docs). The native side
+        // passes the buffer straight through, so guard here instead of
+        // letting it explode on the SDL thread.
+        if (report == null) {
+            Log.w(TAG, "writeReport with a null report; dropping");
+            return -1;
+        }
+
         if (feature) {
+            if (report.length < 2) {
+                Log.w(TAG, "writeReport with a " + report.length + "-byte feature report; dropping");
+                return -1;
+            }
             // We need to skip the first byte, as that doesn't go over the air
             byte[] actual_report = Arrays.copyOfRange(report, 1, report.length - 1);
             //Log.v(TAG, "writeFeatureReport " + HexDump.dumpHexString(actual_report));
@@ -1008,7 +1075,7 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             }
 
             // If we're a Triton, we need to find the correct report characteristic.
-            if (report.length > 0) {
+            if (report.length >= 2) {
                 int reportId = report[0];
                 BluetoothGattCharacteristic targetedReportCharacteristic = mOutputReportChars.get(reportId);
                 if (targetedReportCharacteristic != null) {
@@ -1019,6 +1086,8 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                 } else {
                     Log.w(TAG, "Got report write request for unknown report type 0x" + Integer.toString(reportId, 16));
                 }
+            } else {
+                Log.w(TAG, "Got report write request for a " + report.length + "-byte Triton report; dropping");
             }
         }
 
