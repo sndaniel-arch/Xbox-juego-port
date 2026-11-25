@@ -1615,30 +1615,44 @@ REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
 REX_EXPORT_STUB(__imp__NetDll_WSARecv);
 REX_EXPORT_STUB(__imp__NetDll_WSASend);
 REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
-REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrlW);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrl);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrlW);
+// (Hunt v1.4.6, ronda 16, A3-R16-01.) These XHttp stubs used to be
+// plain REX_EXPORT_STUB, which logs and returns WITHOUT setting r3:
+// the guest read whatever r3 happened to hold, so XHttpOpen /
+// XHttpOpenRequest (HINTERNET) could hand back a stale non-zero
+// value the game treats as a valid session handle, and the BOOL
+// ones (Connect/SendRequest/ReceiveResponse/ReadData/...) could
+// read as TRUE. The game has call sites for the whole flow
+// (see childoflight_recomp.*.cpp) and XHttpStartup -- which
+// already returns 0 (success) -- was hit in the R15 phone log,
+// so the flow can proceed into these stubs. 0 is NULL for the
+// handles and FALSE for the BOOLs, so every stub below fails
+// fast and deterministically instead of faking success.
+// XHttpDoWork / XHttpResetPerfCounters / XHttpShutdown return
+// void and stay plain stubs; XHttpStartup already returns 0.
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpCloseHandle, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpConnect, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpCrackUrl, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpCrackUrlW, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpCreateUrl, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpCreateUrlW, 0);
 REX_EXPORT_STUB(__imp__NetDll_XHttpDoWork);
-REX_EXPORT_STUB(__imp__NetDll_XHttpGetPerfCounters);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpen);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequest);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequestUsingMemory);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryAuthSchemes);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryHeaders);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryOption);
-REX_EXPORT_STUB(__imp__NetDll_XHttpReadData);
-REX_EXPORT_STUB(__imp__NetDll_XHttpReceiveResponse);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpGetPerfCounters, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpOpen, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpOpenRequest, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpOpenRequestUsingMemory, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpQueryAuthSchemes, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpQueryHeaders, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpQueryOption, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpReadData, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpReceiveResponse, 0);
 REX_EXPORT_STUB(__imp__NetDll_XHttpResetPerfCounters);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSendRequest);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetCredentials);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetOption);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpSendRequest, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpSetCredentials, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpSetOption, 0);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpSetStatusCallback, 0);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpStartup, 0);
-REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XHttpWriteData, 0);
 REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
 REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
