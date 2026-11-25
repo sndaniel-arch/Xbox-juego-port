@@ -13,7 +13,7 @@ on:
       title:
         description: 'Release title'
         required: true
-        default: 'Child of Light FULL v1.4.6 — R14 PRUEBA (test, no es el release)'
+        default: 'Child of Light FULL v1.4.6 — PRUEBA (test, no es el release)'
       sha256:
         description: 'Expected SHA-256 of the reassembled APK'
         required: true
@@ -29,11 +29,12 @@ on:
         description: 'Expected number of parts'
         required: true
         default: '17'
-      # (Hunt v1.4.6, ronda 15, A5-R15-01.) The old default said
-      # "PRUEBA R14": the only stale default that fails SILENTLY -- a
-      # wrong sha256/size/tag fails loudly at the verify step or at
-      # `gh release create`, but the R14 body text would have shipped
-      # on the R15 pre-release. Keep the default generic.
+      # (Hunt v1.4.6, ronda 15, A5-R15-01; ronda 16, A5-R16-04.) The old
+      # defaults said "PRUEBA R14": the stale defaults that fail
+      # SILENTLY -- a wrong sha256/size/tag fails loudly at the verify
+      # step or at `gh release create`, but the R14 body text (and the
+      # R14 release title) would have shipped on the R15 pre-release.
+      # Keep the defaults generic.
       notes:
         description: 'Release body'
         required: false
