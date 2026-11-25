@@ -65,14 +65,27 @@ public class HIDDeviceManager {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
+            // (Hunt v1.4.6 ronda 15, A4-R15-01.) EXTRA_DEVICE can be
+            // absent: the USB-permission action is our own custom action
+            // ("org.libsdl.app.USB_PERMISSION") and this receiver is
+            // registered EXPORTED on SDK 33+ (initializeUSB below), so
+            // any app can broadcast it without the extra -- and all
+            // three handlers dereference the device
+            // (connectHIDDeviceUSB reads getInterfaceCount(); the other
+            // two call usbDevice.equals(...)), so a null here NPEd on
+            // the main thread and killed the game mid-play. The system
+            // USB attached/detached broadcasts always carry the extra;
+            // only the permission path is reachable without it, but the
+            // guard covers all three at this single entry point.
+            UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            if (usbDevice == null) {
+                return;
+            }
             if (action.equals(UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
-                UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                 handleUsbDeviceAttached(usbDevice);
             } else if (action.equals(UsbManager.ACTION_USB_DEVICE_DETACHED)) {
-                UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                 handleUsbDeviceDetached(usbDevice);
             } else if (action.equals(HIDDeviceManager.ACTION_USB_PERMISSION)) {
-                UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                 handleUsbDevicePermission(usbDevice, intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false));
             }
         }
