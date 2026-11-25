@@ -1351,20 +1351,48 @@ void KernelState::CompleteOverlappedDeferredEx(
 }
 
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {
-  auto* thread = XThread::GetCurrentThread();
-  auto* ctx = thread->thread_state()->context();
-  auto pcr = memory_->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  // (Hunt v1.4.6, ronda 19, A3-R19-01.) The old code re-derived the PCR
+  // from ctx->r13 -- a guest-controlled register -- with no null check
+  // on the thread and no validation: a rewritten r13 wrote IRQL /
+  // dpc_active into arbitrary guest memory (same class as A3-R9-09),
+  // and End re-derived it again, so a DPC routine that rewrote r13
+  // mid-execution restored the wrong PCR. Use the kernel-assigned PCR
+  // address instead (XThread::pcr_ptr(), public, set at Create time):
+  // it is never guest input, and Begin/End now agree even if r13
+  // moves. No current guest thread (or no PCR yet) yields an invalid
+  // scope, which End treats as a no-op.
   DPCImpersonationScope scope;
+  scope.previous_irql_ = 0;
+  scope.valid_ = false;
+  auto* thread = XThread::GetCurrentThread();
+  if (!thread || !thread->thread_state()) {
+    return scope;
+  }
+  uint32_t pcr_address = thread->pcr_ptr();
+  if (!pcr_address) {
+    return scope;
+  }
+  auto pcr = memory_->TranslateVirtual<X_KPCR*>(pcr_address);
   scope.previous_irql_ = pcr->current_irql;
   pcr->current_irql = IRQL_DISPATCH;
   pcr->prcb_data.dpc_active = 1;
+  scope.valid_ = true;
   return scope;
 }
 
 void KernelState::EndDPCImpersonation(const DPCImpersonationScope& scope) {
+  if (!scope.valid_) {
+    return;
+  }
   auto* thread = XThread::GetCurrentThread();
-  auto* ctx = thread->thread_state()->context();
-  auto pcr = memory_->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  if (!thread || !thread->thread_state()) {
+    return;
+  }
+  uint32_t pcr_address = thread->pcr_ptr();
+  if (!pcr_address) {
+    return;
+  }
+  auto pcr = memory_->TranslateVirtual<X_KPCR*>(pcr_address);
   pcr->prcb_data.dpc_active = 0;
   pcr->current_irql = scope.previous_irql_;
 }
