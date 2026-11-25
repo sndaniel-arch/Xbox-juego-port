@@ -800,7 +800,17 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
     return X_STATUS_INVALID_HANDLE;
   }
 
-  uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
+  // (Hunt v1.4.6, caza ronda 15, A3-R15-03.) The timeout is a
+  // LARGE_INTEGER in 100ns ticks, negative = relative -- the full
+  // 64-bit value, like every threading sibling (KeWaitForSingleObject,
+  // NtWaitForSingleObjectEx, NtWaitForMultipleObjectsEx, KeSetTimer
+  // all pass static_cast<uint64_t>(*timeout_ptr)). The old
+  // static_cast<uint32_t> kept only the low dword: a relative wait of
+  // -1s (0xFFFFFFFFFF676980) became 0xFF676980, which
+  // TimeoutTicksToMs reads as a positive absolute deadline in the
+  // past and answers with 0 ms -- so any relative wait on an IO
+  // completion port timed out immediately instead of waiting.
+  uint64_t timeout_ticks = timeout ? static_cast<uint64_t>(*timeout)
                                    : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
   XIOCompletion::IONotification notification;
   if (port->WaitForNotification(timeout_ticks, &notification)) {
