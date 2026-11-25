@@ -25,7 +25,7 @@
 #   __imp__sub_824C4C00: `lwz r3,156(r31)` / `cmplwi cr6,r3,0` /
 #   `if (cr6.eq) goto loc_824C4C94;` -> return 0).
 #
-# THE FIX (this script, two sites in the SDK-syntax generated tree):
+# THE FIX (this script, three sites in the SDK-syntax generated tree):
 #   1. sub_824C5150 (childoflight_recomp.90.cpp): after loading r4 = *(this+156),
 #      if it is 0, create the sub-object exactly as sub_824C4FD8 would
 #      (Alloc(60, 66) via sub_827AE488, then Ctor sub_8242EAC8, store to +156).
@@ -52,6 +52,22 @@
 #   2. sub_824C4B70 (childoflight_recomp.46.cpp), the +152 == 4 branch: same
 #      recovery after loading r3 = *(this+156); if still 0, goto loc_824C4BE4
 #      (the existing "state != 4" path, which calls sub_824C6B20 instead).
+#   3. sub_824C52F8 (childoflight_recomp.99.cpp), the state-2 ONCE-HOOK
+#      (ronda 19, A2-R19-01): after loading r4 = *(this+156), same
+#      recovery; if the Alloc fails again, re-arm the once-flag (byte +51
+#      = 0, r4 is already 0 on that path) and goto loc_824C52F8_skip, a NEW
+#      label placed BEFORE the two sub_82410310 releases (r1+116, r1+108):
+#      the pre-guard bctrl (vtable offset 88 -> sub_82A61000 ->
+#      sub_82413FB8) already built two heap strings there (sub_82412398
+#      allocates via sub_824C4CB0 -> sub_827AE110), so they must be freed
+#      even on the skip path; SetState(2) then runs (state stays 2, as on
+#      entry) and sub_824C6568 retries the hook next frame. 52F8 passes
+#      +156 to sub_82459F10 through the wrapper sub_82488668 (mr r3,r4; bl
+#      59F10, no check) -- the R17 sweep missed it because it only traced
+#      DIRECT +156 loads feeding 59F10 calls, not wrapper-mediated ones.
+#      No r3 restore is needed here (unlike 5150): the original code sets
+#      r3 = r1+80 AFTER the +156 load, so the guard's clobber of r3 is
+#      overwritten before the call.
 #   A guard on sub_82459F10 ALONE is NOT enough: sub_82413AD8 does
 #   r3 = *(r3+48) and sub_82474328 does r3 = *(r31+52) with r31 = the result
 #   of sub_82459F10, so a NULL return from there would only move the crash.
@@ -145,6 +161,19 @@
 #     the heap never recovers, is the state-3 once-hook retrying every
 #     frame, not "state 2" as this note used to say.) If it stalls, the
 #     next step is guest-heap instrumentation, not a bigger guard.
+#   - (Ronda 19, A2-R19-01.) sub_827AE488 is also declared in
+#     childoflight_funcs.99.h:251; sub_8242EAC8 is declared in none of the
+#     target files, so the script's DECLARE insertion covers .99.cpp too.
+#     The 52F8 skip does NOT go to the epilogue: it lands before the two
+#     sub_82410310 releases so the heap strings built by the pre-guard
+#     bctrl are freed on the skip path; SetState(2) then runs (state stays
+#     2, its entry value) with the once-flag +51 re-armed. LIMIT: under a
+#     persistent heap exhaustion (H1) the pre-guard bctrl itself can fail
+#     first -- its string ctor sub_82412398 allocates via sub_824C4CB0 ->
+#     sub_827AE110 (same heap family) and stores to the result with NO null
+#     check, so a failed small alloc faults at guest 0 (0x100000000) BEFORE
+#     the guard point. This guard fixes the +156 path whenever those small
+#     allocs succeed; it cannot cover a failure inside the bctrl.
 #   - Idempotent: files already carrying the GUARD_R15_A2-R15-01 marker are
 #     skipped. Any target function or anchor that does not match EXACTLY
 #     fails the run (exit 1) instead of shipping unguarded code.
@@ -257,6 +286,61 @@ RECOVERY_4B70 = """\t// %s: +156 es el sub-objeto creado por sub_824C4FD8 (Alloc
 \t\t}
 \t}
 \tif (ctx.r3.u32 == 0) goto loc_824C4BE4;
+""" % MARKER
+
+# --- recovery snippet for sub_824C52F8 (r4 = *(this+156), this = ctx.r31) ---
+# Ronda 19 (A2-R19-01): the state-2 once-hook (vtable offset 44). Mirrors
+# RECOVERY_5150, with two differences: (1) no r3 restore -- the original
+# code sets r3 = r1+80 AFTER the +156 load, so the Alloc/Ctor clobber of r3
+# is overwritten before the sub_82488668 call; (2) the skip label is NOT
+# the epilogue: it sits BEFORE the two sub_82410310 releases, because the
+# pre-guard bctrl already allocated two heap strings at r1+108/r1+116 and
+# they must be freed even when the block is skipped (else one leak of two
+# strings per failed retry-frame while the heap stays exhausted).
+# SetState(2) still runs after the releases: the state stays 2 (its entry
+# value) and the re-armed flag (+51 = 0) makes sub_824C6568 retry the hook
+# next frame, exactly as 5150's skip leaves state 3 with +52 re-armed.
+RECOVERY_52F8 = """\t// %s: +156 es el sub-objeto creado por sub_824C4FD8 (Alloc(60, heap 66)
+\t// + Ctor sub_8242EAC8); el ctor base pone +156 = 0 y solo sub_824C4FD8 lo
+\t// llena. En el crash de R14 llega a 0 (init no corrio o el Alloc fallo)
+\t// y sub_82488668 lo pasa como `this` a sub_82459F10, que lee [r3+4] ->
+\t// SIGSEGV en base+4 (el mismo crash que en sub_824C5150, por el otro
+\t// once-hook). Si falta, se crea aqui como haria el init; si el Alloc
+\t// vuelve a fallar se salta el bloque (sin crash). OJO (ronda 19,
+\t// A2-R19-01): sub_824C52F8 es el once-hook del estado 2 (vtable offset
+\t// 44; el per-frame del estado 2 es sub_824C4D70, offset 52).
+\t// sub_824C6568 pone el flag once (+51) a 1 ANTES de llamar, asi que el
+\t// salto rearma el flag (+51 = 0) y el proximo frame lo reintenta; sin
+\t// el rearmado el init se perderia para siempre. El salto cae ANTES de
+\t// las dos liberaciones sub_82410310 (r1+116 y r1+108): el bctrl previo
+\t// (vtable offset 88 -> sub_82A61000 -> sub_82413FB8) ya construyo esas
+\t// dos cadenas en el heap y hay que liberarlas aunque el bloque se
+\t// salte; despues corre SetState(2) (el estado queda en 2, como a la
+\t// entrada) y el epilogo. Idioma propio del juego: sub_824C4C00 chequea
+\t// +156 == 0 antes de llamar a sub_82459F10.
+\tif (ctx.r4.u32 == 0) {
+\t\tctx.r3.s64 = 60;
+\t\tctx.r4.s64 = 66;
+\t\tctx.lr = 0x824C5330;
+\t\tsub_827AE488(ctx, base);
+\t\tif (ctx.r3.u32 != 0) {
+\t\t\tctx.lr = 0x824C5330;
+\t\t\tsub_8242EAC8(ctx, base);
+\t\t\tREX_STORE_U32(ctx.r31.u32 + 156, ctx.r3.u32);
+\t\t\tctx.r4.u64 = ctx.r3.u64;
+\t\t}
+\t}
+\tif (ctx.r4.u32 == 0) {
+\t\t// A2-R19-01: rearmar el once-hook del estado 2 (byte +51 a 0) para
+\t\t// que sub_824C6568 vuelva a llamar a sub_824C52F8 el proximo frame.
+\t\t// r4 ya es 0 en esta rama (es la condicion del salto) y r31 sigue
+\t\t// siendo `this`; el salto cae antes de las liberaciones 810310, que
+\t\t// leen solo r1+116/r1+108 (construidos por el bctrl previo), y de
+\t\t// SetState(2). Solo dos sitios escriben este flag en esta clase:
+\t\t// el ctor sub_824C6980 (= 0) y sub_824C6568 (= 1).
+\t\tREX_STORE_U8(ctx.r31.u32 + 51, ctx.r4.u8);
+\t\tgoto loc_824C52F8_skip;
+\t}
 """ % MARKER
 
 # --- recovery snippets inserted BEFORE the +156 load (ronda 17) ---
@@ -396,6 +480,41 @@ TARGETS = {
         "recovery": RECOVERY_4B70,
         "label_anchor": None,  # reuses the existing loc_824C4BE4 label
         "label": None,
+        "skip_label": None,
+    },
+    # --- ronda 19: A2-R19-01, state-2 once-hook (same class, wrapper path) ---
+    # Found by tracing 59F10 calls through wrappers (r3 = r4 parameters):
+    # sub_82488668 does `mr r3,r4; bl 59F10`, and its only caller is 52F8
+    # with r4 = *(this+156). The R17 sweep missed it: it only traced DIRECT
+    # +156 loads feeding 59F10 calls. The other r3=r4 wrappers (67C10,
+    # 67938, 62B88, 67048, 65098, 66948, 67508, 62A88, 65AD8) take *(r30+136)
+    # or *(r30+148) from OTHER classes -- same shape, no proof of
+    # nullability, not guarded (see hunt-v146-round19/evidence-a2.md).
+    "sub_824C52F8": {
+        "file_hint": "childoflight_recomp.99.cpp",
+        "mode": "after",
+        # Anchor: the load of +156 only (2 lines). Unlike 5150, the
+        # `// bl 0x82488668` comment does NOT follow the load directly:
+        # the original code sets r3 = r1+80 between them, so a 3-line
+        # anchor would never match. The recovery needs no r3 restore for
+        # the same reason (see RECOVERY_52F8).
+        "anchors": [(
+            "\t// lwz r4,156(r31)\n"
+            "\tctx.r4.u64 = REX_LOAD_U32(ctx.r31.u32 + 156);\n"
+        )],
+        "insert_after_anchor_line": 2,  # after the REX_LOAD_U32 line
+        "recovery": RECOVERY_52F8,
+        # Label anchor: the skip label goes BEFORE the first sub_82410310
+        # release (not at the epilogue): the pre-guard bctrl already
+        # allocated two heap strings at r1+108/r1+116 and they must be
+        # freed even on the skip path; SetState(2) then runs (state stays
+        # 2) and the epilogue follows. The label is inserted after the
+        # `sub_8248BA00(ctx, base);` line, i.e. before `// addi r3,r1,116`.
+        "label_anchor": (
+            "\tsub_8248BA00(ctx, base);\n"
+            "\t// addi r3,r1,116\n"
+        ),
+        "label": "loc_824C52F8_skip:\n",
         "skip_label": None,
     },
     # --- ronda 17: A2-R17-01, same `this` (r30 = entry r3), two sites ---
