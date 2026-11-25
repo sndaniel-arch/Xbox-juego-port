@@ -1780,9 +1780,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
+    // (Caza v1.4.6 ronda 16, A1-R16-01.) The flow's host render target is
+    // the WINDOW, not the swapchain image: GetGuestOutputPaintFlow
+    // returns the output rectangle in host-render-target space, and the
+    // final-effect rotation below (RotateRectangleForSwapchainPreTransform,
+    // ronda 15) converts it from window space to swapchain (buffer)
+    // space exactly once. Passing the swapchain extent here made the flow
+    // stretch the window rect into buffer space by independent per-axis
+    // rescaling (2340x1080 -> 1080x2340 turns (210,0,1920,1080) into
+    // (97,0,886,2340)) and then the rotation rotated it a second time:
+    // the R15 phone screenshot (game sideways, left ~885 px of the screen)
+    // is that double-rotated rect to the pixel. With a pre-rotated
+    // swapchain the extent and the window differ in orientation, so the
+    // two must never be confused; without pre-rotation they are equal
+    // and this change is a no-op. The D3D12 call site is untouched: on
+    // desktop the swapchain extent always equals the window size.
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
-        guest_output_properties, paint_context_.swapchain_extent.width,
-        paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
+        guest_output_properties, surface_width_in_paint_connection_,
+        surface_height_in_paint_connection_, max_framebuffer_extent.width,
         max_framebuffer_extent.height, guest_output_paint_config);
     // Diagnostic for the clipped title/loading screens (Bug 1): log the
     // paint geometry whenever it changes, so the phone log shows whether the
@@ -1792,12 +1807,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // 2340x1080 surface) and cannot produce it from a correct guest image,
     // so the remaining question is which of these two numbers is short on
     // the title screen.
+    // (Caza v1.4.6 ronda 16, A1-R16-01.) The window size and the
+    // pre-transform are logged too: after the flow fix the output rect
+    // must be in WINDOW space ((210,0) 1920x1080 on this phone), while
+    // the swapchain stays in buffer space (1080x2340). If the output
+    // rect ever shows buffer-space numbers again ((97,0) 886x2340), the
+    // flow is being fed the swapchain extent as host render target again.
     if (guest_output_flow.effect_count) {
       static std::mutex paint_geometry_log_mutex;
-      static std::array<int64_t, 10> last_paint_geometry{};
+      static std::array<int64_t, 13> last_paint_geometry{};
       const std::pair<uint32_t, uint32_t>& final_output_size =
           guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1];
-      std::array<int64_t, 10> paint_geometry = {
+      std::array<int64_t, 13> paint_geometry = {
           int64_t(guest_output_properties.frontbuffer_width),
           int64_t(guest_output_properties.frontbuffer_height),
           int64_t(guest_output_properties.display_aspect_ratio_x),
@@ -1807,21 +1828,26 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           int64_t(guest_output_flow.output_x),
           int64_t(guest_output_flow.output_y),
           int64_t(final_output_size.first),
-          int64_t(final_output_size.second)};
+          int64_t(final_output_size.second),
+          int64_t(surface_width_in_paint_connection_),
+          int64_t(surface_height_in_paint_connection_),
+          int64_t(uint32_t(paint_context_.swapchain_pre_transform))};
       {
         std::lock_guard<std::mutex> lock(paint_geometry_log_mutex);
         if (paint_geometry != last_paint_geometry) {
           last_paint_geometry = paint_geometry;
           REXLOG_INFO(
               "VulkanPresenter: paint geometry guest {}x{} aspect {}:{} swapchain {}x{} "
-              "output ({} ,{}) {}x{}",
+              "output ({} ,{}) {}x{} window {}x{} pre-transform {}",
               guest_output_properties.frontbuffer_width,
               guest_output_properties.frontbuffer_height,
               guest_output_properties.display_aspect_ratio_x,
               guest_output_properties.display_aspect_ratio_y,
               paint_context_.swapchain_extent.width,
               paint_context_.swapchain_extent.height, guest_output_flow.output_x,
-              guest_output_flow.output_y, final_output_size.first, final_output_size.second);
+              guest_output_flow.output_y, final_output_size.first, final_output_size.second,
+              surface_width_in_paint_connection_, surface_height_in_paint_connection_,
+              uint32_t(paint_context_.swapchain_pre_transform));
         }
       }
     }
