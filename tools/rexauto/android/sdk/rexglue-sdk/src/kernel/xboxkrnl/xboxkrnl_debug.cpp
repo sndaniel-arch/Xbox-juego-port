@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
+
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -271,6 +273,23 @@ void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4
   fflush(stdout);
   rex::debug::Break();
   assert_always();
+  // (Hunt v1.4.6, caza ronda 22, A3-R22-01.) On real hardware KeBugCheck
+  // never returns: the title is dead. Here it did return -- Break() is
+  // a no-op without a debugger attached (dbg_posix.cpp swallows the
+  // first SIGTRAP and returns) and assert_always() is a no-op in
+  // Release -- so the game kept running with whatever inconsistent
+  // state made it bugcheck, and the failure surfaced later as an
+  // unrelated crash or silent corruption. The game calls KeBugCheck
+  // (code 242, via sub_82A3DAE8) and KeBugCheckEx (7 sites in
+  // ppc_recomp.250.cpp, 3 in .260.cpp) on internal-inconsistency
+  // paths, including the R21 guard tripwire (sub_82A365C0 tail-calls
+  // sub_82A3DAE8 when a guard value differs). Abort after giving a
+  // debugger its chance: the STOP line above stays in the log, and
+  // the process dies with SIGABRT instead of continuing silently.
+  // No correct guest code can depend on returning from KeBugCheck --
+  // on the 360 the code after the call is dead -- so this only
+  // changes behaviour on paths that were already fatal.
+  std::abort();
 }
 
 void KeBugCheck_entry(u32 code) {
