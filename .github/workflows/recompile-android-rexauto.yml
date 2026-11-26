@@ -173,19 +173,22 @@ jobs:
     # honoured in full. (V-A5-01 added the Python-deps timeout to the
     # count: it was untimed before, so the old sum missed it.)
     # (A5-R7-11, ronda 7; aritmetica corregida A5-R8-05, ronda 8;
-    # actualizada A5-R14-01, ronda 14; corregida A5-R19-05, ronda 19.)
+    # actualizada A5-R14-01, ronda 14; corregida A5-R19-05, ronda 19;
+    # actualizada A5-R23-01, ronda 23.)
     # The old comment also assumed the steps WITHOUT a timeout
     # (checkouts, injections, localize, pack, uploads, ...) fit in the
-    # 10 min left over -- an untested hypothesis. 28 of the 29 steps in
+    # 10 min left over -- an untested hypothesis. 29 of the 30 steps in
     # this job now carry their own timeout-minutes, and their sum is
-    # 570, not the 560 the R14-01 comment claimed: the six long steps
-    # sum to 350 (10 + 10 + 30 + 60 + 60 + 180) and the other 22 timed
-    # steps sum to 220. The R14-01 arithmetic predates the "Guard R14
+    # 585, not the 560 the R14-01 comment claimed: the six long steps
+    # sum to 350 (10 + 10 + 30 + 60 + 60 + 180) and the other 23 timed
+    # steps sum to 235. The R14-01 arithmetic predates the "Guard R14
     # crash" step (ronda 15, A2-R15-01, 10 min), which added one timed
-    # step and 10 min without updating this comment (560 + 10 = 570).
+    # step and 10 min without updating this comment (560 + 10 = 570),
+    # and the R23-01 port-src retry step (ronda 23, A5-R23-01, 15 min),
+    # which adds one timed step and 15 min (570 + 15 = 585).
     # Only "Validate inputs" has no timeout (a one-line regex that
     # cannot hang). Step timeouts are per-step ATTRIBUTION caps, NOT an
-    # additive budget: their sum (570) exceeds the job ceiling by
+    # additive budget: their sum (585) exceeds the job ceiling by
     # design -- steps run sequentially and the job timeout (360) is
     # still the hard ceiling that fires first if the run as a whole
     # overruns. A step cap only fires when that single step hangs past
@@ -983,6 +986,13 @@ jobs:
           $r22Total = @(Select-String -Path "$gen\childoflight_recomp.*.cpp" -Pattern "GUARD_R22").Count
           if ($r22Total -lt 57) { Write-Host "::error::R22 guard did not land: $r22Total GUARD_R22 markers (expected >= 57: 10 sibling + 47 crash-(ii))"; exit 1 }
           Write-Host "R22 guard verified: $r22Total GUARD_R22 markers (10 sibling + 47 crash-(ii))"
+          # (Hunt v1.4.6, ronda 23, R23-GUARD-01.) Tripwire R23: 26
+          # marcadores GUARD_R23 (26 crash-(ii) 61508 diferidos de R22)
+          # en el arbol generado. Si la guardia R23 no aterriza, el run
+          # falla aqui aunque el script saliera exit 0.
+          $r23Total = @(Select-String -Path "$gen\childoflight_recomp.*.cpp" -Pattern "GUARD_R23").Count
+          if ($r23Total -lt 26) { Write-Host "::error::R23 guard did not land: $r23Total GUARD_R23 markers (expected >= 26: 26 crash-(ii) 61508)"; exit 1 }
+          Write-Host "R23 guard verified: $r23Total GUARD_R23 markers (26 crash-(ii) 61508)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
@@ -1079,9 +1089,44 @@ jobs:
       # (Upload logs below keeps if: always(): logs are diagnostics,
       # not a build input.)
       - uses: actions/upload-artifact@v7
+        id: upload-port-src
         timeout-minutes: 15
         with:
           name: port-src-${{ env.REX_PROJECT }}
+          path: |
+            ${{ runner.temp }}/port-src.zip
+            ${{ runner.temp }}/cover.png
+          if-no-files-found: error
+          retention-days: 7
+
+      # (Hunt v1.4.6, ronda 23, A5-R23-01.) Retry-once fallback for the
+      # port-src upload (cierra A5-R19-08, diferido en R19/R20/R22).
+      # upload-artifact already retries each request 5 times with
+      # backoff inside the action, so this step only fires on a failure
+      # the action itself gave up on -- a transient service blip after
+      # a full ~19 min codegen, or the first run after the storage flag
+      # lifts. The retry uploads under a DIFFERENT name
+      # (port-src-...-retry): since v4 artifacts are immutable and a
+      # name is unique per run, re-uploading the same name would fail
+      # with 409 Conflict if the first attempt created the artifact
+      # record before dying. The condition is deliberately narrow --
+      # only when THIS upload step failed
+      # (steps.upload-port-src.outcome == 'failure'), never on a bare
+      # if: failure(): if an earlier step failed, this upload never ran
+      # and there is no verified port-src.zip to preserve. The run
+      # still goes red (a failed step cannot be un-failed): the retry
+      # only preserves the bytes, so the deliverable survives without a
+      # full re-dispatch. If the failure was the storage quota, the
+      # retry fails too and the run names the upload step -- the human
+      # action is still freeing storage, never code. Never a release
+      # fallback: docs/DMCA.md forbids publishing the APK as a public
+      # release.
+      - uses: actions/upload-artifact@v7
+        id: upload-port-src-retry
+        if: failure() && steps.upload-port-src.outcome == 'failure'
+        timeout-minutes: 15
+        with:
+          name: port-src-${{ env.REX_PROJECT }}-retry
           path: |
             ${{ runner.temp }}/port-src.zip
             ${{ runner.temp }}/cover.png
@@ -1104,14 +1149,15 @@ jobs:
     name: "APK (arm64-v8a)"
     needs: recompile
     runs-on: ubuntu-24.04
-    # (A5-R8-06, ronda 8.) Same treatment R7-11 gave job 1: every step
+    # (A5-R8-06, ronda 8; actualizada A5-R23-01, ronda 23.) Same treatment R7-11 gave job 1: every step
     # in this job now carries its own timeout-minutes (the 6 steps that
     # already had one sum to 240; the 19 new ones sum to 350, for 590 in
-    # total). The two steps with real variance -- the Gradle cache restore
-    # (potentially GBs) and the ~1.6 GB APK upload -- get generous caps
-    # (60 each); the rest get attribution caps of 5-30 min. Step timeouts
+    # total; the R23-01 APK-upload retry step adds 60, for 650 in total).
+    # The three steps with real variance -- the Gradle cache restore
+    # (potentially GBs), the ~1.6 GB APK upload and its retry -- get
+    # generous caps (60 each); the rest get attribution caps of 5-30 min. Step timeouts
     # are per-step ATTRIBUTION caps, NOT an additive budget: their sum
-    # (590) exceeds the job ceiling (300) by design -- the job timeout is
+    # (650) exceeds the job ceiling (300) by design -- the job timeout is
     # still the hard ceiling, and a step cap only fires when that single
     # step hangs past its own cap, so the failure names the hanging step
     # instead of dying anonymously at the job timeout.
@@ -1781,9 +1827,29 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
+        id: upload-apk
         timeout-minutes: 60
         with:
           name: ${{ env.REX_PROJECT }}-android-apk
+          path: ${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # (Hunt v1.4.6, ronda 23, A5-R23-01.) Same retry-once fallback as
+      # the port-src upload above (same reasoning: the action already
+      # retries x5 internally; a distinct -retry name avoids the v4+
+      # 409 on same-name re-upload; the narrow condition fires only
+      # when THIS upload step failed, so a failed Verify APK step can
+      # never smuggle an unverified APK into an artifact; the run still
+      # goes red and the retry only preserves the bytes of an APK that
+      # passed every gate, saving a full ~30 min re-dispatch to recover
+      # it. Quota failure fails the retry too, loudly.)
+      - uses: actions/upload-artifact@v7
+        id: upload-apk-retry
+        if: failure() && steps.upload-apk.outcome == 'failure'
+        timeout-minutes: 60
+        with:
+          name: ${{ env.REX_PROJECT }}-android-apk-retry
           path: ${{ runner.temp }}/${{ env.REX_PROJECT }}-android.apk
           if-no-files-found: error
           retention-days: 7
