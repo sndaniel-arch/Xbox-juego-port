@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+
+# RONDA 21 (multi-target, familia sub_82461508 + P20-A2-01):
+#   62 sitios en 58 funciones (A2-R20-01, diferido en R20): 25 RECOVER
+#   (+136 ENTRY, forma A) + 37 SKIP-ONLY (+148, +156, otros offsets, MID).
+#   Dos inserciones por sitio (Guard-A tras el stw / tras la carga, nunca
+#   antes de la carga; Guard-B tras el `bl 61508`), mismo skip label.
+#   Deteccion de aplicado POR TARGET (tag GUARD_R21_MT), no por fichero:
+#   un fichero con la guardia vieja recibe sus targets MT nuevos en el
+#   mismo pase. 147 marcadores MT en total (124 bloques + 23 DECLAREs
+#   sub_82434368). P20-A2-01: 0 guardables en R21 (A4, INDETERMINADO).
+#   Detalle y decisiones en hunt-v146-round21-fixes/RUNBOOK.md y
+#   work-a2/DESIGN-multi-target.md (§9: Guard-A tras el stw; §10: r6).
 # Post-codegen guard pass for the deterministic R14 crash (hunt v1.4.6, ronda 15,
 # A2-R15-01). Runs on the GENERATED tree, after tools/localize_fix_col.py and
 # before the pack step, like the localize pass (same CLI: a glob of
@@ -191,6 +203,7 @@
 # Local check: python3 tools/guard_r15_col.py --dry-run <glob>
 
 import glob
+import os
 import re
 import sys
 
@@ -653,6 +666,236 @@ TARGETS = {
     },
 }
 
+# --- RONDA 21: modo MULTI-TARGET (familia sub_82461508 + P20-A2-01) ---
+# 62 sitios en 58 funciones (A2-R20-01, diferido en R20 por no caber en
+# una extension de guardia normal: 116 inserciones). Dos inserciones por
+# sitio con el MISMO skip label (auditado por funcion en
+# hunt-v146-round21-fixes/work-a2/a1-136-sites.md, a2-148-156-sites.md y
+# a3-other-mid-sites.md):
+#   Guard-A (crash (i), campo de entrada == 0): DESPUES del `stw
+#   r10,NNN(r1)` (o despues de la carga si no hay stw), NUNCA antes de la
+#   carga -- el epilogo lee el slot NNN via sub_82A365C0 y el slot debe
+#   estar escrito antes de cualquier salto (DESIGN-multi-target.md §9).
+#   RECOVER (+136 ENTRY, 25): crea el sub-objeto como el ctor hermano
+#   (Alloc(24, heap 4) via sub_824C4CB0 + Ctor sub_82434368, r4=1); si el
+#   Alloc vuelve a fallar, goto skip. r6 se fija a 0x40C00000 como en el
+#   ctor: sub_824C4CB0 elige r5=66 con ese valor (si no, r5=1) (§10).
+#   SKIP-ONLY (37): solo `if (r3==0) goto skip` (sin recovery probado).
+#   Guard-B (crash (ii), 61508 devuelve 0): DESPUES del `bl 61508`, antes
+#   del `lwz rX,28(r3)`: `if (r3==0) goto skip`.
+# Deteccion de aplicado POR TARGET (no por fichero): cada bloque lleva el
+# tag `GUARD_R21_MT <func>+<off>-<kind>`; un fichero ya guardado (p. ej.
+# .90.cpp con 5150) recibe sus targets MT nuevos en el mismo pase.
+# P20-A2-01 (67 sitios `*(param+0)` -> 59F10): 0 guardables en R21 (A4:
+# todos INDETERMINADO, dispatcher sin identificar) -- no esta aqui.
+# Marcadores MT: 2 por sitio (Guard-A + Guard-B) + 1 DECLARE sub_82434368
+# por fichero RECOVER cuyo header no lo declare (23) = 147 en total.
+
+MT_MARKER = "GUARD_R21_MT"
+
+_MT_GUARD_A_RECOVER = """\t// %(marker)s %(tag)s: +%(off)s es el sub-objeto creado por los ctores hermanos
+\t// (Alloc(24, heap 4) via sub_824C4CB0 + Ctor sub_82434368, r4=1); los
+\t// ctores ponen +%(off)s = 0 si el Alloc falla, y sub_82461508 lee [r3+8]
+\t// -> SIGSEGV en base+8 (crash (i)). Si falta, se crea aqui como haria
+\t// el ctor; si el Alloc vuelve a fallar se salta a %(skip)s (sin crash).
+\t// r6 se fija a 0x40C00000 como en el ctor: sub_824C4CB0 elige r5=66 con
+\t// ese valor (si no, r5=1); r6 es volatil y muerto aqui. %(base)s es no
+\t// volatil: sobrevive al Alloc/ctor. r3 ya trae el valor del campo.
+\tif (ctx.r3.u32 == 0) {
+\t\tctx.r6.s64 = 1086324736;
+\t\tctx.r4.s64 = 4;
+\t\tctx.r3.s64 = 24;
+\t\tctx.lr = %(lr)s;
+\t\tsub_824C4CB0(ctx, base);
+\t\tif (ctx.r3.u32 != 0) {
+\t\t\tctx.r4.s64 = 1;
+\t\t\tctx.lr = %(lr)s;
+\t\t\tsub_82434368(ctx, base);
+\t\t\tREX_STORE_U32(ctx.%(base)s.u32 + %(off)s, ctx.r3.u32);
+\t\t}
+\t}
+\tif (ctx.r3.u32 == 0) goto %(skip)s;
+"""
+
+_MT_GUARD_A_SKIP = """\t// %(marker)s %(tag)s: +%(off)s puede llegar a 0 (el ctor/writer almacena 0
+\t// si su Alloc falla); sub_82461508 lee [r3+8] -> SIGSEGV en base+8
+\t// (crash (i)). Sin recovery probado para este offset: se salta a
+\t// %(skip)s (sin crash, se descarta el mensaje de este frame).
+\tif (ctx.r3.u32 == 0) goto %(skip)s;
+"""
+
+_MT_GUARD_B = """\t// %(marker)s %(tag)s: sub_82461508 devuelve 0 si su Alloc(32) fallo
+\t// (crash (ii)); el `lwz rX,28(r3)` de abajo leeria [0+28] -> SIGSEGV
+\t// en base+28. Se salta a %(skip)s (sin crash).
+\tif (ctx.r3.u32 == 0) goto %(skip)s;
+"""
+
+
+def _mt_tag(mt):
+    return f"{mt[0]}+{mt[2]}-{mt[3]}"
+
+
+def mt_guard_a(mt):
+    tag = _mt_tag(mt)
+    # skip SIN el ':' de la definicion: es destino de goto, no etiqueta.
+    skip = mt[10] if mt[10] is not None else mt[11][0].rstrip("\n").rstrip(":")
+    if mt[9] == "RECOVER":
+        return _MT_GUARD_A_RECOVER % {
+            "marker": MT_MARKER, "tag": tag, "off": mt[2],
+            "base": mt[8], "lr": mt[6], "skip": skip}
+    return _MT_GUARD_A_SKIP % {
+        "marker": MT_MARKER, "tag": tag, "off": mt[2], "skip": skip}
+
+
+def mt_guard_b(mt):
+    tag = _mt_tag(mt)
+    # skip SIN el ':' de la definicion (destino de goto).
+    skip = mt[10] if mt[10] is not None else mt[11][0].rstrip("\n").rstrip(":")
+    return _MT_GUARD_B % {
+        "marker": MT_MARKER, "tag": tag, "skip": skip}
+
+
+# func, file_no, off, kind, load_base, slot, lr, deref, base,
+# verdict, skip (existente) o None, new_label o None.
+# new_label: (label, (anchor_lines...), label_after).
+TARGETS_MT = [
+    ("sub_82463320", 70, 136, "ENTRY", "r3", None, "0x82463338", "r11", "r30", "RECOVER", None, ('loc_82463320_skip:\n', ('\tctx.lr = 0x824635C8;', '\tsub_82410310(ctx, base);', '\t// addi r1,r1,176'), 2)),
+    ("sub_82463830", 65, 136, "ENTRY", "r3", 768, "0x82463858", "r9", "r26", "RECOVER", "loc_82463DA8", None),
+    ("sub_82463FC8", 182, 136, "ENTRY", "r3", 688, "0x82463FEC", "r9", "r30", "RECOVER", "loc_824642C8", None),
+    ("sub_82464590", 173, 136, "ENTRY", "r3", 400, "0x824645B4", "r9", "r29", "RECOVER", "loc_82464788", None),
+    ("sub_8246A8D8", 184, 136, "ENTRY", "r3", 496, "0x8246A8FC", "r9", "r30", "RECOVER", "loc_8246ADBC", None),
+    ("sub_8246ADD0", 58, 136, "ENTRY", "r3", 768, "0x8246ADF4", "r9", "r30", "RECOVER", "loc_8246B278", None),
+    ("sub_8246B698", 11, 136, "ENTRY", "r3", 912, "0x8246B6BC", "r9", "r24", "RECOVER", "loc_8246C0D4", None),
+    ("sub_8246C508", 3, 136, "ENTRY", "r3", 752, "0x8246C52C", "r9", "r30", "RECOVER", "loc_8246C988", None),
+    ("sub_8246CE08", 80, 136, "ENTRY", "r3", 480, "0x8246CE2C", "r9", "r30", "RECOVER", "loc_8246D21C", None),
+    ("sub_8246D230", 106, 136, "ENTRY", "r3", 496, "0x8246D254", "r9", "r30", "RECOVER", "loc_8246D5B0", None),
+    ("sub_8246E088", 79, 136, "ENTRY", "r3", 784, "0x8246E0AC", "r9", "r30", "RECOVER", "loc_8246E47C", None),
+    ("sub_8246E950", 136, 136, "ENTRY", "r3", 784, "0x8246E974", "r9", "r29", "RECOVER", "loc_8246EE3C", None),
+    ("sub_82470490", 168, 136, "ENTRY", "r3", 784, "0x824704B4", "r9", "r30", "RECOVER", "loc_824708D0", None),
+    ("sub_82471AF8", 18, 136, "ENTRY", "r3", 784, "0x82471B1C", "r9", "r30", "RECOVER", "loc_82471EC8", None),
+    ("sub_82471F10", 15, 136, "ENTRY", "r3", 480, "0x82471F34", "r9", "r30", "RECOVER", "loc_8247233C", None),
+    ("sub_82472858", 103, 136, "ENTRY", "r3", 496, "0x8247287C", "r9", "r30", "RECOVER", "loc_82472B10", None),
+    ("sub_82472D60", 50, 136, "ENTRY", "r3", 448, "0x82472D84", "r9", "r30", "RECOVER", "loc_82473118", None),
+    ("sub_82473128", 5, 136, "ENTRY", "r3", 496, "0x8247314C", "r9", "r30", "RECOVER", "loc_82473484", None),
+    ("sub_82473498", 169, 136, "ENTRY", "r3", 448, "0x824734BC", "r9", "r30", "RECOVER", "loc_82473898", None),
+    ("sub_824738A8", 115, 136, "ENTRY", "r3", 560, "0x824738CC", "r9", "r30", "RECOVER", "loc_82473C00", None),
+    ("sub_82473E50", 116, 136, "ENTRY", "r3", 448, "0x82473E74", "r9", "r30", "RECOVER", "loc_82474250", None),
+    ("sub_8247A160", 89, 136, "ENTRY", "r3", 960, "0x8247A184", "r9", "r30", "RECOVER", "loc_8247A57C", None),
+    ("sub_8247D2D0", 183, 136, "ENTRY", "r3", 480, "0x8247D2F4", "r9", "r30", "RECOVER", "loc_8247D654", None),
+    ("sub_82480580", 84, 136, "ENTRY", "r3", 704, "0x824805A4", "r9", "r30", "RECOVER", "loc_82480910", None),
+    ("sub_82487838", 117, 136, "ENTRY", "r3", 416, "0x8248785C", "r9", "r30", "RECOVER", "loc_82487AFC", None),
+    ("sub_8246A018", 117, 148, "ENTRY", "r3", 496, "0x8246A03C", "r9", None, "SKIP-ONLY", "loc_8246A2E4", None),
+    ("sub_8246C998", 102, 148, "ENTRY", "r3", 512, "0x8246C9BC", "r9", None, "SKIP-ONLY", "loc_8246CDF8", None),
+    ("sub_824708E0", 97, 148, "ENTRY", "r3", 512, "0x82470904", "r9", None, "SKIP-ONLY", "loc_82470BC8", None),
+    ("sub_82470BD8", 156, 148, "ENTRY", "r3", 480, "0x82470BFC", "r9", None, "SKIP-ONLY", "loc_82470EBC", None),
+    ("sub_82470ED0", 85, 148, "ENTRY", "r3", 496, "0x82470EF4", "r9", None, "SKIP-ONLY", "loc_824711A0", None),
+    ("sub_824714A0", 59, 148, "ENTRY", "r3", 768, "0x824714C4", "r9", None, "SKIP-ONLY", "loc_82471808", None),
+    ("sub_82471818", 76, 148, "ENTRY", "r3", 496, "0x8247183C", "r9", None, "SKIP-ONLY", "loc_82471AE8", None),
+    ("sub_82469A68", 99, 156, "ENTRY", "r3", 496, "0x82469A8C", "r9", None, "SKIP-ONLY", "loc_82469D2C", None),
+    ("sub_8247F4C8", 110, 52, "ENTRY", "r3", None, "0x8247F4E0", "r11", None, "SKIP-ONLY", "loc_8247F5EC", None),
+    ("sub_82485D98", 34, 140, "ENTRY", "r3", 688, "0x82485DBC", "r9", None, "SKIP-ONLY", "loc_824860AC", None),
+    ("sub_824849A8", 87, 144, "ENTRY", "r3", 720, "0x824849CC", "r9", None, "SKIP-ONLY", "loc_82484E64", None),
+    ("sub_82464CB8", 90, 152, "ENTRY", "r3", None, "0x82464CD0", "r11", None, "SKIP-ONLY", "loc_82464E9C", None),
+    ("sub_82464EA8", 162, 152, "ENTRY", "r3", None, "0x82464EC0", "r11", None, "SKIP-ONLY", "loc_8246508C", None),
+    ("sub_8246E490", 101, 152, "ENTRY", "r3", 800, "0x8246E4B4", "r9", None, "SKIP-ONLY", "loc_8246E93C", None),
+    ("sub_8246EE50", 190, 152, "ENTRY", "r3", 1040, "0x8246EE74", "r9", None, "SKIP-ONLY", "loc_8246F360", None),
+    ("sub_824770C0", 121, 152, "ENTRY", "r3", 416, "0x824770E4", "r9", None, "SKIP-ONLY", "loc_82477374", None),
+    ("sub_82477468", 104, 152, "ENTRY", "r3", 416, "0x8247748C", "r9", None, "SKIP-ONLY", "loc_8247772C", None),
+    ("sub_82478050", 152, 152, "ENTRY", "r3", 496, "0x82478074", "r9", None, "SKIP-ONLY", "loc_8247837C", None),
+    ("sub_8247DCC8", 113, 152, "ENTRY", "r3", 448, "0x8247DD00", "r9", None, "SKIP-ONLY", "loc_8247DF34", None),
+    ("sub_824711B0", 128, 168, "ENTRY", "r3", 512, "0x824711D4", "r9", None, "SKIP-ONLY", "loc_82471490", None),
+    ("sub_824635D0", 2, 172, "ENTRY", "r3", 400, "0x824635F4", "r9", None, "SKIP-ONLY", "loc_82463820", None),
+    ("sub_82486E78", 48, 172, "ENTRY", "r3", 688, "0x82486E9C", "r9", None, "SKIP-ONLY", "loc_8248720C", None),
+    ("sub_8246C0E8", 88, 184, "ENTRY", "r3", 592, "0x8246C10C", "r9", None, "SKIP-ONLY", "loc_8246C4F8", None),
+    ("sub_82469688", 73, 216, "ENTRY", "r3", 752, "0x824696AC", "r9", None, "SKIP-ONLY", "loc_82469A58", None),
+    ("sub_8246A2F8", 53, 216, "ENTRY", "r3", 480, "0x8246A31C", "r9", None, "SKIP-ONLY", "loc_8246A5D8", None),
+    ("sub_8246A5E8", 139, 216, "ENTRY", "r3", 480, "0x8246A60C", "r9", None, "SKIP-ONLY", "loc_8246A8C8", None),
+    ("sub_82469D40", 187, 224, "ENTRY", "r3", 496, "0x82469D64", "r9", None, "SKIP-ONLY", "loc_8246A008", None),
+    ("sub_82463FC8", 182, 136, "MID", "r30", None, "0x82464134", "r11", None, "SKIP-ONLY", "loc_824642C8", None),
+    ("sub_82485428", 93, 136, "MID", "r30", None, "0x82485548", "r11", None, "SKIP-ONLY", None, ('loc_82485428_skip:\n', ('\tsub_82410310(ctx, base);', '\t// addi r1,r1,224'), 1)),
+    ("sub_8246B398", 29, 172, "MID", "r31", None, "0x8246B4D0", "r11", None, "SKIP-ONLY", "loc_8246B68C", None),
+    ("sub_8246F370", 96, 152, "MID", "r30", None, "0x8246F7A0", "r11", None, "SKIP-ONLY", "loc_8246F9F4", None),
+    ("sub_8246FA08", 98, 152, "MID", "r30", None, "0x8246FD88", "r11", None, "SKIP-ONLY", "loc_8246FFA0", None),
+    ("sub_824770C0", 121, 152, "MID", "r31", None, "0x8247722C", "r11", None, "SKIP-ONLY", "loc_82477374", None),
+    ("sub_82477468", 104, 152, "MID", "r31", None, "0x824775D4", "r11", None, "SKIP-ONLY", "loc_8247772C", None),
+    ("sub_82477740", 146, 152, "MID", "r29", None, "0x8247795C", "r11", None, "SKIP-ONLY", "loc_8247803C", None),
+    ("sub_8247F780", 172, 140, "MID", "r3", None, "0x8247F7B8", "r11", None, "SKIP-ONLY", "loc_8247F9A4", None),
+    ("sub_824849A8", 87, 144, "MID", "r30", None, "0x82484B14", "r11", None, "SKIP-ONLY", "loc_82484E64", None),
+]
+
+MT_IDS = {f"{t[0]}+{t[2]}-{t[3]}" for t in TARGETS_MT}
+
+
+# Anclas propias (no siguen el patron estandar): func -> lineas Anchor-A
+# (sin el comentario `// bl` ni la linea `ctx.lr`, que se anaden despues).
+_MT_CUSTOM_ANCHOR_A = {
+
+    "sub_82463830": [
+        '\t// lwz r3,136(r3)',
+        '\tctx.r3.u64 = REX_LOAD_U32(ctx.r3.u32 + 136);',
+        '\t// li r31,0',
+        '\tctx.r31.s64 = 0;',
+        '\t// lwz r10,-26272(r11)',
+        '\tctx.r10.u64 = REX_LOAD_U32(r11.u32 + -26272);',
+        '\t// stw r10,768(r1)',
+        '\tREX_STORE_U32(ctx.r1.u32 + 768, ctx.r10.u32);',
+    ],
+    "sub_8247DCC8": [
+        '\t// lwz r3,152(r3)',
+        '\tctx.r3.u64 = REX_LOAD_U32(ctx.r3.u32 + 152);',
+        '\t// li r29,1',
+        '\tctx.r29.s64 = 1;',
+        '\t// li r31,0',
+        '\tctx.r31.s64 = 0;',
+        '\t// lwz r10,-26272(r11)',
+        '\tctx.r10.u64 = REX_LOAD_U32(r11.u32 + -26272);',
+        '\t// mr r28,r31',
+        '\tctx.r28.u64 = ctx.r31.u64;',
+        '\t// stb r29,276(r30)',
+        '\tREX_STORE_U8(ctx.r30.u32 + 276, ctx.r29.u8);',
+        '\t// stw r31,96(r1)',
+        '\tREX_STORE_U32(ctx.r1.u32 + 96, ctx.r31.u32);',
+        '\t// stw r10,448(r1)',
+        '\tREX_STORE_U32(ctx.r1.u32 + 448, ctx.r10.u32);',
+    ],
+}
+
+
+def mt_anchor_a(mt):
+    """(lineas Anchor-A, indice tras el que se inserta Guard-A).
+
+    Anchor-A: del comentario `// lwz` a la linea `ctx.lr`. Guard-A va
+    DESPUES del `stw` (sitios con slot) o DESPUES de la carga (sin stw),
+    nunca antes de la carga (DESIGN §9: el epilogo lee el slot)."""
+    func, _fno, off, _kind, load_base, slot, lr, _d, _b, _v, _s, _n = mt
+    if func in _MT_CUSTOM_ANCHOR_A:
+        lines = list(_MT_CUSTOM_ANCHOR_A[func])
+        insert_after = len(lines) - 1  # tras el stw
+    elif slot is not None:
+        lines = [
+            f"\t// lwz r3,{off}({load_base})",
+            f"\tctx.r3.u64 = REX_LOAD_U32(ctx.{load_base}.u32 + {off});",
+            "\t// lwz r10,-26272(r11)",
+            "\tctx.r10.u64 = REX_LOAD_U32(r11.u32 + -26272);",
+            f"\t// stw r10,{slot}(r1)",
+            f"\tREX_STORE_U32(ctx.r1.u32 + {slot}, ctx.r10.u32);",
+        ]
+        insert_after = len(lines) - 1  # tras el stw
+    else:
+        lines = [
+            f"\t// lwz r3,{off}({load_base})",
+            f"\tctx.r3.u64 = REX_LOAD_U32(ctx.{load_base}.u32 + {off});",
+        ]
+        insert_after = len(lines) - 1  # tras la carga
+    lines += ["\t// bl 0x82461508", f"\tctx.lr = {lr};"]
+    return lines, insert_after
+
+
+def mt_anchor_b(mt):
+    """Lineas Anchor-B (// bl + lr + call); Guard-B va tras la llamada."""
+    return ["\t// bl 0x82461508", f"\tctx.lr = {mt[6]};",
+            "\tsub_82461508(ctx, base);"]
+
 FUNC_RE = re.compile(r"^DEFINE_REX_FUNC\((sub_[0-9A-F]+)\) \{$")
 INCLUDE_RE = re.compile(r'^#include "(childoflight_funcs\.\d+\.h)"$')
 
@@ -750,67 +993,108 @@ def migrate_guard_file(path, text, eol, lines):
     return (migrated, False, None, eol.join(lines))
 
 
+# --- RONDA 21: nuevo guard_file + main (reemplazan a los de R15-R19) ---
+# Cambios: (1) la deteccion de "ya aplicado" es POR TARGET, no por
+# fichero (un fichero con la guardia vieja recibe sus targets MT nuevos
+# en el mismo pase); (2) los targets MT se aplican por sitio con
+# verificacion de ancla exactamente-una-vez y de skip label; (3) el
+# DECLARE de sub_82434368 se inserta solo si falta en el fichero Y en su
+# header hermano; (4) main() exige los 11 targets viejos Y los 62 MT.
+
+
+def _recovery_present(body, spec):
+    """True si el recovery del target viejo esta integro en el cuerpo."""
+    recs = spec.get("recoveries")
+    if recs is None:
+        recs = [spec["recovery"]]
+    for rec in recs:
+        if not _find_block(body, rec.rstrip("\n").split("\n")):
+            return False
+    return True
+
+
+def _insert_declare(lines, decl):
+    """Inserta decl tras el #include de childoflight_funcs.N.h.
+
+    Devuelve True si inserto, False si ya estaba. Falla cerrado (ValueError)
+    si no hay include."""
+    if decl in "\n".join(lines):
+        return False
+    for i, line in enumerate(lines):
+        if INCLUDE_RE.match(line):
+            lines.insert(i + 1, decl)
+            return True
+    raise ValueError("no childoflight_funcs.N.h include found")
+
+
 def guard_file(path, dry_run):
-    """Apply the guards for any target function present in this file.
+    """Aplica las guardias viejas y MT para los targets presentes en el
+    fichero. Devuelve (found_old, found_mt, error, new_text).
 
-    Returns (transformed_names, already_applied, error, new_text), where
-    transformed_names is the set of target functions transformed in this
-    file (empty when the file holds none of them), and new_text is the full
-    transformed file content (None when nothing changed).
-
-    The generated tree is CRLF (the SDK codegen emits \\r\\n); the file is
-    read and written with newline="" so the line ending is preserved
-    byte-for-byte -- a naive text-mode rewrite would flip every line to LF
-    and drown the diff in 36k unchanged lines.
-
-    This function NEVER writes to disk (ronda 17, A2-R17-04): main() writes
-    the collected new texts only after every file transformed cleanly and
-    every target was found, so a failed run modifies zero files."""
+    found_old: nombres de TARGETS viejos encontrados (aplicados ahora o ya
+    aplicados). found_mt: tags de TARGETS_MT encontrados. new_text es None
+    cuando el fichero no cambio. La funcion NUNCA escribe a disco (ronda
+    17, A2-R17-04): main() escribe solo despues de que TODOS los ficheros
+    pasen y todos los targets se encuentren."""
     with open(path, encoding="utf-8", errors="surrogateescape",
               newline="") as f:
         text = f.read()
     eol = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(eol)
-    if MARKER in text:
-        # (Ronda 18, A2-R18-04.) A file guarded by the R17 script is
-        # UPGRADED to the R18 recoveries, not skipped: see
-        # migrate_guard_file above.
-        return migrate_guard_file(path, text, eol, lines)
-    transformed = set()
+    found_old = set()
+    found_mt = set()
     changed = False
+    # --- Fase 0: migracion R17 -> R18 (solo si MARKER presente) ---
+    if MARKER in text:
+        migrated, _already, error, new_text = migrate_guard_file(
+            path, text, eol, lines)
+        if error:
+            return (set(), set(), error, None)
+        if new_text is not None:
+            lines = new_text.split(eol)
+            text = new_text
+            changed = True
+            found_old |= migrated
+    # --- Fase 1: targets viejos (por target, no por fichero) ---
     for name, spec in TARGETS.items():
         span = find_function_span(lines, name)
         if span is None:
-            continue  # target lives in another file of the glob
+            continue  # el target vive en otro fichero del glob
         start, end = span
-        body = lines[start : end + 1]
-        # A "before" target jumps to an existing label on Alloc failure:
-        # it must exist inside this function, or the guard would emit a
-        # goto to nowhere. Fail closed before inserting anything.
-        if spec.get("skip_label") is not None:
-            if not any(l.strip() == spec["skip_label"] + ":"
-                       for l in body):
-                return (set(), False,
-                        f"{path}: {name}: skip label "
-                        f"{spec['skip_label']} not found in function",
-                        None)
+        body = lines[start:end + 1]
+        body_text = "\n".join(body)
+        if MARKER in body_text and not _recovery_present(body, spec):
+            return (set(), set(),
+                    f"{path}: {name}: marcador viejo presente pero el "
+                    "recovery no esta integro (estado corrupto, no se "
+                    "adivina)",
+                    None)
+        if _recovery_present(body, spec):
+            if spec.get("label") is not None:
+                label = spec["label"].rstrip("\n")
+                if not any(l.strip() == label for l in body):
+                    return (set(), set(),
+                            f"{path}: {name}: recovery presente pero falta "
+                            f"la etiqueta {label} (estado corrupto)",
+                            None)
+            found_old.add(name)
+            continue
+        # Aplicacion fresca (logica R15-R19, sin cambios).
         recoveries = spec.get("recoveries")
         if recoveries is None:
             recoveries = [spec["recovery"]] * len(spec["anchors"])
         for anchor_text, recovery in zip(spec["anchors"], recoveries):
-            # Re-find the span (lines shift after each insert).
             span = find_function_span(lines, name)
             start, end = span
-            body = lines[start : end + 1]
+            body = lines[start:end + 1]
             anchor_lines = anchor_text.rstrip("\n").split("\n")
-            # Locate the anchor inside the function body.
             idx = None
             for i in range(len(body) - len(anchor_lines) + 1):
-                if body[i : i + len(anchor_lines)] == anchor_lines:
+                if body[i:i + len(anchor_lines)] == anchor_lines:
                     idx = i
                     break
             if idx is None:
-                return (set(), False,
+                return (set(), set(),
                         f"{path}: {name}: anchor not found verbatim -- "
                         "codegen output changed, refusing to guess",
                         None)
@@ -820,40 +1104,157 @@ def guard_file(path, dry_run):
                 insert_at = start + idx + spec["insert_after_anchor_line"]
             lines[insert_at:insert_at] = recovery.rstrip("\n").split("\n")
             changed = True
-            transformed.add(name)
+            found_old.add(name)
         if spec.get("label") is not None:
-            # Re-find the function span (lines shifted by the insert).
             span = find_function_span(lines, name)
             start, end = span
-            body = lines[start : end + 1]
+            body = lines[start:end + 1]
             label_lines = spec["label_anchor"].rstrip("\n").split("\n")
             lidx = None
             for i in range(len(body) - len(label_lines) + 1):
-                if body[i : i + len(label_lines)] == label_lines:
+                if body[i:i + len(label_lines)] == label_lines:
                     lidx = i
                     break
             if lidx is None:
-                return (set(), False,
+                return (set(), set(),
                         f"{path}: {name}: label anchor not found verbatim",
                         None)
             label_at = start + lidx + 1  # before `// addi r1,r1,128`
             lines[label_at:label_at] = [spec["label"].rstrip("\n")]
-    if not changed:
-        return (set(), False, None, None)
-    # sub_8242EAC8 is not declared in the target file's funcs header
-    # (only in childoflight_funcs.23.h); declare it next to the include.
-    for i, line in enumerate(lines):
-        if INCLUDE_RE.match(line):
-            decl = f"DECLARE_REX_FUNC(sub_8242EAC8);  // {MARKER}"
-            if decl not in "\n".join(lines):
-                lines.insert(i + 1, decl)
-            break
-    else:
-        return (set(), False,
-                f"{path}: no childoflight_funcs.N.h include found",
-                None)
-    new = eol.join(lines)
-    return (transformed, False, None, new)
+    # --- Fase 2: targets MT (por sitio, no por fichero) ---
+    for mt in TARGETS_MT:
+        func = mt[0]
+        tag = _mt_tag(mt)
+        span = find_function_span(lines, func)
+        if span is None:
+            continue  # el target vive en otro fichero del glob
+        start, end = span
+        body = lines[start:end + 1]
+        if MT_MARKER + " " + tag in "\n".join(body):
+            # Ya aplicado: verificar la etiqueta nueva si la hay.
+            if mt[11] is not None:
+                label = mt[11][0].rstrip("\n")
+                if not any(l.strip() == label for l in body):
+                    return (set(), set(),
+                            f"{path}: {func} ({mt[3]}): tag MT presente "
+                            f"pero falta la etiqueta {label}",
+                            None)
+            found_mt.add(tag)
+            continue
+        # Anclas: exactamente una vez cada una en la funcion.
+        a_lines, a_insert = mt_anchor_a(mt)
+        b_lines = mt_anchor_b(mt)
+        if len(_find_block(body, a_lines)) != 1:
+            return (set(), set(),
+                    f"{path}: {func} ({mt[3]}): ancla-A MT no casa "
+                    "exactamente una vez -- codegen output changed, "
+                    "refusing to guess",
+                    None)
+        if len(_find_block(body, b_lines)) != 1:
+            return (set(), set(),
+                    f"{path}: {func} ({mt[3]}): ancla-B MT no casa "
+                    "exactamente una vez -- codegen output changed, "
+                    "refusing to guess",
+                    None)
+        # Skip label: existente (debe estar en la funcion) o nueva
+        # (su label_anchor exactamente una vez, la etiqueta aun no existe).
+        if mt[11] is not None:
+            label, anchor_lines, label_after = mt[11]
+            if any(l.strip() == label.rstrip("\n") for l in body):
+                return (set(), set(),
+                        f"{path}: {func} ({mt[3]}): etiqueta nueva "
+                        f"{label.strip()} ya existe sin tag MT (estado "
+                        "corrupto)",
+                        None)
+            if len(_find_block(body, list(anchor_lines))) != 1:
+                return (set(), set(),
+                        f"{path}: {func} ({mt[3]}): label_anchor no casa "
+                        "exactamente una vez",
+                        None)
+        else:
+            skip = mt[10]
+            if not any(l.strip() == skip + ":" for l in body):
+                return (set(), set(),
+                        f"{path}: {func} ({mt[3]}): skip label {skip} "
+                        "not found in function",
+                        None)
+        # Guard-A (tras el stw o tras la carga; nunca antes de la carga).
+        span = find_function_span(lines, func)
+        start, end = span
+        body = lines[start:end + 1]
+        idx = _find_block(body, a_lines)[0]
+        ga = mt_guard_a(mt).rstrip("\n").split("\n")
+        lines[start + idx + a_insert + 1:start + idx + a_insert + 1] = ga
+        changed = True
+        # Guard-B (tras la llamada a 61508). Si la linea siguiente a la
+        # llamada ya lleva un bloque MT sin este tag, es estado corrupto.
+        span = find_function_span(lines, func)
+        start, end = span
+        body = lines[start:end + 1]
+        idx = _find_block(body, b_lines)[0]
+        after_call = start + idx + len(b_lines)
+        if after_call < len(lines) and MT_MARKER in lines[after_call]:
+            return (set(), set(),
+                    f"{path}: {func} ({mt[3]}): hay un bloque MT tras la "
+                    "llamada sin este tag (estado corrupto)",
+                    None)
+        gb = mt_guard_b(mt).rstrip("\n").split("\n")
+        lines[after_call:after_call] = gb
+        changed = True
+        # Etiqueta nueva si la hay (tras label_after lineas del ancla).
+        if mt[11] is not None:
+            label, anchor_lines, label_after = mt[11]
+            span = find_function_span(lines, func)
+            start, end = span
+            body = lines[start:end + 1]
+            lidx = _find_block(body, list(anchor_lines))[0]
+            lines[start + lidx + label_after:start + lidx + label_after] = [
+                label.rstrip("\n")]
+            changed = True
+        found_mt.add(tag)
+    # --- Fase 3: DECLAREs ---
+    if found_old:
+        # sub_8242EAC8 no esta declarado en los headers de los ficheros
+        # viejos (solo en childoflight_funcs.23.h).
+        try:
+            if _insert_declare(
+                    lines, f"DECLARE_REX_FUNC(sub_8242EAC8);  // {MARKER}"):
+                changed = True
+        except ValueError as e:
+            return (set(), set(), f"{path}: {e}", None)
+    mt_recover_here = [mt for mt in TARGETS_MT
+                       if _mt_tag(mt) in found_mt and mt[9] == "RECOVER"]
+    if mt_recover_here:
+        # sub_82434368: declararla solo si falta en el fichero Y en su
+        # header hermano (.106/.89 ya la tienen; las demas no).
+        m = re.match(r"childoflight_recomp\.(\d+)\.cpp$",
+                     path.replace("\\", "/").split("/")[-1])
+        if m is None:
+            return (set(), set(),
+                    f"{path}: no se pudo derivar el numero de fichero para "
+                    "el header hermano",
+                    None)
+        import os
+        hdr = os.path.join(os.path.dirname(path),
+                           f"childoflight_funcs.{m.group(1)}.h")
+        try:
+            with open(hdr, encoding="utf-8",
+                      errors="surrogateescape") as f:
+                htext = f.read()
+        except OSError:
+            return (set(), set(),
+                    f"{path}: no se pudo leer el header hermano {hdr}",
+                    None)
+        decl_mt = f"DECLARE_REX_FUNC(sub_82434368);  // {MT_MARKER}"
+        if ("DECLARE_REX_FUNC(sub_82434368)" not in htext
+                and decl_mt not in "\n".join(lines)):
+            try:
+                if _insert_declare(lines, decl_mt):
+                    changed = True
+            except ValueError as e:
+                return (set(), set(), f"{path}: {e}", None)
+    new_text = eol.join(lines) if changed else None
+    return (found_old, found_mt, None, new_text)
 
 
 def main():
@@ -881,31 +1282,34 @@ def main():
         return 1
     applied = []
     skipped = []
-    found = set()
+    found_old = set()
+    found_mt = set()
     pending = []  # (path, new_text): written only after all files pass
     for path in paths:
-        transformed, already, error, new_text = guard_file(path, dry_run)
+        fo, fm, error, new_text = guard_file(path, dry_run)
         if error:
             print(f"guard_r15_col: ERROR: {error}", file=sys.stderr)
             return 1
-        if transformed:
+        found_old |= fo
+        found_mt |= fm
+        if new_text is not None:
             pending.append((path, new_text))
-            found |= transformed
-        elif already:
+        elif fo or fm:
             skipped.append(path)
             print(f"guard_r15_col: already applied, skipped {path}")
-            # The marker is in the file: count the targets it defines.
-            with open(path, encoding="utf-8", errors="surrogateescape") as f:
-                t = f.read()
-            for name in TARGETS:
-                if f"DEFINE_REX_FUNC({name})" in t:
-                    found.add(name)
-    # Both targets must be present (guarded now or already applied).
-    missing = sorted(set(TARGETS) - found)
-    if missing:
-        print(f"guard_r15_col: ERROR: target(s) not guarded: {', '.join(missing)} "
-              "-- the generated tree does not contain them (glob or codegen "
-              "changed)", file=sys.stderr)
+    # Todos los targets deben estar presentes (guardados ahora o ya
+    # aplicados): los 11 viejos y los 62 MT.
+    missing_old = sorted(set(TARGETS) - found_old)
+    if missing_old:
+        print(f"guard_r15_col: ERROR: old target(s) not guarded: "
+              f"{', '.join(missing_old)} -- the generated tree does not "
+              "contain them (glob or codegen changed)", file=sys.stderr)
+        return 1
+    missing_mt = sorted(MT_IDS - found_mt)
+    if missing_mt:
+        print(f"guard_r15_col: ERROR: MT target(s) not guarded: "
+              f"{', '.join(missing_mt)} -- the generated tree does not "
+              "contain them (glob or codegen changed)", file=sys.stderr)
         return 1
     # (Ronda 17, A2-R17-04.) Write only now: every file transformed
     # cleanly and every target was found, so a failed run above modified
@@ -918,9 +1322,10 @@ def main():
         applied.append(path)
         print(f"guard_r15_col: guarded {path}")
     print(f"guard_r15_col: OK -- {len(applied)} file(s) guarded, "
-          f"{len(skipped)} already applied, targets: {', '.join(sorted(found))}")
+          f"{len(skipped)} already applied, old targets: "
+          f"{len(found_old)}/{len(TARGETS)}, MT targets: "
+          f"{len(found_mt)}/{len(MT_IDS)}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
