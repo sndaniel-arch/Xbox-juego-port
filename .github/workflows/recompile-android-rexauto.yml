@@ -1044,6 +1044,17 @@ jobs:
           $srcIn = @(Get-ChildItem "$port\src" -Recurse -File).Count
           $srcOut = @(Get-ChildItem "$out\src" -Recurse -File).Count
           if ($srcOut -ne $srcIn) { Write-Host "::error::pack copy failed: $srcOut of $srcIn files under src/ reached $out"; exit 1 }
+          # (Hunt v1.4.6, ronda 22, A5-R22-02.) The fourth cargo: *.cmake
+          # at the port root was copied above (Get-ChildItem *.cmake) but
+          # never counted -- R20-02 left it as a note ("today 0 files, a
+          # no-op; if one appears it should be counted like *.toml").
+          # Today there are still 0 such files in the local tree, so the
+          # count passes trivially; if the init stage ever authors one,
+          # a failed Copy-Item would ship a partial port-src.zip with no
+          # count to catch it. Same source-vs-copy pattern, no hardcoded 0.
+          $cmakeIn = @(Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue).Count
+          $cmakeOut = @(Get-ChildItem $out -File -Filter *.cmake -ErrorAction SilentlyContinue).Count
+          if ($cmakeOut -ne $cmakeIn) { Write-Host "::error::pack copy failed: $cmakeOut of $cmakeIn *.cmake files reached $out"; exit 1 }
           # sources.cmake is ${CMAKE_CURRENT_LIST_DIR}-relative -> relocatable as-is
           Compress-Archive -Path "$out\*" -DestinationPath "${{ runner.temp }}\port-src.zip" -Force
           Copy-Item "${{ runner.temp }}\meta\cover.png" "${{ runner.temp }}\cover.png" -ErrorAction SilentlyContinue
