@@ -237,6 +237,25 @@ void HandleCppException(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
   auto catchable_types = REX_KERNEL_MEMORY()->TranslateVirtual<x_s__CatchableTypeArray*>(
       throw_info->catchable_type_array_ptr);
 
+  // (Hunt v1.4.6, caza ronda 23, A3-R23-02.) A guest C++ throw reaches
+  // here and is swallowed: HandleCppException only reads the thrown
+  // object / ThrowInfo and Break()s, it never dispatches to the
+  // guest's catch block (there is no unwinder: RtlUnwind is a no-op
+  // and __C_specific_handler is a stub), so execution continues past
+  // the throw site as if nothing was thrown. That is a pre-existing
+  // limitation, not something this log fixes -- but until now it was
+  // completely invisible: not even a log line said a throw had been
+  // dropped. Log the first 5 so a phone run can show whether live
+  // code throws at all (the throw stubs sub_82A36100/82A36138 have
+  // many callers in live game code) before any later round decides
+  // whether the swallow is survivable or needs a real unwinder.
+  static int cpp_throw_log_count = 0;
+  if (++cpp_throw_log_count <= 5) {
+    REXKRNL_WARN(
+        "[RtlRaiseException] C++ exception (0xE06D7363) swallowed; no "
+        "unwinder, guest catch blocks never run");
+  }
+
   rex::debug::Break();
 }
 
@@ -264,6 +283,33 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
 
   // TODO(benvanik): unwinding.
   // This is going to suck.
+  // (Hunt v1.4.6, caza ronda 23, A3-R23-02.) Any code other than the
+  // two handled above lands here and is swallowed: Break() is a no-op
+  // without a debugger and the entry returns, so the guest continues
+  // past the raise. That is fail-open, and it is NOT fixed by
+  // aborting here: the audited sites split into two classes. Fatal
+  // when unhandled -- STATUS_NO_MEMORY (0xC0000017, the six sites in
+  // ppc_recomp.250.cpp, throwing-new failure tails) -- and
+  // recoverable-by-design -- the FP codes 0xC000008E..0xC0000093
+  // raised through sub_82A3EE58 (called from live math-error code),
+  // which on real hardware a __try would catch. No handler of either
+  // class can run in this build (no vectored handler is registered
+  // anywhere in the game; __C_specific_handler is a stub;
+  // RtlUnwind is a no-op), so aborting the fatal class is only safe
+  // once a phone run shows the raise never fires on a path whose
+  // caller tolerates the swallowed return -- and the FP class must
+  // never abort. Until that data exists, make the swallow loud
+  // instead of silent: log the first 5 unknown codes with their
+  // value, so the first run with this fix answers the question by
+  // grep. Deliberately no abort here (contrast A3-R22-01: a
+  // bugcheck is fatal by definition; a raise is not).
+  static int unknown_raise_log_count = 0;
+  if (++unknown_raise_log_count <= 5) {
+    REXKRNL_ERROR(
+        "[RtlRaiseException] unhandled exception code 0x{:08X} swallowed; "
+        "no unwinder, guest handlers cannot run",
+        static_cast<uint32_t>(record->code));
+  }
   rex::debug::Break();
 }
 
