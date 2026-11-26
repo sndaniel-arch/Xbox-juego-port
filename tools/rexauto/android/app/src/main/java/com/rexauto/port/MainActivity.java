@@ -2,6 +2,9 @@ package com.rexauto.port;
 
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
@@ -31,6 +34,16 @@ public class MainActivity extends SDLActivity {
     // dialog, so a second gesture back while it is up does not stack
     // another one on top.
     private AlertDialog mExitConfirmDialog;
+
+    // (Hunt v1.4.6 ronda 23, A4-R23-01.) Audio-focus handling (see
+    // requestAudioFocus() below): the granted request, or null while the
+    // game holds no focus. mPausedByAudioFocus is true only while the
+    // guest is parked BECAUSE audio focus was lost: on AUDIOFOCUS_GAIN
+    // the guest resumes only then, never after a pause the player (or
+    // Home / a dialog) caused. It is cleared in resumeEmulation(), so
+    // every path that restarts the guest also clears the pending resume.
+    private AudioFocusRequest mAudioFocusRequest;
+    private boolean mPausedByAudioFocus;
 
     // (Ronda 3, auditor E — mitigación de X-A-1.) While a crash-guard /
     // crash-report dialog is up, the SDL thread must not start behind it:
@@ -162,7 +175,130 @@ public class MainActivity extends SDLActivity {
         if (PadSettings.get(this).enabled()) {
             mGamepad = VirtualPadView.install(this);
         }
+        requestAudioFocus();
     }
+
+    /**
+     * (Hunt v1.4.6 ronda 23, A4-R23-01.) Audio focus: the R20 design
+     * note left this deferred because it assumed the listener had to
+     * live in SDLAudioManager, which cannot reach
+     * MainActivity.nativePauseEmulation (private static, another
+     * package). That bridge was never needed: the listener belongs
+     * HERE, in the class that already owns pauseEmulation() /
+     * resumeEmulation(), and the audio path it guards needs no SDL
+     * involvement at all. Verified against the tree: SDL3 never
+     * requests audio focus on Android (zero hits for AudioFocus in the
+     * vendored SDL3, and its AAudio driver requests none), the guest
+     * audio reaches Android only through the SDL audio stream
+     * (SDLAudioDriver -> SDL_OpenAudioDeviceStream), and the only
+     * focus-adjacent code in the app is SDLAudioManager's device
+     * enumeration. So without this, the game keeps playing at full
+     * volume over any other app's audio: the lifecycle paths
+     * (onPause / focus loss) never fire for a focus loss that keeps
+     * our window in front -- the real case is multi-window, where the
+     * other pane starts music while our pane keeps running (the
+     * shouldResumeEmulation() gate deliberately keeps it running),
+     * plus a notification duck and a call that arrives as a
+     * heads-up. Requesting AUDIOFOCUS_GAIN also pauses the OTHER
+     * app's audio when the game starts, which is the standard game
+     * behaviour; starting the game while music plays now stops the
+     * music instead of mixing under it.
+     *
+     * Behaviour, all through the existing idempotent pause/resume:
+     * <ul>
+     * <li>AUDIOFOCUS_LOSS / LOSS_TRANSIENT: pause the guest and
+     * remember it (mPausedByAudioFocus); the request is deliberately
+     * NOT abandoned, so a later GAIN can resume us.
+     * <li>AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK: do NOT pause -- duck
+     * the SDL stream to 0.2 linear (~-14 dB) through
+     * nativeSetAudioDucked(). There is no volume API on
+     * IAudioSystem; the duck reaches the real output stage via
+     * rex::audio::SetOutputGain, the same gain the SDL callback
+     * snapshots per frame (downmix.h), so it takes effect on the
+     * next audio callback with no thread or lifecycle involved.
+     * <li>AUDIOFOCUS_GAIN: restore full gain first, then resume only
+     * if the focus loss parked us AND the window can resume
+     * (shouldResumeEmulation()): a gain that arrives while the
+     * activity is in the background or behind a dialog must not
+     * restart the guest -- the focus-return path resumes it then,
+     * and resumeEmulation() clears the flag.
+     * </ul>
+     * LOSS also restores full gain: the guest is paused, so its
+     * volume is moot while parked, and this keeps one invariant --
+     * gain is 0.2 only while playing under a duck -- instead of a
+     * game that resumes at whisper volume if the user comes back
+     * before any GAIN arrives. If the request itself fails (another
+     * app holds focus and will not yield it), the game simply plays
+     * on without focus handling, exactly as today: log and continue.
+     * AudioFocusRequest needs API 26; minSdk is 28, so no SDK guard.
+     * The listener runs on the main thread (no Handler supplied), but
+     * runOnUiThread() pins it there anyway: pauseEmulation() touches
+     * the main-thread-only mEmulationPaused flag, and a binder-thread
+     * delivery must never race it.
+     */
+    private void requestAudioFocus() {
+        if (mAudioFocusRequest != null) return;
+        try {
+            AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (audioManager == null) {
+                Log.w("MainActivity", "no AudioManager; playing without audio focus");
+                return;
+            }
+            AudioFocusRequest request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_GAME)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .setOnAudioFocusChangeListener(focusChange -> runOnUiThread(() -> {
+                        switch (focusChange) {
+                            case AudioManager.AUDIOFOCUS_LOSS:
+                            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                                mPausedByAudioFocus = true;
+                                setAudioDucked(false);
+                                pauseEmulation();
+                                break;
+                            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                                setAudioDucked(true);
+                                break;
+                            case AudioManager.AUDIOFOCUS_GAIN:
+                                setAudioDucked(false);
+                                if (mPausedByAudioFocus && shouldResumeEmulation()) {
+                                    resumeEmulation();
+                                }
+                                break;
+                            default:
+                                break;
+                        }
+                    }))
+                    .build();
+            if (audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                mAudioFocusRequest = request;
+            } else {
+                Log.w("MainActivity", "audio focus request not granted; playing without audio focus handling");
+            }
+        } catch (Throwable t) {
+            Log.w("MainActivity", "audio focus request failed; playing without audio focus handling", t);
+        }
+    }
+
+    private void abandonAudioFocus() {
+        if (mAudioFocusRequest == null) return;
+        try {
+            AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (audioManager != null) audioManager.abandonAudioFocusRequest(mAudioFocusRequest);
+        } catch (Throwable t) {
+            Log.w("MainActivity", "abandon audio focus failed", t);
+        } finally {
+            mAudioFocusRequest = null;
+            setAudioDucked(false);
+        }
+    }
+
+    private void setAudioDucked(boolean ducked) {
+        try { nativeSetAudioDucked(ducked); } catch (Throwable t) { Log.w("MainActivity", "set audio ducked failed", t); }
+    }
+
+    private static native void nativeSetAudioDucked(boolean ducked);
 
     /**
      * Mitigación de X-A-1 (ronda 3, auditor E): no dejar que el hilo SDL
@@ -341,6 +477,9 @@ public class MainActivity extends SDLActivity {
      */
     @Override
     protected void onDestroy() {
+        // (Hunt v1.4.6 ronda 23, A4-R23-01.) Release audio focus (and
+        // restore full gain) before the activity goes away.
+        abandonAudioFocus();
         PadSettingsDialog.clearStale();
         GraphicsDialog.clearStale();
         LogsDialog.clearStale();
@@ -412,6 +551,12 @@ public class MainActivity extends SDLActivity {
 
     private void resumeEmulation() {
         // (A4-R7-01.) Deliberately unguarded: see the comment above.
+        // (Hunt v1.4.6 ronda 23, A4-R23-01.) Whatever parked the guest,
+        // it is running again now, so a focus-loss resume is no longer
+        // pending: a stale flag would let a later unrelated GAIN call
+        // resumeEmulation() again (harmless but wrong), and the GAIN
+        // branch must only fire for a pause this focus handling caused.
+        mPausedByAudioFocus = false;
         mEmulationPaused = false;
         try { nativeResumeEmulation(); } catch (Throwable t) { Log.w("MainActivity", "resume emulation failed", t); }
     }
