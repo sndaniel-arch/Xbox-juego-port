@@ -142,6 +142,17 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
     if (first == std::string::npos) continue;
     if (first > 0) line.erase(0, first);
     if (line.rfind("--", 0) == 0) line.erase(0, 2);
+    // (Hunt v1.4.6 ronda 22, A4-R22-03.) A blank after the dashes
+    // ("-- gpu_plugin=xenos") left the key with a leading blank:
+    // the leading-blank strip above ran BEFORE the "--" strip, so
+    // "-- gpu_plugin" reached CLI11 as "-- gpu_plugin=xenos", an
+    // unknown option that was dropped and only warned about as a
+    // (confusingly named) unknown cvar. Strip blanks again after the
+    // dashes; a line that is only "--" plus blanks is silently skipped,
+    // as before (the loop-top trim already leaves "--" -> ""), and
+    // "-- # comment" now reads as the comment it is.
+    const size_t after_dashes = line.find_first_not_of(" \t");
+    if (after_dashes != std::string::npos && after_dashes > 0) line.erase(0, after_dashes);
     if (line.empty() || line[0] == '#') continue;
     const auto eq = line.find('=');
     if (eq == std::string::npos || eq == 0) {
@@ -390,6 +401,82 @@ bool SettingsBoolAppliesAs(const std::string& v, bool& applies_true, bool& recog
   return true;
 }
 
+// (Hunt v1.4.6 ronda 22, A4-R22-01.) The remaining half of A4-R18-04:
+// LogSuspiciousSettingsValues warns when the setter rejects a value or
+// applies only its numeric prefix, but it never looks at the cvar's
+// declared constraints -- and the CLI path never enforces them either
+// (cvar::Init calls ApplyFromSource, which skips ValidateConstraints;
+// only SetFlagFromSource, the console/config path, calls it). So
+// log_flush_interval=999 (range 0-60, logging.cpp), a texture-cache
+// limit above its range (soft 64-4096, cache.cpp), or present_effect=fsr
+// (allowed {"bilinear"} on Android, presenter.cpp, no FidelityFX SDK)
+// all apply in silence: the cache limits are even consumed raw
+// (CompletedSubmissionUpdated adds them to a uint32 with no clamp), so a
+// 5000 MiB soft limit on a 4 GiB phone barely ever evicts. Warn here,
+// next to the other post-hoc checks, using the same public fields
+// ValidateConstraints reads (info->constraints); warnings only, the
+// applied values do not change -- enforcing them on the CLI path would
+// mean routing cvar::Init through SetFlagFromCommandLine, which also
+// fires change callbacks and marks kRequiresRestart flags mid-parse,
+// a behaviour change this warning-only fix deliberately avoids.
+void WarnIfOutsideConstraints(const std::string& key, const std::string& value,
+                              const rex::cvar::FlagEntry* info) {
+  const auto& c = info->constraints;
+  // Range: numeric types only, mirroring ValidateConstraints (cvar.cpp),
+  // which skips String/Boolean here. ParseDouble requires full
+  // consumption, so a value the switch below already warns about ("2x",
+  // "0x2", "abc") never reaches the comparison.
+  if (c.HasRangeConstraint() && info->type != rex::cvar::FlagType::String &&
+      info->type != rex::cvar::FlagType::Boolean) {
+    double d = 0;
+    if (rex::cvar::ParseDouble(value, d) &&
+        ((c.min.has_value() && d < *c.min) || (c.max.has_value() && d > *c.max))) {
+      // A negative texture-cache limit already warns specifically about
+      // the ~4 GiB wrap in the Int32 case below; do not warn twice for
+      // the same line. A limit ABOVE its range still warns here.
+      const bool cache_limit = key == "texture_cache_memory_limit_soft" ||
+                               key == "texture_cache_memory_limit_hard" ||
+                               key == "texture_cache_memory_limit_render_to_texture" ||
+                               key == "texture_cache_memory_limit_soft_lifetime";
+      if (!(cache_limit && d < 0)) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' is outside its declared range "
+                    "[{}, {}]; the CLI path does not enforce constraints, so the value "
+                    "still applies",
+                    value, key, c.min.has_value() ? std::to_string(*c.min) : std::string("-inf"),
+                    c.max.has_value() ? std::to_string(*c.max) : std::string("+inf"));
+      }
+    }
+  }
+  // Allowed values: every type, mirroring ValidateConstraints.
+  if (c.HasAllowedValues()) {
+    bool found = false;
+    for (const auto& allowed : c.allowed_values) {
+      if (allowed == value) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      std::string allowed_list;
+      for (size_t i = 0; i < c.allowed_values.size(); ++i) {
+        if (i != 0) allowed_list += ", ";
+        allowed_list += c.allowed_values[i];
+      }
+      REXLOG_WARN("settings.txt: value '{}' for cvar '{}' is not in its allowed values "
+                  "({}); the CLI path does not enforce constraints, so the value still "
+                  "applies (check the consumer's fallback)",
+                  value, key, allowed_list);
+    }
+  }
+  // Custom validator: none in the tree (grep: zero .validator( uses), but
+  // mirror ValidateConstraints so a future one is covered.
+  if (c.custom_validator && !c.custom_validator(value)) {
+    REXLOG_WARN("settings.txt: value '{}' for cvar '{}' failed its custom validation; "
+                "the CLI path does not enforce constraints, so the value still applies",
+                value, key);
+  }
+}
+
 // (Hunt v1.4.6 ronda 19, A4-R19-03.) Warn about settings.txt values the
 // parse silently misapplied. Runs next to LogUnknownSettingsCvars, after
 // the runtime exists, so the cvar types are known; warnings only, the
@@ -452,6 +539,11 @@ void LogSuspiciousSettingsValues(const std::vector<std::string>& settings_args) 
     const auto& [value, negated] = value_negated;
     const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(key);
     if (!info) continue;  // LogUnknownSettingsCvars already warns.
+    // (Hunt v1.4.6 ronda 22, A4-R22-01.) Range / allowed-values /
+    // custom-validator half of A4-R18-04: the type switch below only
+    // catches values the setter rejects or truncates, never a value the
+    // setter accepts outside its declared constraints.
+    WarnIfOutsideConstraints(key, value, info);
     switch (info->type) {
       case rex::cvar::FlagType::Boolean: {
         bool applies_true = false, recognised = false;
