@@ -57,6 +57,7 @@
 #if REX_HAVE_ADRENOTOOLS
 #include <adrenotools/driver.h>
 #endif
+#include <rex/audio/downmix.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/stfs_asset.h>
@@ -108,7 +109,17 @@ std::string ReadTrimmedFile(const std::string& path) {
 // file always carries env.REX_HEAL_DISCOVER=1). A malformed line (no '=',
 // empty key) used to be skipped silently -- warn in logcat, so a typo'd
 // hand-added line is visible instead of looking applied.
-std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_count) {
+// (Hunt v1.4.6 ronda 23, A4-R23-02.) env_set (when non-null) receives
+// every validated env.* line as (NAME, value), in file order, so the
+// post-hoc checks can warn about env values that map to a cvar: an
+// env.REX_* line reaches the cvar through ApplyEnvironment, which --
+// like the CLI path -- never validates constraints, and neither
+// LogUnknownSettingsCvars nor LogSuspiciousSettingsValues ever sees it
+// (both only iterate the --key=value lines). Lines skipped as malformed
+// (empty env name) are not collected: they never ran setenv.
+std::vector<std::string> ReadSettingsArgs(
+    const std::string& path, int* env_count,
+    std::vector<std::pair<std::string, std::string>>* env_set) {
   std::vector<std::string> out;
   if (env_count) *env_count = 0;
   std::ifstream in(path, std::ios::binary);
@@ -255,6 +266,7 @@ std::vector<std::string> ReadSettingsArgs(const std::string& path, int* env_coun
         continue;
       }
       setenv(env_name.c_str(), value.c_str(), 1);
+      if (env_set) env_set->emplace_back(env_name, value);
       if (env_count) ++(*env_count);
       continue;
     }
@@ -477,6 +489,118 @@ void WarnIfOutsideConstraints(const std::string& key, const std::string& value,
   }
 }
 
+// (Hunt v1.4.6 ronda 23, A4-R23-02.) The per-value half of
+// LogSuspiciousSettingsValues, extracted verbatim so the env.* path
+// (LogSuspiciousEnvValues below) gets the same warnings the CLI path
+// gets: a bool value that is not a bool literal, an int the setter
+// rejects or truncates, a negative cache limit that wraps to ~4 GiB.
+// `negated` is only true for a "--no-key=value" line, which has no env
+// equivalent; the env path always passes false.
+void WarnIfSuspiciousValue(const std::string& key, const std::string& value,
+                           const rex::cvar::FlagEntry* info, bool negated) {
+  switch (info->type) {
+    case rex::cvar::FlagType::Boolean: {
+      bool applies_true = false, recognised = false;
+      SettingsBoolAppliesAs(value, applies_true, recognised);
+      if (negated && recognised) applies_true = !applies_true;
+      // A negated non-literal was already warned about while building
+      // the map (it is broken no matter what follows it); only warn
+      // here for the plain form.
+      if (!recognised && !negated) {
+        REXLOG_WARN("settings.txt: value '{}' for bool cvar '{}' is not "
+                    "a bool literal; CLI11 applied it as {} (use "
+                    "true/false, on/off, yes/no, 0/1)",
+                    value, key, applies_true ? "true" : "false");
+      }
+      break;
+    }
+    case rex::cvar::FlagType::Int32: {
+      int32_t n = 0;
+      const auto [ptr, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), n);
+      if (ec != std::errc()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                    "by the setter (not a number for this type); the "
+                    "previous/default value was kept",
+                    value, key);
+      } else if (ptr != value.data() + value.size()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                    "trailing characters '{}' were ignored",
+                    value, key, n, value.substr(ptr - value.data()));
+      } else if (n < 0 && (key == "texture_cache_memory_limit_soft" ||
+                           key == "texture_cache_memory_limit_hard" ||
+                           key == "texture_cache_memory_limit_render_to_texture" ||
+                           key == "texture_cache_memory_limit_soft_lifetime")) {
+        REXLOG_WARN("settings.txt: negative value {} for cvar '{}' wraps "
+                    "to ~4 GiB when the texture cache converts it to "
+                    "uint32; use 0 to disable or a positive MiB limit",
+                    n, key);
+      }
+      break;
+    }
+    case rex::cvar::FlagType::Int64: {
+      int64_t n = 0;
+      const auto [ptr, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), n);
+      if (ec != std::errc()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                    "by the setter (not a number for this type); the "
+                    "previous/default value was kept",
+                    value, key);
+      } else if (ptr != value.data() + value.size()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                    "trailing characters '{}' were ignored",
+                    value, key, n, value.substr(ptr - value.data()));
+      }
+      break;
+    }
+    case rex::cvar::FlagType::Uint32: {
+      uint32_t n = 0;
+      const auto [ptr, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), n);
+      if (ec != std::errc()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                    "by the setter (not a number for this type); the "
+                    "previous/default value was kept",
+                    value, key);
+      } else if (ptr != value.data() + value.size()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                    "trailing characters '{}' were ignored",
+                    value, key, n, value.substr(ptr - value.data()));
+      }
+      break;
+    }
+    case rex::cvar::FlagType::Uint64: {
+      uint64_t n = 0;
+      const auto [ptr, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), n);
+      if (ec != std::errc()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                    "by the setter (not a number for this type); the "
+                    "previous/default value was kept",
+                    value, key);
+      } else if (ptr != value.data() + value.size()) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
+                    "trailing characters '{}' were ignored",
+                    value, key, n, value.substr(ptr - value.data()));
+      }
+      break;
+    }
+    case rex::cvar::FlagType::Double: {
+      double d = 0;
+      if (!rex::cvar::ParseDouble(value, d)) {
+        REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
+                    "by the setter (not a number); the previous/default "
+                    "value was kept",
+                    value, key);
+      }
+      break;
+    }
+    default:
+      break;  // String stores anything; Command is not a setting.
+  }
+}
+
 // (Hunt v1.4.6 ronda 19, A4-R19-03.) Warn about settings.txt values the
 // parse silently misapplied. Runs next to LogUnknownSettingsCvars, after
 // the runtime exists, so the cvar types are known; warnings only, the
@@ -540,111 +664,59 @@ void LogSuspiciousSettingsValues(const std::vector<std::string>& settings_args) 
     const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(key);
     if (!info) continue;  // LogUnknownSettingsCvars already warns.
     // (Hunt v1.4.6 ronda 22, A4-R22-01.) Range / allowed-values /
-    // custom-validator half of A4-R18-04: the type switch below only
-    // catches values the setter rejects or truncates, never a value the
-    // setter accepts outside its declared constraints.
+    // custom-validator half of A4-R18-04: WarnIfSuspiciousValue above
+    // only catches values the setter rejects or truncates, never a value
+    // the setter accepts outside its declared constraints.
     WarnIfOutsideConstraints(key, value, info);
-    switch (info->type) {
-      case rex::cvar::FlagType::Boolean: {
-        bool applies_true = false, recognised = false;
-        SettingsBoolAppliesAs(value, applies_true, recognised);
-        if (negated && recognised) applies_true = !applies_true;
-        // A negated non-literal was already warned about while building
-        // the map (it is broken no matter what follows it); only warn
-        // here for the plain form.
-        if (!recognised && !negated) {
-          REXLOG_WARN("settings.txt: value '{}' for bool cvar '{}' is not "
-                      "a bool literal; CLI11 applied it as {} (use "
-                      "true/false, on/off, yes/no, 0/1)",
-                      value, key, applies_true ? "true" : "false");
-        }
-        break;
-      }
-      case rex::cvar::FlagType::Int32: {
-        int32_t n = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), n);
-        if (ec != std::errc()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
-                      "by the setter (not a number for this type); the "
-                      "previous/default value was kept",
-                      value, key);
-        } else if (ptr != value.data() + value.size()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
-                      "trailing characters '{}' were ignored",
-                      value, key, n, value.substr(ptr - value.data()));
-        } else if (n < 0 && (key == "texture_cache_memory_limit_soft" ||
-                             key == "texture_cache_memory_limit_hard" ||
-                             key == "texture_cache_memory_limit_render_to_texture" ||
-                             key == "texture_cache_memory_limit_soft_lifetime")) {
-          REXLOG_WARN("settings.txt: negative value {} for cvar '{}' wraps "
-                      "to ~4 GiB when the texture cache converts it to "
-                      "uint32; use 0 to disable or a positive MiB limit",
-                      n, key);
-        }
-        break;
-      }
-      case rex::cvar::FlagType::Int64: {
-        int64_t n = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), n);
-        if (ec != std::errc()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
-                      "by the setter (not a number for this type); the "
-                      "previous/default value was kept",
-                      value, key);
-        } else if (ptr != value.data() + value.size()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
-                      "trailing characters '{}' were ignored",
-                      value, key, n, value.substr(ptr - value.data()));
-        }
-        break;
-      }
-      case rex::cvar::FlagType::Uint32: {
-        uint32_t n = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), n);
-        if (ec != std::errc()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
-                      "by the setter (not a number for this type); the "
-                      "previous/default value was kept",
-                      value, key);
-        } else if (ptr != value.data() + value.size()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
-                      "trailing characters '{}' were ignored",
-                      value, key, n, value.substr(ptr - value.data()));
-        }
-        break;
-      }
-      case rex::cvar::FlagType::Uint64: {
-        uint64_t n = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), n);
-        if (ec != std::errc()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
-                      "by the setter (not a number for this type); the "
-                      "previous/default value was kept",
-                      value, key);
-        } else if (ptr != value.data() + value.size()) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' applied as {}; "
-                      "trailing characters '{}' were ignored",
-                      value, key, n, value.substr(ptr - value.data()));
-        }
-        break;
-      }
-      case rex::cvar::FlagType::Double: {
-        double d = 0;
-        if (!rex::cvar::ParseDouble(value, d)) {
-          REXLOG_WARN("settings.txt: value '{}' for cvar '{}' was rejected "
-                      "by the setter (not a number); the previous/default "
-                      "value was kept",
-                      value, key);
-        }
-        break;
-      }
-      default:
-        break;  // String stores anything; Command is not a setting.
-    }
+    WarnIfSuspiciousValue(key, value, info, negated);
+  }
+}
+
+// (Hunt v1.4.6 ronda 23, A4-R23-02.) The env.* half of A4-R22-01:
+// WarnIfOutsideConstraints only ever saw the --key=value lines, but an
+// env.REX_* line reaches the same cvar through ApplyEnvironment, which
+// -- like cvar::Init's ApplyFromSource -- never calls
+// ValidateConstraints (cvar.cpp: only SetFlagFromSource, the
+// console/config path, validates). So env.REX_LOG_FLUSH_INTERVAL=999
+// (range 0-60) or env.REX_RESOLUTION_SCALE=99 (range 1-8) applied in
+// silence, with no warning from anywhere: not from the setter (it
+// accepts), not from LogSuspiciousSettingsValues (it only iterates the
+// cvar lines). Reachable from the UI, not just by hand-editing: the
+// "extra" box in the graphics dialog exports any env.* line verbatim
+// (GraphicsSettings.asCvars), and the shipped file already carries
+// env.REX_HEAL_DISCOVER / env.REX_FPS_CAP. Warnings only, like the CLI
+// path: the applied values do not change.
+//
+// Only an env value that is actually in effect warns: GetFlagSource
+// tells which source last wrote the cvar, and the priority order is
+// default < config < environment < command line (cvar.h), so an env
+// value loses to any --key=value line for the same cvar (settings.txt
+// or a mobile default). And when the setter rejects the env value,
+// ApplyEnvironment already warns ("Env: failed to parse") and the
+// source stays whatever it was -- so source == kEnvironment is
+// exactly "the env value won and is in effect". Names that do not
+// start with REX_ cannot be a cvar (FlagNameToEnvVar always prefixes
+// REX_), and a REX_ name that maps to no cvar (REX_HEAL_DISCOVER,
+// REX_FPS_CAP, REX_PROFILE and friends, which other getenv() readers
+// consume) is skipped silently, as today. Ambient REX_* variables
+// from outside settings.txt are NOT covered: this only sees the lines
+// ReadSettingsArgs collected -- on Android there is no realistic way
+// for one to arrive (zygote does not carry them), and the native
+// setenvs in this file (REX_PROFILE, REX_FRAMES_OK_PATH, ...) are not
+// cvar overrides.
+void LogSuspiciousEnvValues(
+    const std::vector<std::pair<std::string, std::string>>& env_set) {
+  std::map<std::string, std::string> last;  // env NAME -> value, last wins
+  for (const auto& [name, value] : env_set) last[name] = value;
+  for (const auto& [name, value] : last) {
+    if (name.rfind("REX_", 0) != 0) continue;
+    std::string key = name.substr(4);
+    for (char& c : key) c = char(std::tolower(static_cast<unsigned char>(c)));
+    const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(key);
+    if (!info) continue;
+    if (rex::cvar::GetFlagSource(key) != rex::cvar::Source::kEnvironment) continue;
+    WarnIfOutsideConstraints(key, value, info);
+    WarnIfSuspiciousValue(key, value, info, false);
   }
 }
 
@@ -1418,8 +1490,9 @@ int RunAndroidApp() {
   // ReadSettingsArgs (setenv) and never reach argv; count them so the
   // log below does not undercount.
   int env_lines = 0;
+  std::vector<std::pair<std::string, std::string>> env_set;
   const std::vector<std::string> settings_args =
-      ReadSettingsArgs(external_dir + "/" + kSettingsFileName, &env_lines);
+      ReadSettingsArgs(external_dir + "/" + kSettingsFileName, &env_lines, &env_set);
   for (const auto& a : settings_args) {
     ALOGI("setting: %s", a.c_str());
     args.emplace_back(a);
@@ -1550,6 +1623,11 @@ int RunAndroidApp() {
       // applied as false, an int the setter dropped, a negative cache
       // limit that wraps to ~4 GiB). Warnings only.
       LogSuspiciousSettingsValues(settings_args);
+      // (Hunt v1.4.6 ronda 23, A4-R23-02.) Same point, same argument,
+      // for the env.* lines: an env.REX_* value that maps to a cvar
+      // reaches it through ApplyEnvironment, unvalidated, and the two
+      // checks above never see it.
+      LogSuspiciousEnvValues(env_set);
       // (Hunt v1.4.6 ronda 16, A4-R16-01.) Record the preset outcome in
       // childoflight.log: the per-line "setting:" log in RunAndroidApp
       // only goes to logcat (ALOGI), so a pasted childoflight.log never
@@ -1626,6 +1704,21 @@ Java_com_rexauto_port_MainActivity_nativeResumeEmulation(JNIEnv* /*env*/, jclass
   if (!runtime) return;
   if (auto* audio_system = runtime->audio_system()) audio_system->Resume();
   if (auto* graphics_system = runtime->graphics_system()) graphics_system->Resume();
+}
+
+// (Hunt v1.4.6 ronda 23, A4-R23-01.) Audio-focus ducking, from
+// MainActivity (see requestAudioFocus() there). The SDL audio callback
+// snapshots rex::audio::GetOutputGain() once per frame
+// (sdl_audio_driver.cpp), so this takes effect on the next callback
+// with no thread, lock or lifecycle involved; the gain is a
+// mutex-guarded global, safe to set before the audio system exists and
+// after it is gone. 0.2 linear is ~-14 dB, the usual ducking depth;
+// 1.0 is unity. There is no volume API on IAudioSystem, so this JNI
+// is the only ducking path.
+JNIEXPORT void JNICALL
+Java_com_rexauto_port_MainActivity_nativeSetAudioDucked(JNIEnv* /*env*/, jclass /*clazz*/,
+                                                        jboolean ducked) {
+  rex::audio::SetOutputGain(ducked ? 0.2f : 1.0f);
 }
 
 }  // extern "C"
