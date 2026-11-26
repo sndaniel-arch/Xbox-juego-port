@@ -958,6 +958,22 @@ jobs:
           if ($guardRc -ne 0) { exit $guardRc }
           if (-not $marks90 -or $marks90 -lt 3 -or -not $marks46 -or $marks46 -lt 2 -or -not $marks32 -or $marks32 -lt 3 -or -not $marks129 -or $marks129 -lt 2 -or -not $marks86 -or $marks86 -lt 2 -or -not $marks136 -or $marks136 -lt 2 -or -not $marks184 -or $marks184 -lt 2 -or -not $marks128 -or $marks128 -lt 2 -or -not $marks98 -or $marks98 -lt 2 -or -not $marks50 -or $marks50 -lt 2 -or -not $marks99 -or $marks99 -lt 2) { Write-Host "::error::guard_r15_col ran but the guard did not land per file: $marks90 GUARD_R15 markers in childoflight_recomp.90.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C5150), $marks46 in childoflight_recomp.46.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C4B70), $marks32 in childoflight_recomp.32.cpp (expected >= 3: DECLARE + 2 guard comments, sub_824C4D70), $marks129 in .129.cpp, $marks86 in .86.cpp, $marks136 in .136.cpp, $marks184 in .184.cpp, $marks128 in .128.cpp, $marks98 in .98.cpp, $marks50 in .50.cpp (each expected >= 2: DECLARE + 1 guard comment), $marks99 in .99.cpp (expected >= 2: DECLARE + 1 guard comment, sub_824C52F8)"; exit 1 }
           Write-Host "crash guard verified: $marks90 GUARD_R15 markers in .90.cpp (sub_824C5150) + $marks46 in .46.cpp (sub_824C4B70) + $marks32 in .32.cpp (sub_824C4D70) + $marks129 in .129.cpp (sub_824C8940) + $marks86 in .86.cpp (sub_824C8018) + $marks136 in .136.cpp (sub_824C9A60) + $marks184 in .184.cpp (sub_82A60450) + $marks128 in .128.cpp (sub_824C9DA8) + $marks98 in .98.cpp (sub_82A60C40) + $marks50 in .50.cpp (sub_824C99D8) + $marks99 in .99.cpp (sub_824C52F8)"
+          # (Hunt v1.4.6, ronda 21, MT-GUARD-01.) Tripwire multi-target
+          # (familia sub_82461508, A2-R20-01): 62 sitios en 57 ficheros
+          # (25 RECOVER + 37 SKIP-ONLY), 147 marcadores GUARD_R21_MT en
+          # total (2 por sitio + 1 DECLARE sub_82434368 por fichero con
+          # RECOVER, salvo .106/.89 cuyo header ya lo declara). Los checks
+          # viejos de arriba no se tocan: si la guardia MT no aterriza,
+          # el run falla aqui aunque el script saliera exit 0.
+          $mtExpected = @{ "2" = 2; "3" = 3; "5" = 3; "11" = 3; "15" = 3; "18" = 3; "29" = 2; "34" = 2; "48" = 2; "50" = 3; "53" = 2; "58" = 3; "59" = 2; "65" = 3; "70" = 3; "73" = 2; "76" = 2; "79" = 3; "80" = 3; "84" = 3; "85" = 2; "87" = 4; "88" = 2; "89" = 2; "90" = 2; "93" = 2; "96" = 2; "97" = 2; "98" = 2; "99" = 2; "101" = 2; "102" = 2; "103" = 3; "104" = 4; "106" = 2; "110" = 2; "113" = 2; "115" = 3; "116" = 3; "117" = 5; "121" = 4; "128" = 2; "136" = 3; "139" = 2; "146" = 2; "152" = 2; "156" = 2; "162" = 2; "168" = 3; "169" = 3; "172" = 2; "173" = 3; "182" = 5; "183" = 3; "184" = 3; "187" = 2; "190" = 2 }
+          $mtTotal = 0
+          foreach ($n in $mtExpected.Keys) {
+            $c = @(Select-String -Path "$gen\childoflight_recomp.$n.cpp" -Pattern "GUARD_R21_MT").Count
+            $mtTotal += $c
+            if (-not $c -or $c -lt $mtExpected[$n]) { Write-Host "::error::multi-target guard did not land: $c GUARD_R21_MT markers in childoflight_recomp.$n.cpp (expected >= $($mtExpected[$n]))"; exit 1 }
+          }
+          if ($mtTotal -lt 147) { Write-Host "::error::multi-target guard total: $mtTotal GUARD_R21_MT markers (expected >= 147: 62 sites x 2 + 23 DECLAREs)"; exit 1 }
+          Write-Host "multi-target guard verified: $mtTotal GUARD_R21_MT markers in 57 files (62 sites: 25 RECOVER + 37 SKIP-ONLY)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
