@@ -86,6 +86,26 @@ u32 WaitForSingleObjectEx_entry(u32 handle, u32 milliseconds, u32 alertable) {
   return xeWaitForSingleObject(handle, milliseconds, alertable);
 }
 
+// (Hunt v1.4.6, caza ronda 22, A3-R22-02.) Was a bare REX_EXPORT_STUB:
+// the stub leaves r3 holding the first argument, so the game stored
+// its own argument (2 in sub_828FB0D0, 5 in sub_828FB558) as the title
+// ID of the Live session it was building. The export's name promises
+// the title ID of the title in play, and both call sites store the
+// return value as exactly that (ppc_recomp.243.cpp:3570 and :4250).
+// Return the running title's ID from the XEX execution info instead
+// (KernelState::title_id(), kernel_state.h:200; 0 if no title is
+// loaded yet, which is the honest answer). The argument is ignored:
+// the kernel knows one title ID for the running session, and neither
+// call site's value (2 / 5) can change it -- the game passes what
+// looks like its own session-local slot, not an XAM user index.
+// Offline play never reaches these call sites (both are Live session
+// creation, reached from sub_82447DE0 / sub_8245DA58), so this is
+// BAJO and cannot affect the path to JUGAR.
+u32 XNetLogonGetTitleID_entry(u32 user_index) {
+  (void)user_index;
+  return REX_KERNEL_STATE()->title_id();
+}
+
 }  // namespace rex::kernel::xam
 
 // kinda gross but oh well
@@ -284,6 +304,7 @@ REX_EXPORT_STUB(__imp__UpnpAVServerSearchInitialize);
 REX_EXPORT_STUB(__imp__UpnpAVServerSearchStart);
 REX_EXPORT(__imp__WaitForSingleObject, rex::kernel::xam::WaitForSingleObject_entry)
 REX_EXPORT(__imp__WaitForSingleObjectEx, rex::kernel::xam::WaitForSingleObjectEx_entry)
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 REX_EXPORT_STUB(__imp__WideCharToMultiByte);
 REX_EXPORT_STUB(__imp__XAutomationpBindController);
 REX_EXPORT_STUB(__imp__XAutomationpInputPress);
@@ -331,7 +352,6 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
