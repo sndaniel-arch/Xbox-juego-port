@@ -28,12 +28,15 @@
  *   A differential block is only legal when R+dR, G+dG and B+dB all stay in
  *   [0, 31]; otherwise the hardware decodes it as T/H/planar instead.
  * - Pixel indices (bits 31-0): the MSB plane first, then the LSB plane;
- *   plane bit i (i = y * 4 + x) is pixel (x, y). The 2-bit index maps to a
+ *   pixel (x, y) is numbered k = x * 4 + y (COLUMN-major, spec Table
+ *   C.10: a=(0,0) b=(0,1) c=(0,2) d=(0,3) e=(1,0) ... p=(3,3)), and
+ *   plane bit k is that pixel's index bit. The 2-bit index maps to a
  *   modifier of {+a, +b, -a, -b} for the subblock's table (a, b).
  * - ETC2_RGBA8 is a 16-byte block: the 8-byte EAC alpha block FIRST, then
  *   the 8-byte color block. The alpha block holds an 8-bit base, a 4-bit
  *   multiplier and a 4-bit table codeword (16 tables x 8 modifiers), then
- *   16 3-bit indices, most significant first.
+ *   16 3-bit indices, most significant first, in the same column-major
+ *   texel order (pixel a=(0,0) first, pixel p=(3,3) last).
  *
  * Guest BC blocks arrive big-endian in guest memory; ApplyGuestEndian()
  * mirrors rex::graphics::texture_conversion::CopySwapBlock() (same
@@ -496,16 +499,22 @@ inline void EncodeEtc2Rgb8(const Rgba pixels[16], uint8_t out[8]) {
   }
 
   // Pack the winning block. The 2-bit pixel index is (msb << 1) | lsb and
-  // plane bit i (i = y * 4 + x) belongs to pixel i.
+  // plane bit k (k = x * 4 + y, column-major per spec Table C.10) belongs
+  // to pixel (x, y) -- NOT bit y * 4 + x. (Hunt v1.4.6 ronda 23,
+  // A1-R23-01: the old packing stored pixel (x, y) at the slot of pixel
+  // (y, x), so every transcoded block decoded transposed on hardware:
+  // vertical edges came back horizontal and vice versa, and flip=0
+  // blocks additionally mixed the two subblock bases.)
   uint16_t msb_plane = 0;
   uint16_t lsb_plane = 0;
   for (int i = 0; i < 16; ++i) {
     int index = best_indices[i];
+    int k = (i & 3) * 4 + (i >> 2);  // (x, y) -> x * 4 + y.
     if (index & 2) {
-      msb_plane |= uint16_t(1u << i);
+      msb_plane |= uint16_t(1u << k);
     }
     if (index & 1) {
-      lsb_plane |= uint16_t(1u << i);
+      lsb_plane |= uint16_t(1u << k);
     }
   }
   if (best_differential) {
@@ -602,7 +611,13 @@ inline void EncodeEtc2AlphaBlock(const uint8_t alpha[16], uint8_t out[8]) {
   }
   uint64_t index_bits = 0;
   for (int i = 0; i < 16; ++i) {
-    index_bits |= uint64_t(best_indices[i]) << (3 * (15 - i));
+    // Spec Table C.17: pixel (x, y) is numbered k = x * 4 + y
+    // (column-major) and its 3-bit index sits at bits (47 - 3k .. 45 - 3k)
+    // of the 48-bit field -- NOT at the row-major slot 15 - (y * 4 + x).
+    // (Hunt v1.4.6 ronda 23, A1-R23-01: same transposition as the color
+    // block above; the alpha map decoded transposed on hardware.)
+    int k = (i & 3) * 4 + (i >> 2);  // (x, y) -> x * 4 + y.
+    index_bits |= uint64_t(best_indices[i]) << (3 * (15 - k));
   }
   out[0] = uint8_t(best_base);
   out[1] = uint8_t((best_multiplier << 4) | best_table);
