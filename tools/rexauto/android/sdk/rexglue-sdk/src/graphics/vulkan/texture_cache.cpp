@@ -1734,8 +1734,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // shader runs at all. The load shader index stored with the ETC2 host
   // format (kLoadShaderIndex64bpb / kLoadShaderIndex128bpb) is only a
   // bytes-per-block sentinel for the format tables; it is never dispatched.
-  // DXT1 with 1-bit alpha never reaches this branch: GetHostFormatPair()
-  // sends it to the RGBA8 compute fallback instead.
+  // (Hunt v1.4.6 ronda 22, A1-R22-01.) DXT1 with 1-bit alpha reaches this
+  // branch too when GetHostFormatPair() routes it to ETC2 RGBA8 (the BC3
+  // entry landed on ETC2 RGBA8, so the target is proven usable): the
+  // dispatch below decodes it with DecodeBc1Block, not DecodeBc3Block.
+  // Only DXT1 textures whose target stayed ETC2 RGB8 (or whose blocks are
+  // unaligned) still take the RGBA8 compute fallback.
   if (host_format.format == VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK ||
       host_format.format == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) {
     const bool is_etc2_rgba = host_format.format == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
@@ -2019,9 +2023,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                 // 4-bit alpha + BC1 color block (DecodeBc2Block). The
                 // dispatch is on the GUEST format, not the target: both
                 // BC2 and BC3 land on ETC2 RGBA8.
+                // (Hunt v1.4.6 ronda 22, A1-R22-01.) DXT1 with 1-bit alpha
+                // also lands here, on ETC2 RGBA8: an 8-byte BC1 block,
+                // decoded with DecodeBc1Block (its palette emits alpha 0
+                // for transparent texels) -- never DecodeBc3Block, which
+                // would read 16 bytes from an 8-byte block and decode the
+                // wrong alpha.
                 if (guest_format == xenos::TextureFormat::k_DXT2_3 ||
                     guest_format == xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16) {
                   etc2::DecodeBc2Block(guest_block, pixels);
+                } else if (guest_format == xenos::TextureFormat::k_DXT1 ||
+                           guest_format == xenos::TextureFormat::k_DXT1_AS_16_16_16_16) {
+                  etc2::DecodeBc1Block(guest_block, pixels);
                 } else {
                   etc2::DecodeBc3Block(guest_block, pixels);
                 }
@@ -4429,6 +4442,33 @@ const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
       host_format_pair.format_unsigned.format ==
           VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK &&
       Dxt1TextureHasOneBitAlpha(shared_memory(), key, key.GetGuestLayout())) {
+    // (Hunt v1.4.6 ronda 22, A1-R22-01.) ETC2_RGB8 has no alpha, so a
+    // 1-bit-alpha DXT1 texture cannot use it -- but ETC2_RGBA8 holds the
+    // same alpha via its EAC block, at the same 16 bytes/block as BC3,
+    // and DecodeBc1Block already emits alpha 0 for transparent texels.
+    // Transcode to ETC2_RGBA8 when that target is proven usable on this
+    // device: the BC3 entry landed on it, which only happens when the
+    // ETC2_RGBA8 transcode gate in Initialize() passed (unscaled draw
+    // resolution + linear-filterable ETC2 RGBA8). No header member is
+    // needed for the probe -- the DXT4_5 entry IS the probe result. If
+    // BC3 is natively filterable the entry stays BC3 and this falls
+    // through to the RGBA8 compute fallback below (correct, just not
+    // compressed); likewise for block-unaligned textures, whose CPU
+    // transcode cannot pad the partial edge blocks.
+    if (!(key.GetWidth() & (format_info->block_width - 1)) &&
+        !(key.GetHeight() & (format_info->block_height - 1))) {
+      const HostFormatPair& host_format_dxt4_5 =
+          host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5)];
+      if (host_format_dxt4_5.format_unsigned.format ==
+          VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) {
+        // Same swizzle (RGBA), same unsigned-only sampling, same
+        // linear_filterable (recomputed from the real ETC2 RGBA8
+        // properties by the normalization loop at the end of
+        // Initialize()); only the format and the 16-byte block size
+        // differ from this texture's own ETC2_RGB8 entry.
+        return host_format_dxt4_5;
+      }
+    }
     return kHostFormatDXT1Unaligned;
   }
   if (!(key.GetWidth() & (format_info->block_width - 1)) &&
