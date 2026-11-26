@@ -280,14 +280,29 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
     // Because on Chromebooks we show up as a dual-mode device, it will attempt to connect TRANSPORT_AUTO, which will use TRANSPORT_BREDR instead
     // of TRANSPORT_LE.  Let's force ourselves to connect low energy.
     private BluetoothGatt connectGatt(boolean managed) {
+        // (Hunt v1.4.6 ronda 22, A4-R22-02.) mManager is only nulled by
+        // shutdown() (main thread), but this runs on binder threads too
+        // (replaceGatt() from onServicesDiscovered / probeService): a
+        // shutdown between the callback's mManager == null guard and this
+        // call NPE'd on mManager.getContext() on the binder thread. The
+        // guard is not atomic with the use -- the same check-then-use
+        // shape R19-05 fixed for mGatt by capturing it in a local.
+        // Capture the manager once; a null manager means this device is
+        // dead, so there is nothing to connect to -- every caller already
+        // handles a null GATT (R13-01: constructor, reconnect(),
+        // checkConnectionForChromebookIssue()).
+        HIDDeviceManager manager = mManager;
+        if (manager == null) {
+            return null;
+        }
         if (Build.VERSION.SDK_INT >= 23 /* Android 6.0 (M) */) {
             try {
-                return mDevice.connectGatt(mManager.getContext(), managed, this, TRANSPORT_LE);
+                return mDevice.connectGatt(manager.getContext(), managed, this, TRANSPORT_LE);
             } catch (Exception e) {
-                return mDevice.connectGatt(mManager.getContext(), managed, this);
+                return mDevice.connectGatt(manager.getContext(), managed, this);
             }
         } else {
-            return mDevice.connectGatt(mManager.getContext(), managed, this);
+            return mDevice.connectGatt(manager.getContext(), managed, this);
         }
     }
 
@@ -820,7 +835,15 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         // onServicesDiscovered above: this callback runs on a binder
         // thread, mManager is only nulled by shutdown(), and the
         // dereference below NPEs if shutdown() already ran.
-        if (mManager == null) {
+        // (Hunt v1.4.6 ronda 22, A4-R22-02.) Capture the manager once:
+        // the guard is not atomic with the use -- a shutdown() on the
+        // main thread between the check and HIDDeviceReportResponse()
+        // nulled mManager and NPE'd on the binder thread. A stale but
+        // non-null local is safe (same argument as R19-05 for mGatt):
+        // the callback then does the work it had already started, on a
+        // manager that was alive when it began.
+        HIDDeviceManager manager = mManager;
+        if (manager == null) {
             return;
         }
 
@@ -830,7 +853,7 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         // retry (or drop) applies instead of treating it as success.
         if (status == BluetoothGatt.GATT_SUCCESS
                 && characteristic.getUuid().equals(reportCharacteristic) && !mFrozen) {
-            mManager.HIDDeviceReportResponse(getId(), characteristic.getValue());
+            manager.HIDDeviceReportResponse(getId(), characteristic.getValue());
         }
         if (status != BluetoothGatt.GATT_SUCCESS) {
             markCurrentGattOperationFailed();
@@ -846,7 +869,11 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         // onServicesDiscovered above: this callback runs on a binder
         // thread, mManager is only nulled by shutdown(), and the
         // dereferences below NPE if shutdown() already ran.
-        if (mManager == null) {
+        // (Hunt v1.4.6 ronda 22, A4-R22-02.) Capture the manager once:
+        // the guard is not atomic with the HIDDeviceConnected() use
+        // below (see onCharacteristicRead for the same fix).
+        HIDDeviceManager manager = mManager;
+        if (manager == null) {
             return;
         }
 
@@ -873,7 +900,7 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
             // Only register controller with the native side once it has been fully configured
             if (!isRegistered()) {
                 Log.v(TAG, "Registering Steam Controller with ID: " + getId());
-                mManager.HIDDeviceConnected(getId(), getIdentifier(), getVendorId(), getProductId(), getSerialNumber(), getVersion(), getManufacturerName(), getProductName(), 0, 0, 0, 0, true);
+                manager.HIDDeviceConnected(getId(), getIdentifier(), getVendorId(), getProductId(), getSerialNumber(), getVersion(), getManufacturerName(), getProductName(), 0, 0, 0, 0, true);
                 setRegistered();
             }
         }
@@ -891,12 +918,16 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         // onServicesDiscovered above: this callback runs on a binder
         // thread, mManager is only nulled by shutdown(), and the
         // dereference below NPEs if shutdown() already ran.
-        if (mManager == null) {
+        // (Hunt v1.4.6 ronda 22, A4-R22-02.) Capture the manager once:
+        // the guard is not atomic with the HIDDeviceInputReport() use
+        // below (see onCharacteristicRead for the same fix).
+        HIDDeviceManager manager = mManager;
+        if (manager == null) {
             return;
         }
 
         if (characteristic.getUuid().equals(getInputCharacteristic()) && !mFrozen) {
-            mManager.HIDDeviceInputReport(getId(), characteristic.getValue());
+            manager.HIDDeviceInputReport(getId(), characteristic.getValue());
         }
     }
 
@@ -913,7 +944,11 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
         // onServicesDiscovered above: this callback runs on a binder
         // thread, mManager is only nulled by shutdown(), and the
         // dereference below NPEs if shutdown() already ran.
-        if (mManager == null) {
+        // (Hunt v1.4.6 ronda 22, A4-R22-02.) Capture the manager once:
+        // the guard is not atomic with the HIDDeviceConnected() use
+        // below (see onCharacteristicRead for the same fix).
+        HIDDeviceManager manager = mManager;
+        if (manager == null) {
             return;
         }
 
@@ -933,7 +968,7 @@ class HIDDeviceBLESteamController extends BluetoothGattCallback implements HIDDe
                 if (getProductId() == TRITON_BLE_PID) {
                     // For Triton we just mark things registered.
                     Log.v(TAG, "Registering Triton Steam Controller with ID: " + getId());
-                    mManager.HIDDeviceConnected(getId(), getIdentifier(), getVendorId(), getProductId(), getSerialNumber(), getVersion(), getManufacturerName(), getProductName(), 0, 0, 0, 0, true);
+                    manager.HIDDeviceConnected(getId(), getIdentifier(), getVendorId(), getProductId(), getSerialNumber(), getVersion(), getManufacturerName(), getProductName(), 0, 0, 0, 0, true);
                     setRegistered();
                 } else {
                     // For the original controller, we need to manually enter Valve mode.
