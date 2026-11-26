@@ -12,6 +12,7 @@
 
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
+#include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/thread.h>
 #include <rex/types.h>
@@ -86,6 +87,65 @@ u32 WaitForSingleObjectEx_entry(u32 handle, u32 milliseconds, u32 alertable) {
   return xeWaitForSingleObject(handle, milliseconds, alertable);
 }
 
+// (Hunt v1.4.6, caza ronda 23, A3-R23-01.) File-local copy of the
+// guest-range helper (same text as xam_user.cpp / xboxkrnl_debug.cpp;
+// static helpers live in every file that calls them, defined before
+// first use). TranslateVirtual never validates and never returns null,
+// so a guest pointer + length that runs past the end of the mapping
+// SIGSEGVs the host on the write. Reject a range that wraps past
+// 4 GiB, starts or ends outside any heap, or spans heaps of different
+// kinds (or two physical heaps); inside a single heap require the
+// pages to be read/write for a destination (and always read/write
+// for a physical heap). A range spanning two virtual heaps is
+// validated at both ends; spanning more than two heaps is rejected
+// outright (A3-R8-13 / A3-R9-10).
+static bool GuestRangeAccessible(uint32_t guest_address, size_t length, bool writable) {
+  if (!length) {
+    return true;
+  }
+  if (length > UINT32_MAX - guest_address) {
+    return false;
+  }
+  uint32_t high_address = guest_address + static_cast<uint32_t>(length) - 1;
+  rex::memory::BaseHeap* start_heap = REX_KERNEL_MEMORY()->LookupHeap(guest_address);
+  rex::memory::BaseHeap* end_heap = REX_KERNEL_MEMORY()->LookupHeap(high_address);
+  if (!start_heap || !end_heap) {
+    return false;
+  }
+  bool start_physical =
+      start_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  bool end_physical =
+      end_heap->heap_type() == rex::memory::HeapType::kGuestPhysical;
+  if (start_physical != end_physical || (start_physical && start_heap != end_heap)) {
+    return false;
+  }
+  if (start_heap == end_heap) {
+    auto access = start_heap->QueryRangeAccess(guest_address, high_address);
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  }
+  auto range_ok = [&](rex::memory::PageAccess access) {
+    if (start_physical) {
+      return access == rex::memory::PageAccess::kReadWrite;
+    }
+    return writable ? access == rex::memory::PageAccess::kReadWrite
+                    : access != rex::memory::PageAccess::kNoAccess;
+  };
+  uint32_t start_heap_end = start_heap->heap_base() + start_heap->heap_size() - 1;
+  if (REX_KERNEL_MEMORY()->LookupHeap(start_heap_end + 1) != end_heap) {
+    return false;
+  }
+  return range_ok(start_heap->QueryRangeAccess(guest_address, start_heap_end)) &&
+         range_ok(end_heap->QueryRangeAccess(end_heap->heap_base(), high_address));
+}
+
+static bool GuestRangeWritable(uint32_t guest_address, size_t length) {
+  return GuestRangeAccessible(guest_address, length, true);
+}
+
 // (Hunt v1.4.6, caza ronda 22, A3-R22-02.) Was a bare REX_EXPORT_STUB:
 // the stub leaves r3 holding the first argument, so the game stored
 // its own argument (2 in sub_828FB0D0, 5 in sub_828FB558) as the title
@@ -104,6 +164,35 @@ u32 WaitForSingleObjectEx_entry(u32 handle, u32 milliseconds, u32 alertable) {
 u32 XNetLogonGetTitleID_entry(u32 user_index) {
   (void)user_index;
   return REX_KERNEL_STATE()->title_id();
+}
+
+// (Hunt v1.4.6, caza ronda 23, A3-R23-01.) Was a bare REX_EXPORT_STUB:
+// the stub leaves r3 holding the buffer pointer, so the game's only
+// check (r3 < 0, ppc_recomp.243.cpp:4270, in sub_828FB558) passed and
+// the game went on building its Live session message with the buffer
+// at r1+168 never filled -- stale stack bytes recorded as the
+// machine ID (sub_828FAF40 only records the pointer into the XMsg
+// field list; the bytes are serialised downstream by the Live
+// message builder). The size is inferred, not taken from the XDK
+// (no primary source found 2026-11-26): the call passes a single
+// argument (the buffer pointer, no length -- so the callee writes a
+// fixed size), and the next field the game records sits exactly 8
+// bytes later (r1+176, same XMsg list), next to the 8-byte XUID at
+// r1+160 -- so the slot is 8 bytes. The value is a fixed synthetic
+// ID ("REXMACHN"): there is no per-console ID on this host, Live is
+// unreachable offline so the value is never validated, and a stable
+// nonzero ID beats stale stack bytes. Only reachable from Live
+// session creation (sub_828FB558, from sub_8245DA58), so BAJO and
+// with no effect on the path to JUGAR.
+u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id_ptr) {
+  if (!machine_id_ptr) {
+    return static_cast<u32>(X_E_INVALIDARG);
+  }
+  if (!GuestRangeWritable(machine_id_ptr.guest_address(), sizeof(uint64_t))) {
+    return static_cast<u32>(X_E_INVALIDARG);
+  }
+  *machine_id_ptr = 0x5245584D4143484EULL;  // "REXMACHN", synthetic.
+  return 0;
 }
 
 }  // namespace rex::kernel::xam
@@ -304,6 +393,7 @@ REX_EXPORT_STUB(__imp__UpnpAVServerSearchInitialize);
 REX_EXPORT_STUB(__imp__UpnpAVServerSearchStart);
 REX_EXPORT(__imp__WaitForSingleObject, rex::kernel::xam::WaitForSingleObject_entry)
 REX_EXPORT(__imp__WaitForSingleObjectEx, rex::kernel::xam::WaitForSingleObjectEx_entry)
+REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_entry)
 REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 REX_EXPORT_STUB(__imp__WideCharToMultiByte);
 REX_EXPORT_STUB(__imp__XAutomationpBindController);
@@ -346,7 +436,6 @@ REX_EXPORT_STUB(__imp__XNetLogonGetExtendedStatus);
 REX_EXPORT_STUB(__imp__XNetLogonGetFlowToken);
 REX_EXPORT_STUB(__imp__XNetLogonGetLastUPnPStatus);
 REX_EXPORT_STUB(__imp__XNetLogonGetLoggedOnUsers);
-REX_EXPORT_STUB(__imp__XNetLogonGetMachineID);
 REX_EXPORT_STUB(__imp__XNetLogonGetNatType);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
