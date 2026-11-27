@@ -1732,7 +1732,17 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         int buttonBorderColor;
         int buttonBackgroundColor;
         int buttonSelectedColor;
-        if (colors != null) {
+        // (Hunt v1.4.6 ronda 25, A4-R25-01.) Five indexed reads follow
+        // (colors[0..4]); a non-null array shorter than 5 throws
+        // ArrayIndexOutOfBoundsException on the UI thread. The R10-04
+        // guard above covers the button arrays but not colors, and
+        // upstream SDL passes NULL here only when the caller sets no
+        // colors at all -- a short array is the same "no usable colors"
+        // case as null, so it takes the TRANSPARENT fallback below.
+        // No caller reaches this from the game today (no
+        // SDL_ShowMessageBox caller; XamShowMessageBoxUI is an ImGui
+        // stub); defence in depth, same as R10-04.
+        if (colors != null && colors.length >= 5) {
             int i = -1;
             backgroundColor = colors[++i];
             textColor = colors[++i];
