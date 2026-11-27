@@ -1316,19 +1316,36 @@ int RunAndroidApp() {
       SDL_SetHint(SDL_HINT_ORIENTATIONS, orientations_hint.c_str());
     }
   }
-  // (Hunt v1.4.6 ronda 20, A4-R20-01.) Enable the SDL HIDAPI driver for
-  // Bluetooth Steam Controllers: it is off by default
-  // (SDL_HINT_JOYSTICK_HIDAPI_STEAM defaults to "0", SDL_hints.h), and
-  // without it hid_init() never calls HIDDeviceManager.initialize(false,
-  // true) -- so the bonded-device enumeration, the GATT connect and the
-  // Chromebook poll in HIDDeviceBLESteamController never run in the
-  // shipped build. Must be set before the runtime's
-  // SDL_InitSubSystem(SDL_INIT_GAMEPAD) (app_context.Initialize() below);
-  // on API 31+ SDL itself requests BLUETOOTH_CONNECT (declared in
-  // AndroidManifest.xml) and initialize() runs from its grant callback,
-  // so a deny just leaves Bluetooth off and the game still plays on the
-  // touch pad / USB / standard Android gamepads.
-  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
+  // (Hunt v1.4.6 ronda 24, A4-R24-01.) Bluetooth Steam Controllers:
+  // DORMANT -- the SDL HIDAPI Steam driver stays at its default "0"
+  // (SDL_hints.h: "1 ... requires Bluetooth access and may prompt the
+  // user for permission on iOS and Android"). R20 (A4-R20-01) set this
+  // hint to "1", so SDL's hid_init() asked for BLUETOOTH_CONNECT at
+  // every launch, before the title -- the "Nearby devices" dialog the
+  // player saw on start -- and the player has no Steam Controller
+  // (his controller is the phone itself) and ordered no permission
+  // prompts at game start. With the hint at "0", hid_init() still
+  // runs HIDDeviceManager.initialize(true, false) for USB, but its
+  // Bluetooth branch (initialize(false, true), the bonded-device
+  // enumeration, the GATT connect and the Chromebook poll) never runs
+  // and no runtime permission is requested; the manifest declarations
+  // are gone too (AndroidManifest.xml), so the permission is not even
+  // listed. The BLE stack (HIDDeviceManager /
+  // HIDDeviceBLESteamController) is untouched and still works if
+  // re-enabled: call SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1")
+  // AND restore the manifest lines,
+  // both together -- the hint alone requests a permission the manifest
+  // does not declare (auto-denied, no dialog), and the manifest alone
+  // requests nothing. A lazy in-context request was considered and
+  // rejected: there is no in-app "connect a BLE controller" action to
+  // attach it to (pairing happens in Android Settings; the app only
+  // enumerates bonded devices once, at SDL init), and hid_init() runs
+  // once (g_initialized), so a toggle could only take effect after a
+  // restart -- where it would show the same startup dialog the player
+  // banned -- for hardware he does not own. Standard Bluetooth
+  // gamepads, USB controllers and the touch pad are unaffected: they
+  // arrive through Android's InputDevice path, which needs no
+  // BLUETOOTH_CONNECT from the app.
   // (Ronda 6, auditor E — R6-E3.) Resolve the log dir, wipe the stale
   // markers and install the crash reporter BEFORE loading the custom
   // driver: the old order did it after LoadCustomVulkanDriver, so a crash
