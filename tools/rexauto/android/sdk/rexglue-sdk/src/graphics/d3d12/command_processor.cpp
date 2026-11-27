@@ -151,6 +151,19 @@ void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_
 void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  // (Caza v1.4.6 ronda 24, A1-R24-01.) Same null-cache class as the Vulkan
+  // backend: pipeline_cache_ is only created in SetupContext()
+  // (command_processor.cpp:1201), after ten early `return false` paths,
+  // but LaunchModule() reaches this entry point on the UI thread while
+  // the worker may still be inside SetupContext (see the Vulkan note
+  // above). Fail open the same way: skip the preload for this launch
+  // instead of crashing.
+  if (!pipeline_cache_) {
+    REXGPU_WARN(
+        "D3D12CommandProcessor::InitializeShaderStorage: pipeline cache not created yet "
+        "(SetupContext still running); skipping shader storage init for this launch");
+    return;
+  }
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
