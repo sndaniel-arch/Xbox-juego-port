@@ -341,7 +341,20 @@ void LogUnknownSettingsCvars(const std::vector<std::string>& settings_args) {
     // key with its negation prefix: without the strip every legitimate
     // negation warned spuriously about a cvar named "no-key". Look the
     // base key up; an unknown base still warns, under its own name.
-    if (name.rfind("no-", 0) == 0) name.erase(0, 3);
+    // (Hunt v1.4.6 ronda 25, A4-R25-02.) The strip used to be
+    // unconditional: it also swallowed the prefix of a NON-bool key
+    // ("--no-gpu_plugin=turnip"; gpu_plugin is a String cvar), so the
+    // line warned nowhere -- the dedupe (R18-02) and
+    // LogSuspiciousSettingsValues only treat --no-key as a negation
+    // when the base is a bool cvar, and CLI11 takes the un-stripped
+    // form as a harmless unknown option. Strip only when the base is
+    // a Boolean cvar (same guard as LogSuspiciousSettingsValues):
+    // a "--no-<string-key>" line now warns under its own name.
+    if (name.rfind("no-", 0) == 0) {
+      const std::string base = name.substr(3);
+      const rex::cvar::FlagEntry* base_info = rex::cvar::GetFlagInfo(base);
+      if (base_info && base_info->type == rex::cvar::FlagType::Boolean) name = base;
+    }
     if (name.empty()) continue;
     if (!rex::cvar::GetFlagInfo(name)) {
       REXLOG_WARN("settings.txt: no cvar named '{}' is registered yet "
