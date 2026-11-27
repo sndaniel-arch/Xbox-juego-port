@@ -669,6 +669,23 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first
 void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                      uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  // (Caza v1.4.6 ronda 24, A1-R24-01.) pipeline_cache_ only exists after
+  // SetupContext() reaches its creation (command_processor.cpp:1104), but
+  // this entry point is reachable before that: LaunchModule() calls it on
+  // the UI thread while the worker is still inside SetupContext, as soon
+  // as the command processor is paused -- a startup pause (e.g. the
+  // Bluetooth permission dialog) sets paused_ immediately, while the
+  // worker only parks after SetupContext returns. Dereferencing the null
+  // cache then crashes in SaveDriverPipelineCache ([this+0x260], R23-2,
+  // SIGSEGV fault 0x260). Fail open like the 1000 ms timeout degradation
+  // in GraphicsSystem::InitializeShaderStorage: shader storage is only a
+  // preload, so this launch runs without it instead of crashing.
+  if (!pipeline_cache_) {
+    REXGPU_WARN(
+        "VulkanCommandProcessor::InitializeShaderStorage: pipeline cache not created yet "
+        "(SetupContext still running); skipping shader storage init for this launch");
+    return;
+  }
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
