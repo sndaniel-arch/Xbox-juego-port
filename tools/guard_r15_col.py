@@ -52,6 +52,20 @@
 #   target crash-(iii) (pass-through sin chequeo; lo cubren B1/B2).
 #   lazy+52 = this (back-pointer, ctor 596A8), NO el holder: el holder es
 #   *(this+0) (correccion del analisis previo a R24).
+# RONDA 25 (A2): P20-A2-01 CERRADO (57/57 SIB guardables, 0 diferidos)
+#   + 6FFB0 guardable con custom (crash-(iii) completo salvo 34 NO-CHECK):
+#   guardias SIB estilo R22 en los 57 sitios fam67 sin SIB (10/67 ya la
+#   tenian). Mecanismo: solo fallo de Alloc en un getter hermano aguas
+#   arriba (3A728 Alloc(12), 3A7C0, ...), sin crash observado. Cada sitio
+#   con su auditoria de sufijo (d_analyze25.py: ON_PATH, veneno desde r31,
+#   slots, dtores, r1). 6 sitios necesitaron revision manual (813B8 x2:
+#   destroy en bloque que retorna antes de la guardia; 80920: ctor C2A30
+#   a 9 lineas; 85128: restore r1 de early-return; 852C0: r4 muerto en
+#   8BA00; 7F190: free de puntero heap [r30+0]). 6FFB0 (crash-(iii)
+#   NEEDS-MANUAL): GUARDABLE con snippet custom que replica el estado
+#   de la region saltada (r31=0, slots 96/100=0); sufijo auditado a mano.
+#   34 NO-CHECK, 885A8 y getters hermanos: ver evidence-a2.md R25
+#   (clasificados por sitio, con recetas R26).
 # Post-codegen guard pass for the deterministic R14 crash (hunt v1.4.6, ronda 15,
 # A2-R15-01). Runs on the GENERATED tree, after tools/localize_fix_col.py and
 # before the pack step, like the localize pass (same CLI: a glob of
@@ -1238,6 +1252,106 @@ def _r24_snippet(tag, reg, skip):
             % (R24_MARKER, tag, _r24_comment(tag), reg, skip))
 
 
+R25_MARKER = "GUARD_R25"
+
+# RONDA 25 (A2): P20-A2-01, los 57 sitios fam67 sin guardia SIB R22 (de
+# 67; los 10 restantes ya tienen SIB R22) + 6FFB0 (crash-(iii)
+# NEEDS-MANUAL, con snippet custom que replica el estado de la region
+# saltada). (func, file_no, tag, anchor_lines, insert_after, check_reg,
+# skip, new_label, custom). Mismo formato y misma semantica que
+# TARGETS_R24 (Fase 2d): ancla de 8 lineas SIB1
+# (`// lwz r3,0(r31)` + carga + addi/stw + `bl 0x82459f10` + lr) o 7
+# lineas SIB2 (carga + `bl 0x82459f10` + lr + llamada + `lwz r11,48(r3)`),
+# insert_after=0 (la guardia va ANTES de la carga), check_reg='r31' (el
+# contenedor: 0 si un getter hermano aguas arriba devolvio 0 porque su
+# Alloc fallo, p. ej. 3A728 Alloc(12)), skip a etiqueta nueva
+# `loc_<func>_sib_skip` en el epilogo (antes del dtor final 8BA00 del
+# temp construido a la entrada; compartida por los 2 sitios de la
+# funcion, como R22 SIB1/SIB2). Cada sufijo auditado por d_analyze25.py
+# (simulacion de sufijo con tracking de registros envenenados desde r31
+# + evidencia de slots + reglas de dtores/free + filtro de alcanzabilidad
+# ON_PATH entrada->guardia + chequeo r1). 41 etiquetas nuevas, 40
+# ficheros tocados. Tags `+SIB1` / `+SIB2` (orden de llamada en la
+# funcion). 6FFB0 lleva snippet custom (9o elemento): replica r31=0 y
+# [r1+96]=[r1+100]=0 antes de saltar; verificado a mano (sufijo [9011,
+# 9095]: r31 solo se almacena, [r1+96] se carga en 9057 con r4=0 en el
+# camino cero). Todos los snippets sin backslashes (leccion del run #46).
+TARGETS_R25 = [
+    ('sub_82479288', 100, 'sub_82479288+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824792C0;'), 0, 'r31', None, ('loc_82479288_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82479288', 100, 'sub_82479288+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479374;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82479288_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8246DF30', 107, 'sub_8246DF30+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8246DF64;'), 0, 'r31', None, ('loc_8246DF30_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247ADD0', 107, 'sub_8247ADD0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247AE0C;'), 0, 'r31', None, ('loc_8247ADD0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82485128', 109, 'sub_82485128+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82485164;'), 0, 'r31', None, ('loc_82485128_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// addi r10,r11,-11828', '\tctx.r10.s64 = r11.s64 + -11828;', '\t// stw r10,0(r29)', '\tREX_STORE_U32(ctx.r29.u32 + 0, ctx.r10.u32);', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824631C8', 112, 'sub_824631C8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82463200;'), 0, 'r31', None, ('loc_824631C8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82476368', 119, 'sub_82476368+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824763A0;'), 0, 'r31', None, ('loc_82476368_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82476368', 119, 'sub_82476368+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82476454;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82476368_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82482C50', 122, 'sub_82482C50+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82482C88;'), 0, 'r31', None, ('loc_82482C50_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247FD90', 123, 'sub_8247FD90+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247FDC8;'), 0, 'r31', None, ('loc_8247FD90_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247FD90', 123, 'sub_8247FD90+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247FE7C;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_8247FD90_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824813B8', 125, 'sub_824813B8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r28,r11,-11828', '\tctx.r28.s64 = r11.s64 + -11828;', '\t// stw r28,128(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 128, ctx.r28.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824813FC;'), 0, 'r31', None, ('loc_824813B8_sib_skip:\n', ('\t// addi r3,r1,128', '\tctx.r3.s64 = ctx.r1.s64 + 128;', '\t// bl 0x8248ba00', '\tctx.lr = 0x8248171C;', '\tsub_8248BA00(ctx, base);'), 0), None),
+    ('sub_824813B8', 125, 'sub_824813B8+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x824814CC;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_824813B8_sib_skip:\n', ('\t// addi r3,r1,128', '\tctx.r3.s64 = ctx.r1.s64 + 128;', '\t// bl 0x8248ba00', '\tctx.lr = 0x8248171C;', '\tsub_8248BA00(ctx, base);'), 0), None),
+    ('sub_8247BF90', 126, 'sub_8247BF90+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247BFC8;'), 0, 'r31', None, ('loc_8247BF90_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824829A0', 127, 'sub_824829A0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824829D8;'), 0, 'r31', None, ('loc_824829A0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82460748', 128, 'sub_82460748+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8246077C;'), 0, 'r31', None, ('loc_82460748_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82482AF8', 134, 'sub_82482AF8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82482B30;'), 0, 'r31', None, ('loc_82482AF8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824861F8', 138, 'sub_824861F8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8248622C;'), 0, 'r31', None, ('loc_824861F8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824861F8', 138, 'sub_824861F8+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x824862E0;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_824861F8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247C240', 150, 'sub_8247C240+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247C278;'), 0, 'r31', None, ('loc_8247C240_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247B930', 16, 'sub_8247B930+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247B968;'), 0, 'r31', None, ('loc_8247B930_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247B088', 162, 'sub_8247B088+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247B0C0;'), 0, 'r31', None, ('loc_8247B088_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475F38', 164, 'sub_82475F38+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475F70;'), 0, 'r31', None, ('loc_82475F38_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475F38', 164, 'sub_82475F38+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82476024;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82475F38_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8246DD58', 165, 'sub_8246DD58+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8246DD94;'), 0, 'r31', None, ('loc_8246DD58_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247F030', 165, 'sub_8247F030+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247F06C;'), 0, 'r31', None, ('loc_8247F030_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247B590', 170, 'sub_8247B590+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r10,r11,-11828', '\tctx.r10.s64 = r11.s64 + -11828;', '\t// stw r10,104(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 104, ctx.r10.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247B5C8;'), 0, 'r31', None, ('loc_8247B590_sib_skip:\n', ('\t// addi r3,r1,104', '\tctx.r3.s64 = ctx.r1.s64 + 104;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247C0E8', 173, 'sub_8247C0E8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247C120;'), 0, 'r31', None, ('loc_8247C0E8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475638', 175, 'sub_82475638+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475670;'), 0, 'r31', None, ('loc_82475638_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475638', 175, 'sub_82475638+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475724;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82475638_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82476150', 176, 'sub_82476150+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82476188;'), 0, 'r31', None, ('loc_82476150_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82476150', 176, 'sub_82476150+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247623C;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82476150_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247B1E0', 178, 'sub_8247B1E0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247B21C;'), 0, 'r31', None, ('loc_8247B1E0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247E088', 2, 'sub_8247E088+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247E0C0;'), 0, 'r31', None, ('loc_8247E088_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247E088', 2, 'sub_8247E088+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247E174;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_8247E088_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475A78', 20, 'sub_82475A78+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475AB0;'), 0, 'r31', None, ('loc_82475A78_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475A78', 20, 'sub_82475A78+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475B64;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82475A78_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82480920', 26, 'sub_82480920+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82480960;'), 0, 'r31', None, ('loc_82480920_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824798D0', 35, 'sub_824798D0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247990C;'), 0, 'r31', None, ('loc_824798D0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824798D0', 35, 'sub_824798D0+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x824799C0;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_824798D0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82479AF0', 38, 'sub_82479AF0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479B28;'), 0, 'r31', None, ('loc_82479AF0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82479AF0', 38, 'sub_82479AF0+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479BDC;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82479AF0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247C7A0', 39, 'sub_8247C7A0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247C7D8;'), 0, 'r31', None, ('loc_8247C7A0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475858', 44, 'sub_82475858+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475890;'), 0, 'r31', None, ('loc_82475858_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82475858', 44, 'sub_82475858+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82475944;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82475858_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824852C0', 46, 'sub_824852C0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824852FC;'), 0, 'r31', None, ('loc_824852C0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247AC80', 48, 'sub_8247AC80+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247ACB4;'), 0, 'r31', None, ('loc_8247AC80_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247C398', 54, 'sub_8247C398+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247C3D0;'), 0, 'r31', None, ('loc_8247C398_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82482DA8', 6, 'sub_82482DA8+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82482DE0;'), 0, 'r31', None, ('loc_82482DA8_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82478850', 61, 'sub_82478850+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r28,r11,-11828', '\tctx.r28.s64 = r11.s64 + -11828;', '\t// stw r28,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r28.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82478888;'), 0, 'r31', None, ('loc_82478850_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82478850', 61, 'sub_82478850+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247893C;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82478850_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247F190', 67, 'sub_8247F190+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247F1C8;'), 0, 'r31', None, ('loc_8247F190_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824794A0', 71, 'sub_824794A0+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x824794D4;'), 0, 'r31', None, ('loc_824794A0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_824794A0', 71, 'sub_824794A0+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479588;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_824794A0_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8247AF30', 90, 'sub_8247AF30+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r30,r11,-11828', '\tctx.r30.s64 = r11.s64 + -11828;', '\t// stw r30,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r30.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x8247AF68;'), 0, 'r31', None, ('loc_8247AF30_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82479D10', 92, 'sub_82479D10+SIB1', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// addi r29,r11,-11828', '\tctx.r29.s64 = r11.s64 + -11828;', '\t// stw r29,112(r1)', '\tREX_STORE_U32(ctx.r1.u32 + 112, ctx.r29.u32);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479D48;'), 0, 'r31', None, ('loc_82479D10_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_82479D10', 92, 'sub_82479D10+SIB2', ('\t// lwz r3,0(r31)', '\tctx.r3.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);', '\t// bl 0x82459f10', '\tctx.lr = 0x82479DFC;', '\tsub_82459F10(ctx, base);', '\t// lwz r11,48(r3)', '\tr11.u64 = REX_LOAD_U32(ctx.r3.u32 + 48);'), 0, 'r31', None, ('loc_82479D10_sib_skip:\n', ('\t// addi r3,r1,112', '\tctx.r3.s64 = ctx.r1.s64 + 112;', '\t// bl 0x8248ba00'), 0), None),
+    ('sub_8246FFB0', 37, 'sub_8246FFB0+59F10', ('\t// bl 0x82459f10', '\tctx.lr = 0x8246FFC8;', '\tsub_82459F10(ctx, base);'), 3, None, None, ('loc_8246FFB0_r25_skip:\n', ('\t// bne cr6,0x8247007c', '\tif (!cr6.eq) goto loc_8247007C;'), 2), '\t// GUARD_R25 sub_8246FFB0+59F10: 59F10 devuelve 0 si su Alloc(56)\n\t// fallo; el deref `lwz r11,48(r3)` leeria [0+48] -> SIGSEGV en\n\t// base+48. La region saltada [llamada, bne) es recta (sin ramas)\n\t// y su unico efecto observable es r31=0 y [r1+96]=[r1+100]=0\n\t// (li r31,0 + 2 stores); el sufijo [9011,9095] solo usa r31 como\n\t// valor almacenado (11x stw r31,XX(r1)) y carga [r1+96] en 9057\n\t// (r4=0 en el camino cero). El snippet replica ese estado exacto\n\t// y salta a loc_8246FFB0_r25_skip (fall-through del bne).\n\tif (ctx.r3.u32 == 0) {\n\t\tctx.r31.s64 = 0;\n\t\tREX_STORE_U32(ctx.r1.u32 + 96, 0);\n\t\tREX_STORE_U32(ctx.r1.u32 + 100, 0);\n\t\tgoto loc_8246FFB0_r25_skip;\n\t}\n'),
+]
+
+R25_IDS = {t[2] for t in TARGETS_R25}
+
+
+def _r25_comment(tag):
+    """Comentario de una linea para el bloque R25 (familia SIB)."""
+    return ("getter lazy devuelve 0 si su Alloc falla; la carga "
+            "`lwz r3,0(r31)` leeria [0+0] -> SIGSEGV en base+0")
+
+
+def _r25_snippet(tag, reg, skip):
+    return ("\t// %s %s: %s\n"
+            "\tif (ctx.%s.u32 == 0) goto %s;\n"
+            % (R25_MARKER, tag, _r25_comment(tag), reg, skip))
+
+
 def _migrate_711b0(path, lines):
     """Migracion R21 -> R22 de sub_824711B0+168 (SKIP-ONLY -> RECOVER).
 
@@ -1489,9 +1603,9 @@ def _insert_declare(lines, decl):
 
 
 def guard_file(path, dry_run):
-    """Aplica las guardias viejas, MT, R22, R23 y R24 para los targets
-    presentes en el fichero. Devuelve (found_old, found_mt, found_r22,
-    found_r23, found_r24, error, new_text).
+    """Aplica las guardias viejas, MT, R22, R23, R24 y R25 para los
+    targets presentes en el fichero. Devuelve (found_old, found_mt,
+    found_r22, found_r23, found_r24, found_r25, error, new_text).
 
     found_old: nombres de TARGETS viejos encontrados (aplicados ahora o ya
     aplicados). found_mt: tags de TARGETS_MT encontrados. new_text es None
@@ -1508,13 +1622,14 @@ def guard_file(path, dry_run):
     found_r22 = set()
     found_r23 = set()
     found_r24 = set()
+    found_r25 = set()
     changed = False
     # --- Fase 0: migracion R17 -> R18 (solo si MARKER presente) ---
     if MARKER in text:
         migrated, _already, error, new_text = migrate_guard_file(
             path, text, eol, lines)
         if error:
-            return (set(), set(), set(), set(), set(), error, None)
+            return (set(), set(), set(), set(), set(), set(), error, None)
         if new_text is not None:
             lines = new_text.split(eol)
             text = new_text
@@ -1524,7 +1639,7 @@ def guard_file(path, dry_run):
     if MT_MARKER in text:
         migrated, error = _migrate_711b0(path, lines)
         if error:
-            return (set(), set(), set(), set(), set(), error, None)
+            return (set(), set(), set(), set(), set(), set(), error, None)
         if migrated:
             changed = True
     # --- Fase 1: targets viejos (por target, no por fichero) ---
@@ -1536,7 +1651,7 @@ def guard_file(path, dry_run):
         body = lines[start:end + 1]
         body_text = "\n".join(body)
         if MARKER in body_text and not _recovery_present(body, spec):
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {name}: marcador viejo presente pero el "
                     "recovery no esta integro (estado corrupto, no se "
                     "adivina)",
@@ -1545,7 +1660,7 @@ def guard_file(path, dry_run):
             if spec.get("label") is not None:
                 label = spec["label"].rstrip("\n")
                 if not any(l.strip() == label for l in body):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {name}: recovery presente pero falta "
                             f"la etiqueta {label} (estado corrupto)",
                             None)
@@ -1566,7 +1681,7 @@ def guard_file(path, dry_run):
                     idx = i
                     break
             if idx is None:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {name}: anchor not found verbatim -- "
                         "codegen output changed, refusing to guess",
                         None)
@@ -1588,7 +1703,7 @@ def guard_file(path, dry_run):
                     lidx = i
                     break
             if lidx is None:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {name}: label anchor not found verbatim",
                         None)
             label_at = start + lidx + 1  # before `// addi r1,r1,128`
@@ -1607,7 +1722,7 @@ def guard_file(path, dry_run):
             if mt[11] is not None:
                 label = mt[11][0].rstrip("\n")
                 if not any(l.strip() == label for l in body):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({mt[3]}): tag MT presente "
                             f"pero falta la etiqueta {label}",
                             None)
@@ -1617,13 +1732,13 @@ def guard_file(path, dry_run):
         a_lines, a_insert = mt_anchor_a(mt)
         b_lines = mt_anchor_b(mt)
         if len(_find_block(body, a_lines)) != 1:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({mt[3]}): ancla-A MT no casa "
                     "exactamente una vez -- codegen output changed, "
                     "refusing to guess",
                     None)
         if len(_find_block(body, b_lines)) != 1:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({mt[3]}): ancla-B MT no casa "
                     "exactamente una vez -- codegen output changed, "
                     "refusing to guess",
@@ -1633,20 +1748,20 @@ def guard_file(path, dry_run):
         if mt[11] is not None:
             label, anchor_lines, label_after = mt[11]
             if any(l.strip() == label.rstrip("\n") for l in body):
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({mt[3]}): etiqueta nueva "
                         f"{label.strip()} ya existe sin tag MT (estado "
                         "corrupto)",
                         None)
             if len(_find_block(body, list(anchor_lines))) != 1:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({mt[3]}): label_anchor no casa "
                         "exactamente una vez",
                         None)
         else:
             skip = mt[10]
             if not any(l.strip() == skip + ":" for l in body):
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({mt[3]}): skip label {skip} "
                         "not found in function",
                         None)
@@ -1666,7 +1781,7 @@ def guard_file(path, dry_run):
         idx = _find_block(body, b_lines)[0]
         after_call = start + idx + len(b_lines)
         if after_call < len(lines) and MT_MARKER in lines[after_call]:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({mt[3]}): hay un bloque MT tras la "
                     "llamada sin este tag (estado corrupto)",
                     None)
@@ -1697,7 +1812,7 @@ def guard_file(path, dry_run):
             if new_label is not None:
                 label = new_label[0].rstrip("\n")
                 if not any(l.strip() == label for l in body):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): tag R22 presente "
                             f"pero falta la etiqueta {label}",
                             None)
@@ -1705,7 +1820,7 @@ def guard_file(path, dry_run):
             continue
         # Ancla: exactamente una vez en la funcion.
         if len(_find_block(body, list(anchor_lines))) != 1:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): ancla R22 no casa "
                     "exactamente una vez -- codegen output changed, "
                     "refusing to guess",
@@ -1727,21 +1842,21 @@ def guard_file(path, dry_run):
                             and t[2] != tag]
                 if not any(R22_MARKER + " " + st in "\n".join(body)
                            for st in sib_tags):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): etiqueta nueva "
                             f"{label.strip()} ya existe sin tag R22 (estado "
                             "corrupto)",
                             None)
                 label_exists = True
             elif len(_find_block(body, list(la_lines))) != 1:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): label_anchor R22 no casa "
                         "exactamente una vez",
                         None)
             skip = label_stripped.rstrip(":")
         else:
             if not any(l.strip() == skip + ":" for l in body):
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): skip label {skip} "
                         "not found in function",
                         None)
@@ -1753,7 +1868,7 @@ def guard_file(path, dry_run):
         idx = _find_block(body, list(anchor_lines))[0]
         insert_at = start + idx + insert_after
         if insert_at < len(lines) and R22_MARKER in lines[insert_at]:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): hay un bloque R22 en el "
                     "punto de insercion sin este tag (estado corrupto)",
                     None)
@@ -1785,7 +1900,7 @@ def guard_file(path, dry_run):
             if new_label is not None:
                 label = new_label[0].rstrip("\n")
                 if not any(l.strip() == label for l in body):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): tag R23 presente "
                             f"pero falta la etiqueta {label}",
                             None)
@@ -1793,7 +1908,7 @@ def guard_file(path, dry_run):
             continue
         # Ancla: exactamente una vez en la funcion.
         if len(_find_block(body, list(anchor_lines))) != 1:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): ancla R23 no casa "
                     "exactamente una vez -- codegen output changed, "
                     "refusing to guess",
@@ -1815,21 +1930,21 @@ def guard_file(path, dry_run):
                             and t[2] != tag]
                 if not any(R23_MARKER + " " + st in "\n".join(body)
                            for st in sib_tags):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): etiqueta nueva "
                             f"{label.strip()} ya existe sin tag R23 (estado "
                             "corrupto)",
                             None)
                 label_exists = True
             elif len(_find_block(body, list(la_lines))) != 1:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): label_anchor R23 no casa "
                         "exactamente una vez",
                         None)
             skip = label_stripped.rstrip(":")
         else:
             if not any(l.strip() == skip + ":" for l in body):
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): skip label {skip} "
                         "not found in function",
                         None)
@@ -1841,7 +1956,7 @@ def guard_file(path, dry_run):
         idx = _find_block(body, list(anchor_lines))[0]
         insert_at = start + idx + insert_after
         if insert_at < len(lines) and R23_MARKER in lines[insert_at]:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): hay un bloque R23 en el "
                     "punto de insercion sin este tag (estado corrupto)",
                     None)
@@ -1873,7 +1988,7 @@ def guard_file(path, dry_run):
             if new_label is not None:
                 label = new_label[0].rstrip("\n")
                 if not any(l.strip() == label for l in body):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): tag R24 presente "
                             f"pero falta la etiqueta {label}",
                             None)
@@ -1881,7 +1996,7 @@ def guard_file(path, dry_run):
             continue
         # Ancla: exactamente una vez en la funcion.
         if len(_find_block(body, list(anchor_lines))) != 1:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): ancla R24 no casa "
                     "exactamente una vez -- codegen output changed, "
                     "refusing to guess",
@@ -1903,21 +2018,21 @@ def guard_file(path, dry_run):
                             and t[2] != tag]
                 if not any(R24_MARKER + " " + st in "\n".join(body)
                            for st in sib_tags):
-                    return (set(), set(), set(), set(), set(),
+                    return (set(), set(), set(), set(), set(), set(),
                             f"{path}: {func} ({tag}): etiqueta nueva "
                             f"{label.strip()} ya existe sin tag R24 (estado "
                             "corrupto)",
                             None)
                 label_exists = True
             elif len(_find_block(body, list(la_lines))) != 1:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): label_anchor R24 no casa "
                         "exactamente una vez",
                         None)
             skip = label_stripped.rstrip(":")
         else:
             if not any(l.strip() == skip + ":" for l in body):
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: {func} ({tag}): skip label {skip} "
                         "not found in function",
                         None)
@@ -1929,7 +2044,7 @@ def guard_file(path, dry_run):
         idx = _find_block(body, list(anchor_lines))[0]
         insert_at = start + idx + insert_after
         if insert_at < len(lines) and R24_MARKER in lines[insert_at]:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: {func} ({tag}): hay un bloque R24 en el "
                     "punto de insercion sin este tag (estado corrupto)",
                     None)
@@ -1948,6 +2063,94 @@ def guard_file(path, dry_run):
                 label.rstrip("\n")]
             changed = True
         found_r24.add(tag)
+    # --- Fase 2e: targets R25 (insercion unica por sitio) ---
+    for r25 in TARGETS_R25:
+        func, _fno, tag, anchor_lines, insert_after, reg, skip, new_label, custom = r25
+        span = find_function_span(lines, func)
+        if span is None:
+            continue  # el target vive en otro fichero del glob
+        start, end = span
+        body = lines[start:end + 1]
+        if R25_MARKER + " " + tag in "\n".join(body):
+            # Ya aplicado: verificar la etiqueta nueva si la hay.
+            if new_label is not None:
+                label = new_label[0].rstrip("\n")
+                if not any(l.strip() == label for l in body):
+                    return (set(), set(), set(), set(), set(), set(),
+                            f"{path}: {func} ({tag}): tag R25 presente "
+                            f"pero falta la etiqueta {label}",
+                            None)
+            found_r25.add(tag)
+            continue
+        # Ancla: exactamente una vez en la funcion.
+        if len(_find_block(body, list(anchor_lines))) != 1:
+            return (set(), set(), set(), set(), set(), set(),
+                    f"{path}: {func} ({tag}): ancla R25 no casa "
+                    "exactamente una vez -- codegen output changed, "
+                    "refusing to guess",
+                    None)
+        # Skip label: existente (debe estar en la funcion) o nueva
+        # (su label_anchor exactamente una vez, la etiqueta aun no existe).
+        label_exists = False
+        if new_label is not None:
+            label, la_lines, label_after = new_label
+            label_stripped = label.rstrip("\n")
+            if any(l.strip() == label_stripped for l in body):
+                # La etiqueta puede venir de un target hermano R25 de la
+                # misma funcion que comparte skip (p. ej. SIB1/SIB2, o las
+                # dos llamadas de 77740): solo es legitima si el tag de
+                # ese hermano ya esta en el cuerpo.
+                sib_tags = [t[2] for t in TARGETS_R25
+                            if t[0] == func and t[7] is not None
+                            and t[7][0].rstrip("\n") == label_stripped
+                            and t[2] != tag]
+                if not any(R25_MARKER + " " + st in "\n".join(body)
+                           for st in sib_tags):
+                    return (set(), set(), set(), set(), set(), set(),
+                            f"{path}: {func} ({tag}): etiqueta nueva "
+                            f"{label.strip()} ya existe sin tag R25 (estado "
+                            "corrupto)",
+                            None)
+                label_exists = True
+            elif len(_find_block(body, list(la_lines))) != 1:
+                return (set(), set(), set(), set(), set(), set(),
+                        f"{path}: {func} ({tag}): label_anchor R25 no casa "
+                        "exactamente una vez",
+                        None)
+            skip = label_stripped.rstrip(":")
+        else:
+            if not any(l.strip() == skip + ":" for l in body):
+                return (set(), set(), set(), set(), set(), set(),
+                        f"{path}: {func} ({tag}): skip label {skip} "
+                        "not found in function",
+                        None)
+        # Insercion (tras `insert_after` lineas del ancla). Si la linea
+        # siguiente ya lleva un bloque R25, es estado corrupto.
+        span = find_function_span(lines, func)
+        start, end = span
+        body = lines[start:end + 1]
+        idx = _find_block(body, list(anchor_lines))[0]
+        insert_at = start + idx + insert_after
+        if insert_at < len(lines) and R25_MARKER in lines[insert_at]:
+            return (set(), set(), set(), set(), set(), set(),
+                    f"{path}: {func} ({tag}): hay un bloque R25 en el "
+                    "punto de insercion sin este tag (estado corrupto)",
+                    None)
+        snippet = (custom if custom is not None else _r25_snippet(tag, reg, skip)).rstrip("\n").split("\n")
+        lines[insert_at:insert_at] = snippet
+        changed = True
+        # Etiqueta nueva si la hay y no la puso ya un hermano (tras
+        # label_after lineas del ancla).
+        if new_label is not None and not label_exists:
+            label, la_lines, label_after = new_label
+            span = find_function_span(lines, func)
+            start, end = span
+            body = lines[start:end + 1]
+            lidx = _find_block(body, list(la_lines))[0]
+            lines[start + lidx + label_after:start + lidx + label_after] = [
+                label.rstrip("\n")]
+            changed = True
+        found_r25.add(tag)
     # --- Fase 3: DECLAREs ---
     if found_old:
         # sub_8242EAC8 no esta declarado en los headers de los ficheros
@@ -1957,7 +2160,7 @@ def guard_file(path, dry_run):
                     lines, f"DECLARE_REX_FUNC(sub_8242EAC8);  // {MARKER}"):
                 changed = True
         except ValueError as e:
-            return (set(), set(), set(), set(), set(), f"{path}: {e}", None)
+            return (set(), set(), set(), set(), set(), set(), f"{path}: {e}", None)
     mt_recover_here = [mt for mt in TARGETS_MT
                        if _mt_tag(mt) in found_mt and mt[9] == "RECOVER"]
     if mt_recover_here:
@@ -1966,7 +2169,7 @@ def guard_file(path, dry_run):
         m = re.match(r"childoflight_recomp\.(\d+)\.cpp$",
                      path.replace("\\", "/").split("/")[-1])
         if m is None:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: no se pudo derivar el numero de fichero para "
                     "el header hermano",
                     None)
@@ -1978,7 +2181,7 @@ def guard_file(path, dry_run):
                       errors="surrogateescape") as f:
                 htext = f.read()
         except OSError:
-            return (set(), set(), set(), set(), set(),
+            return (set(), set(), set(), set(), set(), set(),
                     f"{path}: no se pudo leer el header hermano {hdr}",
                     None)
         decl_mt = f"DECLARE_REX_FUNC(sub_82434368);  // {MT_MARKER}"
@@ -1988,7 +2191,7 @@ def guard_file(path, dry_run):
                 if _insert_declare(lines, decl_mt):
                     changed = True
             except ValueError as e:
-                return (set(), set(), set(), set(), set(), f"{path}: {e}", None)
+                return (set(), set(), set(), set(), set(), set(), f"{path}: {e}", None)
     # Ronda 24-fix (run #46 rojo): ninguna linea de guardia puede llevar
     # un backslash literal. El custom B2 de R24 se escribio con \\n/\\t
     # dobles y el bloque entero colapso en una sola linea fisica
@@ -1999,12 +2202,12 @@ def guard_file(path, dry_run):
     if changed:
         for _l in lines:
             if "GUARD_" in _l and "\\" in _l:
-                return (set(), set(), set(), set(), set(),
+                return (set(), set(), set(), set(), set(), set(),
                         f"{path}: linea de guardia con backslash literal "
                         f"(escape doble, colapsaria el bloque): {_l.strip()[:80]!r}",
                         None)
     new_text = eol.join(lines) if changed else None
-    return (found_old, found_mt, found_r22, found_r23, found_r24, None, new_text)
+    return (found_old, found_mt, found_r22, found_r23, found_r24, found_r25, None, new_text)
 
 
 def main():
@@ -2037,9 +2240,10 @@ def main():
     found_r22 = set()
     found_r23 = set()
     found_r24 = set()
+    found_r25 = set()
     pending = []  # (path, new_text): written only after all files pass
     for path in paths:
-        fo, fm, fr, fr23, fr24, error, new_text = guard_file(path, dry_run)
+        fo, fm, fr, fr23, fr24, fr25, error, new_text = guard_file(path, dry_run)
         if error:
             print(f"guard_r15_col: ERROR: {error}", file=sys.stderr)
             return 1
@@ -2048,14 +2252,15 @@ def main():
         found_r22 |= fr
         found_r23 |= fr23
         found_r24 |= fr24
+        found_r25 |= fr25
         if new_text is not None:
             pending.append((path, new_text))
         elif fo or fm or fr:
             skipped.append(path)
             print(f"guard_r15_col: already applied, skipped {path}")
     # Todos los targets deben estar presentes (guardados ahora o ya
-    # aplicados): los 11 viejos, los 62 MT, los 57 R22, los 26 R23 y los
-    # 75 R24.
+    # aplicados): los 11 viejos, los 62 MT, los 57 R22, los 26 R23, los
+    # 75 R24 y los 58 R25.
     missing_old = sorted(set(TARGETS) - found_old)
     if missing_old:
         print(f"guard_r15_col: ERROR: old target(s) not guarded: "
@@ -2086,6 +2291,12 @@ def main():
               f"{', '.join(missing_r24)} -- the generated tree does not "
               "contain them (glob or codegen changed)", file=sys.stderr)
         return 1
+    missing_r25 = sorted(R25_IDS - found_r25)
+    if missing_r25:
+        print(f"guard_r15_col: ERROR: R25 target(s) not guarded: "
+              f"{', '.join(missing_r25)} -- the generated tree does not "
+              "contain them (glob or codegen changed)", file=sys.stderr)
+        return 1
     # (Ronda 17, A2-R17-04.) Write only now: every file transformed
     # cleanly and every target was found, so a failed run above modified
     # zero files. In dry-run mode nothing is written, same as before.
@@ -2102,7 +2313,8 @@ def main():
           f"{len(found_mt)}/{len(MT_IDS)}, R22 targets: "
           f"{len(found_r22)}/{len(R22_IDS)}, R23 targets: "
           f"{len(found_r23)}/{len(R23_IDS)}, R24 targets: "
-          f"{len(found_r24)}/{len(R24_IDS)}")
+          f"{len(found_r24)}/{len(R24_IDS)}, R25 targets: "
+          f"{len(found_r25)}/{len(R25_IDS)}")
     return 0
 
 if __name__ == "__main__":
