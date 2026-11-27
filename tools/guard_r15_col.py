@@ -1214,7 +1214,7 @@ TARGETS_R24 = [
     ('sub_8247A160', 89, 'sub_8247A160+59F10#2', ('\t// bl 0x82459f10', '\tctx.lr = 0x8247A2EC;', '\tsub_82459F10(ctx, base);'), 3, 'r3', 'loc_8247A3E8', None, None),
     ('sub_82A60C40', 98, 'sub_82A60C40+59F10', ('\t// bl 0x82459f10', '\tctx.lr = 0x82A60C84;', '\tsub_82459F10(ctx, base);'), 3, 'r3', 'loc_82A60D64', None, None),
     ('sub_82459F10', 63, 'sub_82459F10+59F10B-enter', ('\tctx.r10.u64 = REX_LOAD_U8(ctx.r30.u32 + -25098);', '\t// cmplwi cr6,r10,0', '\tcr6.compare<uint32_t>(ctx.r10.u32, 0, ctx.xer);', '\t// beq cr6,0x82459f48', '\tif (cr6.eq) goto loc_82459F48;'), 5, 'r29', 'loc_82459F48', None, None),
-    ('sub_82459F10', 63, 'sub_82459F10+59F10B-leave', ('\tctx.r10.u64 = REX_LOAD_U8(ctx.r30.u32 + -25098);', '\t// cmplwi cr6,r10,0', '\tcr6.compare<uint32_t>(ctx.r10.u32, 0, ctx.xer);', '\t// beq cr6,0x82459f98', '\tif (cr6.eq) goto loc_82459F98;'), 5, None, 'loc_82459F98', None, '\\t// GUARD_R24 sub_82459F10+59F10B-leave: holder nulo en sub_82459F10 (crash R23-1): *(this+0)==0 cuando el ctor sub_8242EAC8 no lo lleno (global 0x82CD7744==0, 26CF8==0 o Alloc(20) fallo); el Enter se salto en B1 pero el Leave leeria [r29+0] -> SIGSEGV en base+0. Se recarga el holder via el back-pointer del lazy (lazy+52 = this, ctor sub_824596A8, cola incondicional; holder = *(this+0)); si es 0 se salta el Leave (el Enter no corrio o corrio con critsec 0, y *(holder+0) solo lo escribe sub_8241AD10). r10 es scratch muerto tras 9F84 en ambos caminos.\\n\\tif (ctx.r3.u32 != 0) {\\n\\t\\tctx.r10.u64 = REX_LOAD_U32(ctx.r3.u32 + 52);\\n\\t\\tif (ctx.r10.u32 == 0) goto loc_82459F98;\\n\\t\\tctx.r10.u64 = REX_LOAD_U32(ctx.r10.u32 + 0);\\n\\t\\tif (ctx.r10.u32 == 0) goto loc_82459F98;\\n\\t}\\n'),
+    ('sub_82459F10', 63, 'sub_82459F10+59F10B-leave', ('\tctx.r10.u64 = REX_LOAD_U8(ctx.r30.u32 + -25098);', '\t// cmplwi cr6,r10,0', '\tcr6.compare<uint32_t>(ctx.r10.u32, 0, ctx.xer);', '\t// beq cr6,0x82459f98', '\tif (cr6.eq) goto loc_82459F98;'), 5, None, 'loc_82459F98', None, '\t// GUARD_R24 sub_82459F10+59F10B-leave: holder nulo en sub_82459F10 (crash R23-1): *(this+0)==0 cuando el ctor sub_8242EAC8 no lo lleno (global 0x82CD7744==0, 26CF8==0 o Alloc(20) fallo); el Enter se salto en B1 pero el Leave leeria [r29+0] -> SIGSEGV en base+0. Se recarga el holder via el back-pointer del lazy (lazy+52 = this, ctor sub_824596A8, cola incondicional; holder = *(this+0)); si es 0 se salta el Leave (el Enter no corrio o corrio con critsec 0, y *(holder+0) solo lo escribe sub_8241AD10). r10 es scratch muerto tras 9F84 en ambos caminos.\n\tif (ctx.r3.u32 != 0) {\n\t\tctx.r10.u64 = REX_LOAD_U32(ctx.r3.u32 + 52);\n\t\tif (ctx.r10.u32 == 0) goto loc_82459F98;\n\t\tctx.r10.u64 = REX_LOAD_U32(ctx.r10.u32 + 0);\n\t\tif (ctx.r10.u32 == 0) goto loc_82459F98;\n\t}\n'),
 ]
 
 R24_IDS = {t[2] for t in TARGETS_R24}
@@ -1989,6 +1989,20 @@ def guard_file(path, dry_run):
                     changed = True
             except ValueError as e:
                 return (set(), set(), set(), set(), set(), f"{path}: {e}", None)
+    # Ronda 24-fix (run #46 rojo): ninguna linea de guardia puede llevar
+    # un backslash literal. El custom B2 de R24 se escribio con \\n/\\t
+    # dobles y el bloque entero colapso en una sola linea fisica
+    # (childoflight_recomp.63.cpp:9703 "expected expression"). Los
+    # snippets de guardia nunca contienen backslashes, asi que cualquier
+    # "\" en una linea GUARD_ es estado corrupto: fail-closed, sin
+    # escribir el fichero.
+    if changed:
+        for _l in lines:
+            if "GUARD_" in _l and "\\" in _l:
+                return (set(), set(), set(), set(), set(),
+                        f"{path}: linea de guardia con backslash literal "
+                        f"(escape doble, colapsaria el bloque): {_l.strip()[:80]!r}",
+                        None)
     new_text = eol.join(lines) if changed else None
     return (found_old, found_mt, found_r22, found_r23, found_r24, None, new_text)
 
