@@ -1790,6 +1790,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
       if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
+          // (Caza v1.4.6 ronda 24, A1-R24-02.) Stamp the insertion
+          // sequence under the same lock that guards the queue, so the
+          // comparator sees a consistent (priority, sequence) pair.
+          creation_arguments_real.sequence =
+              creation_sequence_counter_.fetch_add(1, std::memory_order_relaxed);
           creation_queue_.push(creation_arguments_real);
         }
         creation_request_cond_.notify_one();
