@@ -365,6 +365,9 @@ class VulkanPipelineCache {
   // Description that can be passed from the command processor thread to the
   // creation threads, with everything needed from caches pre-looked-up.
   struct PipelineCreationArguments {
+    // (Caza v1.4.6 ronda 24, A1-R24-02.) Insertion sequence for FIFO
+    // ordering within a priority level (see the comparator below).
+    uint64_t sequence = 0;
     uint8_t priority = 0;
     std::pair<const PipelineDescription, Pipeline>* pipeline = nullptr;
     const PipelineLayoutProvider* pipeline_layout = nullptr;
@@ -381,7 +384,18 @@ class VulkanPipelineCache {
   };
   struct PipelineCreationArgumentsPriorityComparator {
     bool operator()(const PipelineCreationArguments& a, const PipelineCreationArguments& b) const {
-      return a.priority < b.priority;
+      // (Caza v1.4.6 ronda 24, A1-R24-02.) std::priority_queue orders by
+      // this comparator alone, with no fairness guarantee between equal
+      // keys: with only four priority levels, most scene pipelines share
+      // one level, so an older entry could be overtaken indefinitely by
+      // newer arrivals while the game queues new pipelines every frame
+      // (the R23 title screen: placeholder draws that never complete).
+      // Break ties by insertion sequence so each level drains FIFO and
+      // every queued pipeline eventually completes.
+      if (a.priority != b.priority) {
+        return a.priority < b.priority;
+      }
+      return a.sequence > b.sequence;
     }
   };
 
@@ -648,6 +662,11 @@ class VulkanPipelineCache {
 
   mutable std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
+  // (Caza v1.4.6 ronda 24, A1-R24-02.) Monotonic insertion sequence for
+  // the creation queue (see PipelineCreationArguments::sequence):
+  // assigned under creation_request_lock_ at the single push site in
+  // ConfigurePipeline, so (priority, sequence) pairs are consistent.
+  std::atomic<uint64_t> creation_sequence_counter_{0};
   std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
                       PipelineCreationArgumentsPriorityComparator>
       creation_queue_;
