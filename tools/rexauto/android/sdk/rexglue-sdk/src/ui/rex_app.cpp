@@ -554,21 +554,36 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
     main_thread->Resume();
 
 #if REX_PLATFORM_ANDROID
-    // (Run #11, F1.) Sample which CPU the guest main thread REALLY runs on:
+    // (Run #11, F1; R25, A3-R25-01.) Sample which CPU the guest threads REALLY run on:
     // 1 Hz for the first 10 s. sched_getcpu() here would report the
     // *caller's* CPU (this lambda runs on the UI thread), so the sampler
-    // reads /proc/self/task/<tid>/stat (field 39, processor) for the thread
+    // reads /proc/self/task/<tid>/stat (field 39, processor) for every thread
     // whose comm starts with "Main XThread" (KernelState names the launch
-    // thread that; pthread names truncate to 15 chars). Detached: it owns
-    // nothing but its own copies and exits after the 10th sample.
-    std::thread([]() {
-      constexpr const char* kGuestThreadCommPrefix = "Main XThread";
-      uint64_t cpu_samples[64] = {};
-      int found_samples = 0;
+    // thread that) or "XThread" (XThread::Create names later guest threads
+    // "XThread{:04X}", xthread.cpp:490; pthread names truncate to 15 chars).
+    // R25: the run #11 sampler only watched the main thread, and only the
+    // main thread and the command processor are pinned to the big cores; the
+    // other guest threads run wherever the scheduler puts them. This version
+    // keeps one CPU histogram per guest thread and reports the big-core share
+    // of each, so the next phone run shows whether any guest thread is stuck
+    // on the little cores. Log-only: no affinity is changed here. Detached:
+    // it owns nothing but its own copies and exits after the 10th sample.
+    // big_core_mask is captured by value (resolved just above, same scope).
+    std::thread([big_core_mask]() {
+      struct ThreadCpuSamples {
+        int tid = -1;
+        std::string comm;
+        uint64_t cpus[64] = {};
+        int found = 0;
+      };
+      // 32 slots: the guest rarely has more live threads at once; any extra
+      // thread is counted as overflow instead of growing the table mid-run.
+      ThreadCpuSamples threads[32] = {};
+      int thread_count = 0;
+      int overflow_threads = 0;
       for (int sample = 1; sample <= 10; ++sample) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        int cpu = -1;
-        int tid = -1;
+        bool main_seen = false;
         std::error_code ec;  // Fresh per sample: a stale error must not abort the next one.
         for (const auto& entry :
              std::filesystem::directory_iterator("/proc/self/task", ec)) {
@@ -578,7 +593,9 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
           std::ifstream comm_file(entry.path() / "comm");
           std::string comm;
           std::getline(comm_file, comm);
-          if (comm.rfind(kGuestThreadCommPrefix, 0) != 0) {
+          const bool is_main = comm.rfind("Main XThread", 0) == 0;
+          const bool is_guest = comm.rfind("XThread", 0) == 0;
+          if (!is_main && !is_guest) {
             continue;
           }
           // stat is "pid (comm) state ppid ... processor ..."; comm itself
@@ -595,6 +612,7 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
           std::istringstream rest(stat_line.substr(close_paren + 1));
           std::string token;
           int token_index = 0;
+          int cpu = -1;
           while (rest >> token) {
             if (token_index == 36) {
               cpu = std::atoi(token.c_str());
@@ -602,39 +620,70 @@ void ReXApp::LaunchModule() {  app_context().CallInUIThreadDeferred([this]() {
             }
             ++token_index;
           }
-          if (cpu >= 0 && cpu < 64) {
-            tid = std::atoi(entry.path().filename().string().c_str());
-          }
-          break;
-        }
-        if (cpu >= 0) {
-          ++found_samples;
-          cpu_samples[cpu]++;
-          REXLOG_INFO("Guest main thread CPU sample {}/10: CPU {} (tid {})", sample, cpu,
-                      tid);
-        } else {
-          REXLOG_WARN("Guest main thread CPU sample {}/10: thread '{}' not found in "
-                      "/proc/self/task yet",
-                      sample, kGuestThreadCommPrefix);
-        }
-      }
-      if (found_samples > 0) {
-        std::string summary;
-        for (int cpu = 0; cpu < 64; ++cpu) {
-          if (cpu_samples[cpu] == 0) {
+          if (cpu < 0 || cpu >= 64) {
             continue;
           }
-          if (!summary.empty()) {
-            summary += ", ";
+          const int tid = std::atoi(entry.path().filename().string().c_str());
+          ThreadCpuSamples* slot = nullptr;
+          for (int i = 0; i < thread_count; ++i) {
+            if (threads[i].tid == tid) {
+              slot = &threads[i];
+              break;
+            }
           }
-          summary += fmt::format("CPU{} x{}", cpu, cpu_samples[cpu]);
+          if (!slot) {
+            if (thread_count >= 32) {
+              ++overflow_threads;
+              continue;
+            }
+            slot = &threads[thread_count++];
+            slot->tid = tid;
+            slot->comm = comm;
+          }
+          slot->cpus[cpu]++;
+          slot->found++;
+          if (is_main) {
+            main_seen = true;
+            REXLOG_INFO("Guest main thread CPU sample {}/10: CPU {} (tid {})", sample, cpu,
+                        tid);
+          }
         }
-        REXLOG_INFO("Guest main thread CPU samples (10s, found {}/10): {}", found_samples,
-                    summary);
+        if (!main_seen) {
+          REXLOG_WARN("Guest main thread CPU sample {}/10: thread 'Main XThread' not found "
+                      "in /proc/self/task yet",
+                      sample);
+        }
+      }
+      if (thread_count == 0) {
+        REXLOG_WARN("Guest thread CPU samples (10s): no 'Main XThread'/'XThread' thread "
+                    "found in /proc/self/task; the pin could not be confirmed from the CPU "
+                    "side");
       } else {
-        REXLOG_WARN("Guest main thread CPU samples (10s): thread '{}' never found in "
-                    "/proc/self/task; the pin could not be confirmed from the CPU side",
-                    kGuestThreadCommPrefix);
+        for (int i = 0; i < thread_count; ++i) {
+          const ThreadCpuSamples& t = threads[i];
+          std::string summary;
+          int big_core_samples = 0;
+          for (int cpu = 0; cpu < 64; ++cpu) {
+            if (t.cpus[cpu] == 0) {
+              continue;
+            }
+            if (!summary.empty()) {
+              summary += ", ";
+            }
+            summary += fmt::format("CPU{} x{}", cpu, t.cpus[cpu]);
+            if (big_core_mask & (uint64_t(1) << cpu)) {
+              big_core_samples += static_cast<int>(t.cpus[cpu]);
+            }
+          }
+          REXLOG_INFO("Guest thread '{}' (tid {}) CPU samples (10s, found {}/10): {} "
+                      "(big-core samples: {}/{})",
+                      t.comm, t.tid, t.found, summary, big_core_samples, t.found);
+        }
+        if (overflow_threads > 0) {
+          REXLOG_WARN("Guest thread CPU samples (10s): {} extra guest thread(s) did not fit "
+                      "the 32-slot table and were not counted",
+                      overflow_threads);
+        }
       }
     }).detach();
 #endif
