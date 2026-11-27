@@ -3,18 +3,26 @@
 
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- Allow access to Bluetooth devices (Hunt v1.4.6 ronda 20,
-         A4-R20-01): the SDL HIDAPI driver for Bluetooth Steam Controllers
-         (HIDDeviceBLESteamController) needs BLUETOOTH_CONNECT on API 31+
-         — a runtime permission, which SDL requests at joystick init and
-         initializeBluetooth() re-checks — and BLUETOOTH on API <=30.
-         Without these declarations the merged release manifest carried
-         only VIBRATE, so the whole BLE stack was dead code. No scanning
-         is done (bonded devices + GATT only), so BLUETOOTH_SCAN is not
-         needed. -->
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
-    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <!-- Bluetooth Steam Controllers: DORMANT (Hunt v1.4.6 ronda 24,
+         A4-R24-01). R20 (A4-R20-01) declared BLUETOOTH_CONNECT /
+         BLUETOOTH (maxSdk 30) / bluetooth_le here and enabled the SDL
+         HIDAPI Steam driver, so SDL asked for BLUETOOTH_CONNECT at
+         every launch — the "Nearby devices" dialog the player saw on
+         start. The player has no Steam Controller (his controller is
+         the phone itself) and ordered no permission prompts at game
+         start, so the declarations are gone and the driver stays at
+         the SDL default ("0", android_main.cpp). Nothing in the app
+         uses Bluetooth now: the BLE stack
+         (HIDDeviceManager/HIDDeviceBLESteamController) is intact but
+         never started, and standard Bluetooth gamepads, USB
+         controllers and the touch pad do not need this permission
+         (they arrive through the Android InputDevice path). To bring
+         the Steam Controller path back, restore BOTH halves together:
+         the two uses-permission lines + the uses-feature line here,
+         AND SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1") in
+         android_main.cpp before SDL_InitSubSystem(SDL_INIT_GAMEPAD) —
+         either half alone leaves the stack dead (a request for an
+         undeclared permission is auto-denied with no dialog). -->
 
     <!-- The Xenos GPU backend needs a full Vulkan 1.1 implementation. -->
     <uses-feature
