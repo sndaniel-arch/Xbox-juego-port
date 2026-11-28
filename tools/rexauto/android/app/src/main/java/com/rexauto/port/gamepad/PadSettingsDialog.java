@@ -2,6 +2,9 @@ package com.rexauto.port.gamepad;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -292,34 +295,68 @@ public final class PadSettingsDialog {
             new AlertDialog.Builder(activity)
                 .setMessage(R.string.reset_confirm)
                 .setPositiveButton(android.R.string.ok, (d, w) -> {
-                    // (Ronda 7, auditor F — R7-F7.) delete() devuelve
-                    // boolean, no tira: si el borrado fallaba (almacenamiento
-                    // retirado a mitad, fichero retenido), el reset se daba
-                    // por hecho igual — activity.finish() y el proximo toque
-                    // volvia a entrar al juego como si nada. Misma familia
-                    // que R6-F6 (renameTo ignorado), en el otro sentido: aqui
-                    // el silencio miente sobre un borrado, no sobre un
-                    // renombre. Solo se sale cuando todo se borro de verdad.
-                    boolean ok = false;
-                    try {
-                        ok = deleteRecursively(GameFiles.gameDir(activity));
-                        // Full builds have no extracted game files: the game
-                        // data lives in <external>/data (saves, installed
-                        // DLC, shader cache). Without this the reset was a
-                        // no-op there and the game came back on next launch.
-                        ok = deleteRecursively(GameFiles.dataDir(activity)) && ok;
-                        File cfg = GameFiles.configFile(activity);
-                        if (cfg.exists() && !cfg.delete()) ok = false;
-                    } catch (Exception e) {
-                        Toast.makeText(activity, e.toString(), Toast.LENGTH_LONG).show();
-                    }
-                    if (!ok) {
-                        Toast.makeText(activity, R.string.err_generic, Toast.LENGTH_LONG).show();
-                        return;
-                    }
-                    // Game files gone: back to the icon; next tap opens the
-                    // first-run import screen again.
-                    activity.finish();
+                    // (Hunt v1.4.6 ronda 26, A4-R26-03.) The delete used to
+                    // run here, on the UI thread: deleteRecursively over
+                    // files/game (up to ~2 GB extracted in dev builds) +
+                    // files/data (saves, installed DLC, shader cache,
+                    // growing with play time) is unbounded synchronous
+                    // file I/O — a slow delete with a tap queued behind
+                    // it trips the 5 s input ANR. Same class as the
+                    // ANR-on-pause deferred item, but this one was still
+                    // live and unbounded. The delete now runs on a worker
+                    // thread (same WeakReference + main-looper idiom as
+                    // GraphicsDialog.onDriverPicked, R7-04/R8-F2). The
+                    // modal progress dialog is load-bearing, not
+                    // decoration: while it is up the activity has no
+                    // window focus, so the guest stays paused (focus
+                    // loss parks it) and cannot read files out from
+                    // under the delete; dismissing it early would resume
+                    // the guest mid-delete. finish() only runs after the
+                    // delete really finished (R7-F7 semantics kept: only
+                    // leave when everything is really gone).
+                    if (activity.isFinishing() || activity.isDestroyed()) return;
+                    final AlertDialog progress = new AlertDialog.Builder(activity)
+                            .setMessage(R.string.reset_deleting)
+                            .setCancelable(false)
+                            .create();
+                    progress.show();
+                    final WeakReference<Activity> selfRef = new WeakReference<>(activity);
+                    final Context appCtx = activity.getApplicationContext();
+                    new Thread(() -> {
+                        boolean ok = false;
+                        String errorMsg = null;
+                        try {
+                            ok = deleteRecursively(GameFiles.gameDir(appCtx));
+                            // Full builds have no extracted game files: the game
+                            // data lives in <external>/data (saves, installed
+                            // DLC, shader cache). Without this the reset was a
+                            // no-op there and the game came back on next launch.
+                            ok = deleteRecursively(GameFiles.dataDir(appCtx)) && ok;
+                            File cfg = GameFiles.configFile(appCtx);
+                            if (cfg.exists() && !cfg.delete()) ok = false;
+                        } catch (Exception e) {
+                            errorMsg = e.toString();
+                        }
+                        final boolean deleted = ok;
+                        final String failure = errorMsg;
+                        new Handler(Looper.getMainLooper()).post(() -> {
+                            Activity a = selfRef.get();
+                            // (Ronda 8, auditor F - R8-F2.) If the activity
+                            // died mid-delete there is no dialog to dismiss
+                            // and no toast to show; the files are gone all
+                            // the same, so the next launch goes to the
+                            // first-run import screen either way.
+                            if (a == null || a.isFinishing() || a.isDestroyed()) return;
+                            progress.dismiss();
+                            if (!deleted) {
+                                Toast.makeText(a, failure != null ? failure : a.getString(R.string.err_generic), Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            // Game files gone: back to the icon; next tap opens the
+                            // first-run import screen again.
+                            a.finish();
+                        });
+                    }, "reset-delete").start();
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
