@@ -16,6 +16,7 @@
     <string name="copied">Copiado al portapapeles</string>
     <string name="reset">Quitar archivos</string>
     <string name="reset_confirm">¿Borrar los archivos del juego y los datos guardados (partidas, DLC instalados, caché)?</string>
+    <string name="reset_deleting">Borrando archivos del juego…</string>
     <!-- (Hunt v1.4.6 ronda 7, A4-R7-02.) Exit confirmation for the Android
          gesture back in MainActivity: the swipe used to kill the game
          with no question and no save. -->
