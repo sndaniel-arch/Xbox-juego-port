@@ -1015,6 +1015,17 @@ jobs:
           $r25Total = @(Select-String -Path "$gen\childoflight_recomp.*.cpp" -Pattern "GUARD_R25").Count
           if ($r25Total -lt 58) { Write-Host "::error::R25 guard did not land: $r25Total GUARD_R25 markers (expected >= 58: A2-R25)"; exit 1 }
           Write-Host "R25 guard verified: $r25Total GUARD_R25 markers (A2-R25)"
+          # (Hunt v1.4.6, ronda 26, R26-GUARD-01.) Tripwire R26:
+          # 34 marcadores GUARD_R26 (A2-R26) en el arbol
+          # generado. Si la guardia R26 no aterriza, el run falla aqui
+          # aunque el script saliera exit 0. (Nota del coordinador: A2 entrego
+          # el conteo final, 34, y el placeholder quedo sustituido por 34 en
+          # este bloque y en el diff COORD-R26-tripwire.diff.)
+          # Con 34 el paso exige >= 34 marcadores GUARD_R26 en el arbol.
+          # (NO-CHECK crash-(iii) + callee 7F4C8 + contenedor +156 + custom 885A8.)
+          $r26Total = @(Select-String -Path "$gen\childoflight_recomp.*.cpp" -Pattern "GUARD_R26").Count
+          if ($r26Total -lt 34) { Write-Host "::error::R26 guard did not land: $r26Total GUARD_R26 markers (expected >= 34: A2-R26)"; exit 1 }
+          Write-Host "R26 guard verified: $r26Total GUARD_R26 markers (A2-R26)"
 
       - name: Title metadata (name, Title ID, cover)
         id: meta
