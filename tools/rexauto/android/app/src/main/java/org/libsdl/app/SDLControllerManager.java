@@ -272,8 +272,30 @@ class SDLJoystickHandler {
                             }
                         }
                         if (!joystick.lights.isEmpty()) {
-                            joystick.lightsSession = lightsManager.openSession();
-                            has_rgb_led = true;
+                            // (Hunt v1.4.6 ronda 26, A4-R26-02.) openSession()
+                            // is a binder call into the input service
+                            // (InputDeviceLightsManager opens the session for
+                            // this device id): a pad unplugged between
+                            // getLights() above and this call — the same
+                            // mid-poll race R11-05 fixed for getDevice() —
+                            // throws out of here, and pollInputDevices runs
+                            // from JNI (Android_JNI_PollInputDevices, no
+                            // ExceptionCheck), so the exception would stay
+                            // pending on the SDL thread, abort this poll
+                            // (this pad never registers, the removal pass
+                            // never runs) and poison later polls. Same
+                            // guard as lightsSession.close() below and
+                            // setLED() (R19-08): lose the LED, keep the pad.
+                            // (SDLJoystickHandler has no TAG of its own;
+                            // use the manager's tag, as setLED does.)
+                            try {
+                                joystick.lightsSession = lightsManager.openSession();
+                            } catch (Exception e) {
+                                Log.v("SDLControllerManager", "openSession failed for device " + device_id + ": " + e);
+                            }
+                            if (joystick.lightsSession != null) {
+                                has_rgb_led = true;
+                            }
                         }
                     }
 
