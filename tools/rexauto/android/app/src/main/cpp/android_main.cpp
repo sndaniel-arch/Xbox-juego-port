@@ -1713,11 +1713,20 @@ int RunAndroidApp() {
 // interfaces with no link dependency on the concrete systems (SDL audio
 // driver, GPU plugin).
 // Ordering: pause graphics first (command processor + vblank), then audio;
-// resume in the reverse order. Both Pause() calls can block waiting for
-// their worker threads to reach a safe point (audio pause_fence_); if a
-// worker is stuck inside a guest callback with no orderly exit, onPause
-// blocks -- the same pre-existing risk class as AudioSystem::Shutdown's
-// Terminate(0) fallback. Phone verification required.
+// resume in the reverse order. Each Pause() waits on its worker with a
+// BOUNDED fence (A4-R3-02): CommandProcessor::Pause and AudioSystem::Pause
+// wait at most 1000 ms each, XmaDecoder::Pause another 1000 ms, so a pause
+// on the UI thread costs ~3 s worst case, sequential, when every worker is
+// stuck inside a guest callback / FFmpeg decode — and each timeout leaves
+// paused_ set, so the worker parks late and Resume() unparks it. That is
+// under Android's 5 s input-dispatch ANR threshold (and a Home press
+// dispatches no input event to the app at all), so the unbounded onPause
+// hang this comment used to warn about is gone: it was closed by the R3/R4
+// bounds, not by moving the pause off the UI thread (which would leave the
+// guest running in the background — worse). The one live unbounded
+// UI-thread block of this class was the Reset delete in PadSettingsDialog,
+// fixed in ronda 26 (A4-R26-03).
+// (Hunt v1.4.6 ronda 26, A4-R26-04 — cierra el diferido ANR-on-pause.)
 extern "C" {
 
 JNIEXPORT void JNICALL
