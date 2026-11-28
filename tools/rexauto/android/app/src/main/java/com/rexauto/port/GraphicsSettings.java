@@ -148,7 +148,28 @@ public final class GraphicsSettings {
     }
     public void setLanguage(String v) { prefs.edit().putString("language", v == null ? "es" : v).apply(); }
 
-    /** XLanguage id for an ISO 639 code (xcontent.h: es=5, en=1, …). */
+    /**
+     * XLanguage id for an ISO 639 code (xcontent.h: es=5, en=1, …).
+     * (Hunt v1.4.6 ronda 26, A4-R26-01 — cierra A4-R25-D1 para "zh".)
+     * "zh" is 8 (kTChinese): a real XLanguage value — a Traditional
+     * Chinese console sets it, so any shipped 360 game must handle it,
+     * and xeXamGetLanguageString(8) round-trips to "zh". The 360 game
+     * data has no Chinese text (the release ships en/fr/de/it/es/ja/
+     * pt/ru), so in THIS game the guest falls back to English on its
+     * own — same screen as before, but the cvar now tells the truth
+     * instead of claiming English. SDK-side readers are safe either
+     * way: XdbfGameData::GetExistingLanguage falls back to the game's
+     * default language when its XDBF has no strings for the id.
+     * "sv"/"tr"/"nb"/"nl" have NO valid mapping and stay on the English
+     * default on purpose: the XLanguage enum ends at kRussian=12
+     * (kMaxLanguages=13), and ids 13..17 only exist in the XAM *string*
+     * table (xeXamGetLanguageString, fed by online-language ids for
+     * display strings) — no real console ever sets user_language to
+     * them, so writing one would feed the game an out-of-contract id.
+     * Locale.getLanguage() also drops the script, so "zh" cannot tell
+     * Traditional (8) from Simplified (10); 8 is the first "zh" in the
+     * XAM string table and the one Xenia maps the primary online-zh to.
+     */
     public static int languageId(String lang) {
         if (lang == null) return 1;
         switch (lang) {
@@ -158,6 +179,7 @@ public final class GraphicsSettings {
             case "fr": return 4;
             case "it": return 6;
             case "ko": return 7;
+            case "zh": return 8;
             case "pt": return 9;
             case "ru": return 12;
             case "pl": return 11;
@@ -326,14 +348,17 @@ public final class GraphicsSettings {
             // this settings value overrode it)
             m.put("async_shader_compilation", "true");
             m.put("vulkan_async_skip_incomplete_frames", "false");
-            // present: FIFO_RELAXED when the driver offers it (FIFO with
-            // tearing allowed if a frame arrives late -- the SDK default,
-            // and the value that actually ships here), else strict FIFO.
+            // present: strict FIFO (vsync, no tearing). FIFO_RELAXED was
+            // the value shipped before (FIFO with tearing allowed if a
+            // frame arrives late): the Vulkan spec's own use case for it
+            // is a game that is mostly on time and only occasionally late,
+            // but this guest runs at 0-15 fps, so essentially every
+            // present is late and every frame can tear (A1-R26-01).
             // Mailbox/immediate stay off: they keep the GPU busy rendering
             // frames the panel never shows -- pure heat on a phone.
             m.put("vulkan_allow_present_mode_immediate", "false");
             m.put("vulkan_allow_present_mode_mailbox", "false");
-            m.put("vulkan_allow_present_mode_fifo_relaxed", "true");
+            m.put("vulkan_allow_present_mode_fifo_relaxed", "false");
             // log I/O on the render/guest threads is not free
             // log_level=info while diagnosing (hunt P1-2): warning hid the
             // info lines the FASE5 checklist needs (presenter geometry,
